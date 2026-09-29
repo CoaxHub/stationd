@@ -1,0 +1,5 @@
+# The seed corpus under corpus/ is committed; generated inputs, crashes and
+# build output are not (fuzz.sh writes new inputs to a scratch directory).
+target/
+artifacts/
+coverage/

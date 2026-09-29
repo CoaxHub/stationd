@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: MIT
+# cargo-fuzz targets for coaxhub-station-proto (station-protocol §10).
+# Nightly only: run with `scripts/fuzz.sh [seconds]`.
+# Its own workspace, so the stable station workspace never builds it.
+[package]
+name = "coaxhub-station-proto-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+coaxhub-station-proto = { path = ".." }
+libfuzzer-sys = "0.4.13"
+
+[[bin]]
+name = "station_message"
+path = "fuzz_targets/station_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "waterfall_decompress"
+path = "fuzz_targets/waterfall_decompress.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "identity"
+path = "fuzz_targets/identity.rs"
+test = false
+doc = false
+bench = false
