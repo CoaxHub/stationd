@@ -1,0 +1,77 @@
+// CoaxHub Stations — station <-> control plane (enrollment, assignment,
+// certificate renewal).
+//
+// License: MIT OR Apache-2.0 (operator-run code).
+// Flow: docs/architecture.md.
+//
+// Transport: gRPC over HTTPS to the control plane.
+//   Enrollment      https://api.{domain}          public WebPKI TLS + one-time token
+//   StationControl  https://station-api.{domain}  mTLS with the station certificate;
+//                   server verified against gateway_ca_bundle_pem
+
+syntax = "proto3";
+
+package coaxhub.station.v1;
+
+service Enrollment {
+  // Exchanges a one-time enrollment token and a CSR for a station
+  // certificate. The token is consumed even if the call fails after
+  // validation.
+  rpc Enroll(EnrollRequest) returns (EnrollResponse);
+}
+
+service StationControl {
+  // Returns the station's current home hub. Called at startup and whenever
+  // the hub sends Goodbye{refresh_assignment: true}.
+  rpc GetAssignment(GetAssignmentRequest) returns (Assignment);
+
+  // Issues a new certificate for a new key. stationd renews when two thirds
+  // of the current certificate's lifetime has elapsed.
+  rpc RenewCertificate(RenewCertificateRequest) returns (RenewCertificateResponse);
+}
+
+message EnrollRequest {
+  // The single-use token from the web UI (format "chs_enr_" + 32 base32 chars).
+  string token = 1;
+  // PKCS#10 CSR, DER. Key: ECDSA P-256 generated on the station; the private
+  // key never leaves it. Subject fields are ignored by the CA.
+  bytes csr_der = 2;
+  string daemon_version = 3;
+}
+
+message EnrollResponse {
+  // The station's permanent id (UUID). Stored locally for display only; the
+  // certificate is the credential.
+  string station_id = 1;
+  StationCertificate certificate = 2;
+  // Root certificates (PEM) the station must use to authenticate the hub
+  // gateway and station-api. Replaces any previously stored bundle.
+  string gateway_ca_bundle_pem = 3;
+  Assignment assignment = 4;
+}
+
+message GetAssignmentRequest {}
+
+message Assignment {
+  string hub_id = 1;
+  // e.g. "https://gw.sa1.{domain}:443"
+  string gateway_url = 2;
+}
+
+message RenewCertificateRequest {
+  bytes csr_der = 1;
+}
+
+message RenewCertificateResponse {
+  StationCertificate certificate = 1;
+  // Present when the gateway CA bundle rotated.
+  optional string gateway_ca_bundle_pem = 2;
+}
+
+message StationCertificate {
+  // Leaf certificate, DER.
+  bytes certificate_der = 1;
+  // Intermediates, DER, leaf-issuer first.
+  repeated bytes chain_der = 2;
+  int64 not_after_unix_s = 3;
+}
