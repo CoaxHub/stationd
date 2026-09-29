@@ -1,6 +1,8 @@
 // CoaxHub Stations — station <-> hub tunnel.
 //
-// License: MIT OR Apache-2.0 (operator-run code).
+// SPDX-License-Identifier: MIT
+// The station protocol is MIT-licensed so any implementation (including the
+// CoaxHub hub) can use it.
 // Semantics, limits and validation rules: docs/station-protocol.md.
 //
 // Transport: gRPC over HTTP/2 + TLS 1.3 with mutual authentication.

@@ -1,6 +1,8 @@
 // CoaxHub Stations — station health and events.
 //
-// License: MIT OR Apache-2.0 (operator-run code).
+// SPDX-License-Identifier: MIT
+// The station protocol is MIT-licensed so any implementation (including the
+// CoaxHub hub) can use it.
 // Semantics, limits and validation rules: docs/station-protocol.md.
 //
 // Everything here is a claim made by the station. The hub stores it for the

@@ -1,7 +1,9 @@
 // CoaxHub Stations — station <-> control plane (enrollment, assignment,
 // certificate renewal).
 //
-// License: MIT OR Apache-2.0 (operator-run code).
+// SPDX-License-Identifier: MIT
+// The station protocol is MIT-licensed so any implementation (including the
+// CoaxHub hub) can use it.
 // Flow: docs/architecture.md.
 //
 // Transport: gRPC over HTTPS to the control plane.
