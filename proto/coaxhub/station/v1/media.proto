@@ -1,6 +1,8 @@
 // CoaxHub Stations — media streamed from station to hub.
 //
-// License: MIT OR Apache-2.0 (operator-run code).
+// SPDX-License-Identifier: MIT
+// The station protocol is MIT-licensed so any implementation (including the
+// CoaxHub hub) can use it.
 // Semantics, limits and validation rules: docs/station-protocol.md.
 //
 // A station only sends media for channel_ids and subscription_ids the hub
