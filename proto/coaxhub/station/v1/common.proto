@@ -1,0 +1,93 @@
+// CoaxHub Stations — station protocol, shared types.
+//
+// License: MIT OR Apache-2.0 (operator-run code).
+// Semantics, limits and validation rules: docs/station-protocol.md.
+//
+// Conventions used in every file of this package:
+//   * Frequencies are absolute, in hertz, as uint64.
+//   * Filter edges are relative to the tuned frequency, in hertz, as int32
+//     (negative = below the carrier).
+//   * Every value a station sends is an untrusted claim. The hub validates it
+//     and never renders it as markup.
+
+syntax = "proto3";
+
+package coaxhub.station.v1;
+
+// Semantic version of the station protocol.
+// The hub rejects a different major. For the same major, the session uses the
+// lower of the two minors, and both sides only use features of that minor.
+message ProtocolVersion {
+  uint32 major = 1;
+  uint32 minor = 2;
+}
+
+// Closed interval [start_hz, end_hz]. start_hz <= end_hz.
+message FrequencyRange {
+  uint64 start_hz = 1;
+  uint64 end_hz = 2;
+}
+
+// Demodulation mode.
+enum Mode {
+  MODE_UNSPECIFIED = 0;
+  MODE_AM = 1;   // envelope detection
+  MODE_FM = 2;   // wideband FM (broadcast), mono audio
+  MODE_NFM = 3;  // narrowband FM
+  MODE_USB = 4;
+  MODE_LSB = 5;
+  MODE_CW = 6;   // CW with BFO offset applied by the station
+}
+
+enum AudioCodec {
+  AUDIO_CODEC_UNSPECIFIED = 0;
+  AUDIO_CODEC_OPUS = 1;  // mono, one Opus packet per AudioFrame
+}
+
+// Audio encoding parameters requested by the hub and confirmed by the station.
+message AudioParams {
+  AudioCodec codec = 1;
+  // Target bitrate in bits per second. Allowed: 6000..=64000.
+  uint32 bitrate_bps = 2;
+  // Decoded sample rate. Allowed: 8000, 12000, 16000, 24000, 48000.
+  uint32 sample_rate_hz = 3;
+  // Opus frame duration in milliseconds. Allowed: 10, 20, 40, 60.
+  uint32 frame_duration_ms = 4;
+}
+
+// Compression applied to WaterfallRow.payload.
+enum WaterfallCompression {
+  WATERFALL_COMPRESSION_UNSPECIFIED = 0;
+  WATERFALL_COMPRESSION_NONE = 1;
+  // Zstandard frame per row. The station may use a level of its choosing.
+  WATERFALL_COMPRESSION_ZSTD = 2;
+}
+
+// Linear mapping from a uint8 bin value v to power in dBFS:
+//   power_dbfs = offset_db + v * step_db
+// v = 0 means "at or below offset_db"; v = 255 means "at or above the top".
+message Quantization {
+  float offset_db = 1;  // e.g. -160.0
+  float step_db = 2;    // e.g. 0.5 (range 127.5 dB)
+}
+
+// Result of a request. Codes are stable across minor versions.
+enum ResultCode {
+  RESULT_CODE_UNSPECIFIED = 0;
+  RESULT_CODE_OK = 1;
+  RESULT_CODE_INVALID_ARGUMENT = 2;    // malformed or out-of-bounds field
+  RESULT_CODE_OUT_OF_RANGE = 3;        // frequency outside the tunable range
+  RESULT_CODE_RESOURCE_EXHAUSTED = 4;  // no free channel / subscription slot
+  RESULT_CODE_UNSUPPORTED = 5;         // mode, codec or feature not supported
+  RESULT_CODE_PERMISSION_DENIED = 6;   // refused by the owner's local config
+  RESULT_CODE_NOT_FOUND = 7;           // unknown channel_id / subscription_id
+  RESULT_CODE_ALREADY_EXISTS = 8;      // id already in use on this connection
+  RESULT_CODE_BACKEND_ERROR = 9;       // DSP backend failed; see message
+}
+
+message Result {
+  ResultCode code = 1;
+  // Human-readable detail for logs and the owner dashboard.
+  // Untrusted; at most 256 bytes UTF-8; displayed escaped, never as markup.
+  string message = 2;
+}

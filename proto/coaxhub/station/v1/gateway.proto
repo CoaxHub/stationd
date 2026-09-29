@@ -1,0 +1,152 @@
+// CoaxHub Stations — station <-> hub tunnel.
+//
+// License: MIT OR Apache-2.0 (operator-run code).
+// Semantics, limits and validation rules: docs/station-protocol.md.
+//
+// Transport: gRPC over HTTP/2 + TLS 1.3 with mutual authentication.
+// The station is the gRPC client and dials OUT to its home hub's gateway.
+// The hub is the gRPC server but the LOGICAL client: it sends requests,
+// and the station answers them and streams only what was requested.
+//
+// Station identity comes exclusively from the mTLS client certificate.
+// No field in this protocol identifies the station.
+
+syntax = "proto3";
+
+package coaxhub.station.v1;
+
+import "coaxhub/station/v1/common.proto";
+import "coaxhub/station/v1/control.proto";
+import "coaxhub/station/v1/media.proto";
+import "coaxhub/station/v1/status.proto";
+
+service StationGateway {
+  // A station keeps exactly one Connect stream open to its home hub.
+  // A new stream from the same station replaces the old one (the hub sends
+  // Goodbye{DUPLICATE_CONNECTION} on the old stream and closes it).
+  //
+  // Sequence:
+  //   station -> Hello                  (must be the first message)
+  //   hub     -> Welcome | Goodbye      (must be the first message)
+  //   hub     -> Request*               (GetCapabilities first)
+  //   station -> Response* / media / status / events
+  rpc Connect(stream StationMessage) returns (stream HubMessage);
+}
+
+// ---------------------------------------------------------------- Hub -> Station
+
+message HubMessage {
+  oneof body {
+    Welcome welcome = 1;
+    Goodbye goodbye = 2;
+    Request request = 3;
+  }
+}
+
+// Accepts the session. Sent once, in reply to Hello.
+message Welcome {
+  // Negotiated version (same major, lower minor of the two sides).
+  ProtocolVersion protocol_version = 1;
+  // Opaque id of this connection, for correlating logs on both sides.
+  string connection_id = 2;
+  // How often the station sends StationStatus. Default 10000.
+  uint32 status_interval_ms = 3;
+  // Largest StationMessage the hub will accept, in bytes. The hub
+  // disconnects on anything larger.
+  uint32 max_message_bytes = 4;
+  // Hub wall-clock time, for coarse clock-skew diagnostics only.
+  int64 hub_time_unix_ms = 5;
+}
+
+// Ends the session. The hub closes the stream right after sending it.
+message Goodbye {
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    REASON_SHUTDOWN = 1;              // hub restarting; reconnect after retry_after_ms
+    REASON_DRAINING = 2;              // hub being drained; reconnect (maybe elsewhere)
+    REASON_REASSIGNED = 3;            // home hub changed; refresh assignment first
+    REASON_UNSUPPORTED_VERSION = 4;   // protocol major not supported; update stationd
+    REASON_DISABLED = 5;              // station disabled by owner or moderator
+    REASON_REVOKED = 6;               // credential revoked; stop and re-enroll
+    REASON_PROTOCOL_VIOLATION = 7;    // station broke the protocol (a strike is recorded)
+    REASON_QUOTA_EXCEEDED = 8;        // bandwidth or message-rate quota exceeded
+    REASON_DUPLICATE_CONNECTION = 9;  // a newer connection from this station replaced this one
+  }
+  Reason reason = 1;
+  // Hub-authored text for the station log. At most 256 bytes.
+  string message = 2;
+  // Minimum wait before reconnecting. 0 = use the default backoff.
+  uint32 retry_after_ms = 3;
+  // If true, call StationControl.GetAssignment before reconnecting.
+  bool refresh_assignment = 4;
+}
+
+// A command. The station answers every Request with exactly one Response
+// carrying the same request_id.
+message Request {
+  // Unique per connection, strictly increasing, never 0.
+  uint64 request_id = 1;
+  oneof command {
+    GetCapabilities get_capabilities = 10;
+    OpenChannel open_channel = 11;
+    UpdateChannel update_channel = 12;
+    CloseChannel close_channel = 13;
+    SetFrontend set_frontend = 14;
+    SubscribeWaterfall subscribe_waterfall = 15;
+    UnsubscribeWaterfall unsubscribe_waterfall = 16;
+    Ping ping = 17;
+    AdminOp admin_op = 18;
+  }
+}
+
+// ---------------------------------------------------------------- Station -> Hub
+
+message StationMessage {
+  oneof body {
+    Hello hello = 1;
+    Response response = 2;
+    AudioFrame audio = 3;
+    WaterfallRow waterfall = 4;
+    ChannelSignal signal = 5;
+    StationStatus status = 6;
+    Event event = 7;
+  }
+}
+
+// First message on every stream.
+message Hello {
+  ProtocolVersion protocol_version = 1;
+  // stationd version, semver. Informational; used for update hints.
+  string daemon_version = 2;
+  BackendInfo backend = 3;
+  // Platform, informational only: e.g. "linux-aarch64".
+  string platform = 4;
+  // Random value generated at stationd process start. A change tells the hub
+  // the daemon restarted (all channels and subscriptions are gone).
+  uint64 boot_id = 5;
+}
+
+enum BackendKind {
+  BACKEND_KIND_UNSPECIFIED = 0;
+  BACKEND_KIND_KA9Q_RADIO = 1;
+}
+
+message BackendInfo {
+  BackendKind kind = 1;
+  string version = 2;  // informational, untrusted
+}
+
+message Response {
+  uint64 request_id = 1;
+  Result result = 2;
+  // Present only when result.code == RESULT_CODE_OK and the command has a
+  // payload. Its type must match the command.
+  oneof payload {
+    Capabilities capabilities = 10;
+    ChannelOpened channel_opened = 11;
+    ChannelUpdated channel_updated = 12;
+    FrontendState frontend_state = 14;
+    WaterfallSubscribed waterfall_subscribed = 15;
+    Pong pong = 17;
+  }
+}

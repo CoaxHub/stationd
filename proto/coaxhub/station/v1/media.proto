@@ -1,0 +1,48 @@
+// CoaxHub Stations — media streamed from station to hub.
+//
+// License: MIT OR Apache-2.0 (operator-run code).
+// Semantics, limits and validation rules: docs/station-protocol.md.
+//
+// A station only sends media for channel_ids and subscription_ids the hub
+// opened on the current connection and has not closed. Anything else is a
+// protocol violation.
+
+syntax = "proto3";
+
+package coaxhub.station.v1;
+
+// One encoded audio packet.
+message AudioFrame {
+  uint32 channel_id = 1;
+  // Increments by 1 per frame, wraps at 2^32. Gaps mean frames were dropped.
+  uint32 seq = 2;
+  // Media timestamp in samples at 48 kHz (the Opus RTP clock), wraps at
+  // 2^32. Used for jitter buffering and gap concealment; not wall clock.
+  uint32 timestamp = 3;
+  // One Opus packet (RFC 6716). At most 1275 bytes.
+  bytes payload = 4;
+}
+
+// One spectrum row.
+message WaterfallRow {
+  uint32 subscription_id = 1;
+  // Increments by 1 per row, wraps at 2^32.
+  uint32 seq = 2;
+  // Station monotonic clock, microseconds. For row-rate checks only.
+  uint64 timestamp_us = 3;
+  // Compressed per WaterfallSubscribed.compression. Once decompressed it is
+  // exactly WaterfallSubscribed.bins bytes, lowest frequency first, each a
+  // uint8 quantized per WaterfallSubscribed.quantization.
+  bytes payload = 4;
+}
+
+// Signal measurements for an audio channel (S-meter). At most 5 per second
+// per channel.
+message ChannelSignal {
+  uint32 channel_id = 1;
+  float snr_db = 2;
+  // Power within the channel filter, dBFS.
+  float power_dbfs = 3;
+  // Present when squelch is enabled on the channel.
+  optional bool squelch_open = 4;
+}

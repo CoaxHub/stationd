@@ -1,0 +1,82 @@
+// CoaxHub Stations — station health and events.
+//
+// License: MIT OR Apache-2.0 (operator-run code).
+// Semantics, limits and validation rules: docs/station-protocol.md.
+//
+// Everything here is a claim made by the station. The hub stores it for the
+// owner dashboard and alerts; it never drives security decisions.
+
+syntax = "proto3";
+
+package coaxhub.station.v1;
+
+// Periodic health snapshot, every Welcome.status_interval_ms.
+message StationStatus {
+  uint64 uptime_s = 1;       // stationd process uptime
+  HostHealth host = 2;
+  BackendHealth backend = 3;
+  FrontendHealth frontend = 4;
+  uint32 active_channels = 5;
+  uint32 active_subscriptions = 6;
+  // Frames dropped by the station's outbound queue since stationd start.
+  uint64 audio_frames_dropped_total = 7;
+  uint64 waterfall_rows_dropped_total = 8;
+}
+
+message HostHealth {
+  float load_avg_1m = 1;
+  uint32 cpu_count = 2;
+  // Absent when the platform does not expose a CPU temperature sensor.
+  optional float cpu_temp_c = 3;
+  uint64 mem_used_bytes = 4;
+  uint64 mem_total_bytes = 5;
+  uint64 host_uptime_s = 6;
+}
+
+message BackendHealth {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    STATE_RUNNING = 1;
+    STATE_DEGRADED = 2;  // running but reporting errors
+    STATE_DOWN = 3;      // not reachable by stationd
+  }
+  State state = 1;
+  string version = 2;  // informational, untrusted
+}
+
+message FrontendHealth {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    STATE_OK = 1;
+    STATE_OVERLOAD = 2;   // ADC clipping in the last interval
+    STATE_NO_DEVICE = 3;  // SDR not present / lost
+  }
+  State state = 1;
+  uint32 sample_rate_hz = 2;
+  uint64 center_frequency_hz = 3;
+  float gain_db = 4;
+  // ADC overload events since stationd start.
+  uint64 overloads_total = 5;
+  // Wideband input power, dBFS.
+  optional float input_power_dbfs = 6;
+}
+
+// Asynchronous notification.
+message Event {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_FRONTEND_OVERLOAD = 1;
+    KIND_DEVICE_LOST = 2;
+    KIND_DEVICE_RESTORED = 3;
+    KIND_BACKEND_RESTARTED = 4;   // all channels and subscriptions are gone
+    KIND_CHANNEL_CLOSED = 5;      // channel_id set; hub must not reuse it without OpenChannel
+    KIND_SUBSCRIPTION_CLOSED = 6; // subscription_id set
+    KIND_FRONTEND_CHANGED = 7;    // tunable range changed; hub re-reads capabilities
+    KIND_SHUTTING_DOWN = 8;       // stationd is stopping
+  }
+  Kind kind = 1;
+  optional uint32 channel_id = 2;
+  optional uint32 subscription_id = 3;
+  // Untrusted detail, at most 256 bytes UTF-8. Displayed escaped.
+  string detail = 4;
+}

@@ -1,0 +1,188 @@
+// CoaxHub Stations — hub commands and their results.
+//
+// License: MIT OR Apache-2.0 (operator-run code).
+// Semantics, limits and validation rules: docs/station-protocol.md.
+
+syntax = "proto3";
+
+package coaxhub.station.v1;
+
+import "coaxhub/station/v1/common.proto";
+
+// ------------------------------------------------------------ Capabilities
+
+message GetCapabilities {}
+
+message Capabilities {
+  // Range the station can demodulate RIGHT NOW without retuning the
+  // frontend (the current passband). Listeners can only tune inside it.
+  FrequencyRange tunable_range = 1;
+  // Full range the hardware could cover if the owner retunes the frontend.
+  FrequencyRange hardware_range = 2;
+  uint32 sample_rate_hz = 3;
+  // Maximum simultaneous audio channels the station accepts.
+  uint32 max_channels = 4;
+  repeated Mode modes = 5;
+  repeated AudioCodec codecs = 6;
+  WaterfallLimits waterfall = 7;
+  FrontendControls frontend = 8;
+  // Admin operations the owner allows (stationd.toml). Default: empty.
+  repeated AdminOpKind allowed_admin_ops = 9;
+  // Whether the owner allows SetFrontend (stationd.toml). Default: true.
+  bool frontend_control_allowed = 10;
+  // Informational, untrusted, at most 64 bytes: e.g. "RTL-SDR Blog V4".
+  string sdr_model = 11;
+}
+
+message WaterfallLimits {
+  uint32 max_bins = 1;             // per subscription
+  uint32 min_row_interval_ms = 2;  // fastest row rate supported
+  uint32 max_subscriptions = 3;
+}
+
+message FrontendControls {
+  bool has_gain = 1;
+  float min_gain_db = 2;
+  float max_gain_db = 3;
+  bool has_hardware_agc = 4;
+  bool has_attenuator = 5;
+  float max_attenuation_db = 6;
+  // Selectable antenna ports, e.g. ["A", "B"]. Empty = not selectable.
+  // Untrusted labels, at most 8 entries of 16 bytes.
+  repeated string antenna_ports = 7;
+  // Whether the frontend center frequency can be changed at runtime.
+  bool can_retune = 8;
+}
+
+// ------------------------------------------------------------ Audio channels
+
+// Creates a demodulated audio channel. channel_id is chosen by the hub and
+// must not be in use on this connection.
+message OpenChannel {
+  uint32 channel_id = 1;
+  uint64 frequency_hz = 2;
+  Mode mode = 3;
+  int32 low_cut_hz = 4;
+  int32 high_cut_hz = 5;
+  AudioParams audio = 6;
+  // Squelch threshold in dB SNR. Absent = squelch off.
+  optional float squelch_snr_db = 7;
+}
+
+// What the station actually configured (may be rounded by the backend).
+message ChannelOpened {
+  uint32 channel_id = 1;
+  uint64 frequency_hz = 2;
+  Mode mode = 3;
+  int32 low_cut_hz = 4;
+  int32 high_cut_hz = 5;
+  AudioParams audio = 6;
+}
+
+// Changes an open channel in place. Absent fields keep their value.
+// Codec parameters cannot change; close and reopen instead.
+message UpdateChannel {
+  uint32 channel_id = 1;
+  optional uint64 frequency_hz = 2;
+  optional Mode mode = 3;
+  optional int32 low_cut_hz = 4;
+  optional int32 high_cut_hz = 5;
+  optional float squelch_snr_db = 6;
+  // true = turn squelch off (squelch_snr_db is ignored).
+  bool squelch_off = 7;
+}
+
+message ChannelUpdated {
+  uint32 channel_id = 1;
+  uint64 frequency_hz = 2;
+  Mode mode = 3;
+  int32 low_cut_hz = 4;
+  int32 high_cut_hz = 5;
+}
+
+message CloseChannel {
+  uint32 channel_id = 1;
+}
+
+// ------------------------------------------------------------ Frontend
+
+// Changes shared hardware settings. Affects every channel on the station, so
+// the hub only sends it on behalf of the owner (never a listener).
+// Absent fields keep their value.
+message SetFrontend {
+  optional float gain_db = 1;
+  optional bool hardware_agc = 2;
+  optional float attenuation_db = 3;
+  optional string antenna_port = 4;
+  // Moves the passband. Existing channels outside the new passband are
+  // closed by the station (Event CHANNEL_CLOSED).
+  optional uint64 center_frequency_hz = 5;
+}
+
+message FrontendState {
+  float gain_db = 1;
+  bool hardware_agc = 2;
+  float attenuation_db = 3;
+  string antenna_port = 4;
+  uint64 center_frequency_hz = 5;
+  FrequencyRange tunable_range = 6;
+}
+
+// ------------------------------------------------------------ Waterfall
+
+// Starts a spectrum stream. subscription_id is chosen by the hub.
+message SubscribeWaterfall {
+  uint32 subscription_id = 1;
+  FrequencyRange range = 2;
+  // Number of bins across the range. 64..=Capabilities.waterfall.max_bins.
+  uint32 bins = 3;
+  // Time between rows. >= Capabilities.waterfall.min_row_interval_ms.
+  uint32 row_interval_ms = 4;
+  Quantization quantization = 5;
+  WaterfallCompression compression = 6;
+}
+
+// What the station actually configured. Rows use exactly these values.
+message WaterfallSubscribed {
+  uint32 subscription_id = 1;
+  FrequencyRange range = 2;
+  uint32 bins = 3;
+  uint32 row_interval_ms = 4;
+  Quantization quantization = 5;
+  WaterfallCompression compression = 6;
+}
+
+message UnsubscribeWaterfall {
+  uint32 subscription_id = 1;
+}
+
+// ------------------------------------------------------------ Liveness
+
+message Ping {
+  uint64 nonce = 1;
+  int64 hub_time_unix_ms = 2;
+}
+
+message Pong {
+  uint64 nonce = 1;
+  int64 station_time_unix_ms = 2;
+}
+
+// ------------------------------------------------------------ Admin operations
+
+// Typed, opt-in maintenance operations. The station refuses any kind not
+// listed in its local allowed_admin_ops with RESULT_CODE_PERMISSION_DENIED.
+// There is deliberately no "run command" or "push config" operation.
+enum AdminOpKind {
+  ADMIN_OP_KIND_UNSPECIFIED = 0;
+  ADMIN_OP_KIND_RESTART_STATIOND = 1;  // restart the stationd service
+  ADMIN_OP_KIND_RESTART_BACKEND = 2;   // restart the DSP backend (radiod)
+  ADMIN_OP_KIND_UPDATE = 3;            // upgrade CoaxHub packages from the signed repo
+  ADMIN_OP_KIND_REBOOT_HOST = 4;       // reboot the machine
+}
+
+// The station replies with RESULT_CODE_OK when the operation is accepted,
+// then performs it. The connection may drop as a consequence.
+message AdminOp {
+  AdminOpKind kind = 1;
+}
