@@ -353,6 +353,35 @@ async fn slow_consumer_drops_oldest_packets() {
     ch.close().await.unwrap();
 }
 
+/// radiod overrides the output rate for some modes (WFM runs at 48 kHz). The
+/// client must adopt it: re-sending the requested rate at every keepalive
+/// restarts the demodulator each time (seen on a real RTL-SDR).
+#[tokio::test(start_paused = true)]
+async fn radiod_sample_rate_override_does_not_restart_the_channel() {
+    let (fake, client) = setup().await;
+    let params = AudioChannelParams {
+        samprate: Some(24_000),
+        ..AudioChannelParams::new(97.5e6, "wfm")
+    };
+    let ch = client.open_audio_channel(params).await.unwrap();
+    let ssrc = ch.ssrc();
+    let restarts_after_open = fake.channel(ssrc).unwrap().restarts;
+    // Many keepalives.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let fc = fake.channel(ssrc).unwrap();
+    let stats = ch.stats();
+    assert!(stats.keepalives >= 12, "{stats:?}");
+    assert_eq!(stats.recreations, 0, "{stats:?}");
+    assert_eq!(fc.samprate, 48_000);
+    assert_eq!(
+        fc.restarts, restarts_after_open,
+        "keepalives restarted the channel"
+    );
+    assert_eq!(ch.params().samprate, Some(48_000));
+    ch.close().await.unwrap();
+    fake.assert_client_contract();
+}
+
 #[tokio::test(start_paused = true)]
 async fn lost_audio_channel_is_recreated() {
     let (fake, client) = setup().await;

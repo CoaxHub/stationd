@@ -838,7 +838,7 @@ impl Ka9qClient {
     /// destroyed again.
     pub async fn open_audio_channel(
         &self,
-        params: AudioChannelParams,
+        mut params: AudioChannelParams,
     ) -> Result<AudioChannel, ClientError> {
         params.validate()?;
         let core = &self.core;
@@ -850,12 +850,17 @@ impl Ka9qClient {
             .execute(&ctx, |tag| params.create_command(ssrc, tag, lifetime))
             .await
             .and_then(|st| params.confirm(ssrc, st));
-        if let Err(e) = created {
-            // The command may have created the channel even if no reply came.
-            if let Err(d) = core.destroy(&ctx).await {
-                tracing::debug!(ssrc, "destroy after failed open: {d}");
+        match created {
+            Ok(st) => {
+                params.adopt_reported(ssrc, &st);
             }
-            return Err(e);
+            Err(e) => {
+                // The command may have created the channel even if no reply came.
+                if let Err(d) = core.destroy(&ctx).await {
+                    tracing::debug!(ssrc, "destroy after failed open: {d}");
+                }
+                return Err(e);
+            }
         }
         let shared = Arc::new(AudioShared {
             ctx,
@@ -1070,7 +1075,15 @@ impl AudioChannelParams {
         c.lifetime(lifetime)
     }
 
-    /// Checks that a status reply shows these parameters applied.
+    /// Checks that a status reply shows this is still our channel: the
+    /// frequency and Opus encoding we set. A channel radiod re-created from
+    /// the template fails this (0 Hz, PCM).
+    ///
+    /// The output sample rate is deliberately not checked: radiod overrides it
+    /// for some modes (WFM always outputs 48 kHz, `wfm.c`; Opus forces 48 kHz
+    /// for rates it cannot encode). Treating that as a lost channel made the
+    /// keepalive re-send the create, which restarts the demodulator every
+    /// time. Use [`AudioChannelParams::adopt_reported`] instead.
     fn check(&self, st: &ChannelStatus) -> Result<(), String> {
         check_frequency("RADIO_FREQUENCY", self.frequency_hz, st.radio_frequency_hz)?;
         if st.output_encoding != Some(Encoding::Opus) {
@@ -1079,12 +1092,25 @@ impl AudioChannelParams {
                 st.output_encoding
             ));
         }
-        if let (Some(want), Some(got)) = (self.samprate, st.output_samprate) {
-            if want != got {
-                return Err(format!("OUTPUT_SAMPRATE is {got} Hz, requested {want} Hz"));
-            }
-        }
         Ok(())
+    }
+
+    /// Adopts the output sample rate radiod reports when it differs from the
+    /// requested one, so that a later re-create asks for what radiod will
+    /// actually run instead of forcing a demodulator restart. Returns true if
+    /// the parameters changed.
+    fn adopt_reported(&mut self, ssrc: u32, st: &ChannelStatus) -> bool {
+        match (self.samprate, st.output_samprate) {
+            (Some(want), Some(got)) if want != got => {
+                tracing::info!(
+                    ssrc,
+                    "radiod runs OUTPUT_SAMPRATE {got} Hz (requested {want} Hz)"
+                );
+                self.samprate = Some(got);
+                true
+            }
+            _ => false,
+        }
     }
 
     fn confirm(
@@ -1176,7 +1202,11 @@ async fn audio_keepalive(core: Arc<Core>, shared: Arc<AudioShared>) {
         {
             Ok(st) => {
                 bump(&shared.keepalives);
-                let params = shared.params();
+                let params = {
+                    let mut guard = shared.params.lock().unwrap_or_else(PoisonError::into_inner);
+                    guard.adopt_reported(ssrc, &st);
+                    guard.clone()
+                };
                 if let Err(why) = params.check(&st) {
                     tracing::warn!(ssrc, "channel lost its configuration ({why}); re-creating");
                     bump(&shared.recreations);
@@ -1297,6 +1327,7 @@ impl AudioChannel {
             })
             .await?;
         let st = next.confirm(ssrc, st)?;
+        next.adopt_reported(ssrc, &st);
         *self
             .shared
             .params
@@ -1851,14 +1882,22 @@ mod tests {
             ..good.clone()
         };
         assert!(p.check(&pcm).unwrap_err().contains("OUTPUT_ENCODING"));
+        // radiod overriding the sample rate (e.g. WFM -> 48 kHz) is not a
+        // lost channel: it is accepted and adopted.
         let rate = ChannelStatus {
             output_samprate: Some(48_000),
             ..good
         };
-        assert!(matches!(
-            p.confirm(7, Arc::new(rate)),
-            Err(ClientError::Rejected { ssrc: 7, .. })
-        ));
+        let mut adopted = p.clone();
+        assert!(adopted.confirm(7, Arc::new(rate.clone())).is_ok());
+        assert!(adopted.adopt_reported(7, &rate));
+        assert_eq!(adopted.samprate, Some(48_000));
+        assert!(!adopted.adopt_reported(7, &rate), "already adopted");
+        let mut unset = AudioChannelParams::new(10e6, "am");
+        assert!(
+            !unset.adopt_reported(7, &rate),
+            "no requested rate: nothing to adopt"
+        );
     }
 
     #[test]
