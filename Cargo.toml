@@ -1,0 +1,23 @@
+# The stationd workspace (github.com/CoaxHub/stationd). Everything here is GPL-3.0-only
+# except the station protocol (proto/, station-proto crate), which is MIT.
+[workspace]
+resolver = "3"
+members = ["crates/backend-ka9q", "crates/ka9q-spike"]
+
+[workspace.package]
+edition = "2024"
+license = "GPL-3.0-only"
+repository = "https://github.com/CoaxHub/stationd"
+rust-version = "1.85"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"

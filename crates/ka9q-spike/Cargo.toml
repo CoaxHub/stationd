@@ -1,0 +1,25 @@
+[package]
+name = "ka9q-spike"
+description = "Spike: drive radiod, record Opus audio to .opus, dump waterfall rows"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+backend-ka9q = { path = "../backend-ka9q" }
+clap = { version = "4.6.7", features = ["derive"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "signal", "macros", "net", "time"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+proptest = "1.11.0"
+tempfile = "3.27.0"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "test-util", "macros"] }
