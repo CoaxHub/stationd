@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-only
 #
-# Build and install ka9q-radio `radiod` (signal-generator front end only) and
+# Build and install ka9q-radio `radiod` (signal-generator and RTL-SDR front ends) and
 # the upstream client tools we use for testing, inside a development container.
 #
 # Idempotent: re-running with the same pinned commit and an existing install
@@ -12,7 +12,7 @@
 #   KA9Q_PREFIX  install prefix    default: ~/.local/opt/ka9q-radio
 #                  $KA9Q_PREFIX/sbin/radiod
 #                  $KA9Q_PREFIX/bin/{control,metadump,tune,pcmrecord,powers}
-#                  $KA9Q_PREFIX/lib/ka9q-radio/sig_gen.so   (compiled-in PKGLIBDIR)
+#                  $KA9Q_PREFIX/lib/ka9q-radio/{sig_gen,rtlsdr}.so (compiled-in PKGLIBDIR)
 #                  $KA9Q_PREFIX/share/ka9q-radio/presets.conf (compiled-in PKGDATADIR)
 #                  $KA9Q_PREFIX/var/lib/ka9q-radio            (FFTW wisdom, STATEDIR)
 # The install is user-owned; sudo is only used for apt-get and, if needed,
@@ -29,21 +29,23 @@ KA9Q_PREFIX="${KA9Q_PREFIX:-${HOME}/.local/opt/ka9q-radio}"
 
 # Minimal Debian (bookworm) packages to build radiod + sig_gen.so + tools.
 # radiod links -lopus -lfftw3f(_threads) -liniparser -lusb-1.0 -lbsd;
-# sig_gen.so links -lsamplerate; pcmrecord links -lopus -logg; control links -lncursesw.
+# sig_gen.so links -lsamplerate; rtlsdr.so links -lrtlsdr; pcmrecord links -lopus -logg;
+# control links -lncursesw.
 readonly BUILD_PKGS=(
   git build-essential pkg-config
   libbsd-dev libfftw3-dev libiniparser-dev libopus-dev libogg-dev
-  libsamplerate0-dev libusb-1.0-0-dev libncurses-dev
+  libsamplerate0-dev libusb-1.0-0-dev libncurses-dev librtlsdr-dev
 )
 # Runtime/test tools: sox generates the AM test tone (see testdata/radiod-siggen.conf)
 # and analyses recordings; iproute2 for `ip`; tcpdump/opus-tools/sysstat for verification;
 # the shellcheck package lints these scripts.
-readonly TOOL_PKGS=(sox iproute2 tcpdump opus-tools sysstat shellcheck)
+# rtl-sdr provides rtl_test for checking USB access to a dongle.
+readonly TOOL_PKGS=(sox iproute2 tcpdump opus-tools sysstat shellcheck rtl-sdr)
 
 # Upstream programs to build (radiod is in src/Makefile DAEMONS; the rest in EXECS).
 readonly DAEMONS=(radiod)
 readonly EXECS=(control metadump tune pcmrecord powers)
-readonly DRIVERS=(sig_gen.so)
+readonly DRIVERS=(sig_gen.so rtlsdr.so)
 
 force_rebuild=false
 case "${1:-}" in
@@ -96,19 +98,21 @@ fetch_source() {
 
 build_and_install() {
   local stamp="${KA9Q_PREFIX}/.coaxhub-ka9q-commit"
-  if [[ "${force_rebuild}" == false && -f "${stamp}" && "$(cat "${stamp}")" == "${KA9Q_COMMIT}" \
+  # The stamp records the commit and the driver set, so adding a driver triggers a rebuild.
+  local want="${KA9Q_COMMIT} ${DRIVERS[*]}"
+  if [[ "${force_rebuild}" == false && -f "${stamp}" && "$(cat "${stamp}")" == "${want}" \
     && -x "${KA9Q_PREFIX}/sbin/radiod" ]]; then
     log "ka9q-radio ${KA9Q_COMMIT:0:12} already installed in ${KA9Q_PREFIX}"
     return
   fi
-  # Only the sig_gen front end: every other hardware driver is disabled so no SDR
-  # vendor libraries are needed. The paths below are compiled into config_paths.h.
+  # Only the sig_gen and RTL-SDR front ends: every other hardware driver is disabled
+  # so no other SDR vendor libraries are needed. The paths below are compiled into config_paths.h.
   local make_vars=(
     "prefix=${KA9Q_PREFIX}"
     "confdir=${KA9Q_PREFIX}/etc/radio"
     "statedir=${KA9Q_PREFIX}/var/lib/ka9q-radio"
     ENABLE_AIRSPY=0 ENABLE_AIRSPYHF=0 ENABLE_BLADERF=0 ENABLE_FOBOS=0
-    ENABLE_FUNCUBE=0 ENABLE_HACKRF=0 ENABLE_HYDRASDR=0 ENABLE_RTLSDR=0
+    ENABLE_FUNCUBE=0 ENABLE_HACKRF=0 ENABLE_HYDRASDR=0 ENABLE_RTLSDR=1
     ENABLE_RX888=0 ENABLE_SDRPLAY=0 ENABLE_SOAPY=0 ENABLE_SIG_GEN=1
   )
   log "building ${DAEMONS[*]} ${EXECS[*]} ${DRIVERS[*]}"
@@ -124,7 +128,7 @@ build_and_install() {
   for f in "${EXECS[@]}"; do install -m 0755 "${KA9Q_SRC}/src/${f}" "${KA9Q_PREFIX}/bin/"; done
   for f in "${DRIVERS[@]}"; do install -m 0755 "${KA9Q_SRC}/src/${f}" "${KA9Q_PREFIX}/lib/ka9q-radio/"; done
   install -m 0644 "${KA9Q_SRC}/share/presets.conf" "${KA9Q_PREFIX}/share/ka9q-radio/"
-  printf '%s\n' "${KA9Q_COMMIT}" >"${stamp}"
+  printf '%s\n' "${want}" >"${stamp}"
 }
 
 # radiod needs the MULTICAST flag on the loopback interface: its TTL-0 sockets send
