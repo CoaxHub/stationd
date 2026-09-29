@@ -91,15 +91,29 @@ pub enum SpectrumError {
 
 /// Our own quantization scale, mirroring `coaxhub.station.v1.Quantization`
 /// (`proto/coaxhub/station/v1/common.proto`) and station-protocol.md §6.2:
-/// `power_dbfs = offset_db + v * step_db`, with `v = 0` the floor and
+/// `density_db_hz = offset_db + v * step_db`, with `v = 0` the floor and
 /// `v = 255` the ceiling of the representable range.
+///
+/// Values are **power spectral density in dB/Hz** on radiod's (uncalibrated)
+/// scale: [`requantize`] subtracts `10·log10(bin width)` from radiod's
+/// per-bin power, so the same noise floor maps to the same byte at every
+/// zoom level.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Quantization {
-    /// Power, in dB, that byte value 0 represents.
+    /// Density, in dB/Hz, that byte value 0 represents.
     pub offset_db: f32,
     /// dB per LSB.
     pub step_db: f32,
 }
+
+/// The default waterfall scale: −130 dB/Hz to −2.5 dB/Hz in
+/// 0.5 dB steps. Measured with an RTL-SDR on 40 m and the signal generator,
+/// noise floors sit around −80 to −101 dB/Hz and the strongest bins around
+/// −50 dB/Hz, leaving over 40 dB of headroom and 30 dB of floor.
+pub const DEFAULT_QUANTIZATION: Quantization = Quantization {
+    offset_db: -130.0,
+    step_db: 0.5,
+};
 
 impl Quantization {
     /// Creates a new quantization scale.
@@ -108,9 +122,10 @@ impl Quantization {
         Quantization { offset_db, step_db }
     }
 
-    /// Decodes a byte value to a power in dB, per station-protocol.md §6.2.
+    /// Decodes a byte value to a power spectral density in dB/Hz, per
+    /// station-protocol.md §6.2.
     #[must_use]
-    pub fn power_dbfs(&self, v: u8) -> f32 {
+    pub fn density_db_hz(&self, v: u8) -> f32 {
         self.offset_db + f32::from(v) * self.step_db
     }
 
@@ -186,18 +201,42 @@ impl SpectrumFrame {
     }
 }
 
-/// Converts a radiod-native [`SpectrumFrame`] (quantized on `base_db`/
-/// `step_db`) to our wire scale `q`, with saturation and round-to-nearest.
+/// Converts one radiod row to our scale: radiod's per-bin power
+/// (`base_db + v * step_db`, decoded with this row's own base/step, which
+/// radiod rescales on every poll) is normalised to power spectral density by
+/// subtracting `10·log10(bin_width_hz)`, then quantized with `q` (saturating).
+///
+/// radiod reports power **per bin**, so without this the noise floor moves by
+/// the bin-width ratio when the zoom changes (measured: −50 dB with 1.8 kHz
+/// bins vs −72.5 dB with 6.25 Hz bins on the same antenna), and no fixed
+/// `Quantization` fits every zoom level.
+///
+/// A non-finite or non-positive `bin_width_hz` (never sent by radiod; only
+/// possible for a malformed frame) is treated as 1 Hz: no normalisation.
 #[must_use]
 pub fn requantize(frame: &SpectrumFrame, q: &Quantization) -> Vec<u8> {
+    let norm_db = density_normalisation_db(frame.bin_width_hz);
     frame
         .bins
         .iter()
         .map(|&v| {
             let power_db = frame.base_db + f32::from(v) * frame.step_db;
-            q.quantize(power_db)
+            q.quantize(power_db - norm_db)
         })
         .collect()
+}
+
+/// `10·log10(bin_width_hz)`: the dB to subtract from per-bin power to get dB/Hz.
+/// Returns 0 for a non-finite or non-positive width.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+// The result is a few tens of dB at most; f64 -> f32 loses nothing that matters.
+pub fn density_normalisation_db(bin_width_hz: f64) -> f32 {
+    if bin_width_hz.is_finite() && bin_width_hz > 0.0 {
+        (10.0 * bin_width_hz.log10()) as f32
+    } else {
+        0.0
+    }
 }
 
 /// Crops `frame` to the bins whose center frequency falls in
@@ -369,7 +408,7 @@ mod tests {
     fn quantize_floor_is_zero() {
         let q = Quantization::new(-160.0, 0.5);
         assert_eq!(q.quantize(-160.0), 0);
-        assert_eq!(q.power_dbfs(0), -160.0);
+        assert_eq!(q.density_db_hz(0), -160.0);
     }
 
     #[test]
@@ -377,7 +416,7 @@ mod tests {
         let q = Quantization::new(-160.0, 0.5);
         // offset + 255*step = -160 + 127.5 = -32.5
         assert_eq!(q.quantize(-32.5), 255);
-        assert_eq!(q.power_dbfs(255), -32.5);
+        assert_eq!(q.density_db_hz(255), -32.5);
     }
 
     #[test]
@@ -467,6 +506,53 @@ mod tests {
         // radiod base=-160,step=0.5: byte 200 -> -60 dB.
         let f = frame(0.0, 1.0, vec![200]);
         // Our scale: offset=-100, step=1.0 dB -> -60 dB -> v=40.
+        let q = Quantization::new(-100.0, 1.0);
+        assert_eq!(requantize(&f, &q), vec![40]);
+    }
+
+    #[test]
+    fn requantize_normalises_to_density() {
+        // radiod: base -50 dB, step 0.5; byte 0 = -50 dB per 1 kHz bin
+        // = -80 dB/Hz -> default scale (-130, 0.5) -> v = 100.
+        let f = SpectrumFrame {
+            base_db: -50.0,
+            step_db: 0.5,
+            ..frame(7.1e6, 1000.0, vec![0, 40])
+        };
+        assert_eq!(requantize(&f, &DEFAULT_QUANTIZATION), vec![100, 140]);
+        assert_eq!(DEFAULT_QUANTIZATION.density_db_hz(100), -80.0);
+    }
+
+    #[test]
+    fn same_density_maps_to_same_byte_at_every_zoom() {
+        // The same noise density (-80 dB/Hz) seen with 1.8 kHz and 6.25 Hz
+        // bins: radiod reports ~24.6 dB apart per bin; we must not.
+        let wide = SpectrumFrame {
+            base_db: -80.0 + density_normalisation_db(1800.0),
+            step_db: 0.1,
+            ..frame(7.1e6, 1800.0, vec![0])
+        };
+        let narrow = SpectrumFrame {
+            base_db: -80.0 + density_normalisation_db(6.25),
+            step_db: 0.1,
+            ..frame(7.0755e6, 6.25, vec![0])
+        };
+        assert_eq!(
+            requantize(&wide, &DEFAULT_QUANTIZATION),
+            requantize(&narrow, &DEFAULT_QUANTIZATION)
+        );
+    }
+
+    #[test]
+    fn density_normalisation_values() {
+        assert_eq!(density_normalisation_db(1.0), 0.0);
+        assert!((density_normalisation_db(1000.0) - 30.0).abs() < 1e-5);
+        assert!((density_normalisation_db(6.25) - 7.9588).abs() < 1e-3);
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(density_normalisation_db(bad), 0.0, "{bad}");
+        }
+        // Malformed width: treated as 1 Hz, i.e. plain per-bin power.
+        let f = frame(0.0, f64::NAN, vec![200]);
         let q = Quantization::new(-100.0, 1.0);
         assert_eq!(requantize(&f, &q), vec![40]);
     }
