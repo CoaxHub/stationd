@@ -79,6 +79,9 @@ pub struct FakeChannel {
     pub rtp_seq: u16,
     pub rtp_ts: u32,
     pub rtp_sent: u64,
+    /// Demodulator restarts caused by commands (a sample-rate or demod change
+    /// on a live channel), as radiod's `decode_radio_commands` reports them.
+    pub restarts: u32,
     held_rtp: Option<Vec<u8>>,
     queue: VecDeque<(Vec<u8>, SocketAddr)>,
 }
@@ -106,6 +109,7 @@ impl FakeChannel {
             rtp_seq: u16::try_from(ssrc & 0xfff).unwrap_or(0).wrapping_mul(7),
             rtp_ts: ssrc.wrapping_mul(3),
             rtp_sent: 0,
+            restarts: 0,
             held_rtp: None,
             queue: VecDeque::new(),
         }
@@ -424,6 +428,7 @@ fn apply(st: &mut FakeState, ch: &mut FakeChannel, cmd: &[u8]) -> bool {
         ch.preset = name;
     }
     let was_spectrum = ch.demod == 4;
+    let (old_samprate, old_demod) = (ch.samprate, ch.demod);
     for f in pkt.fields() {
         let Some(tag) = f.status_type() else {
             continue;
@@ -456,6 +461,13 @@ fn apply(st: &mut FakeState, ch: &mut FakeChannel, cmd: &[u8]) -> bool {
             StatusType::Lifetime => ch.lifetime_set = f.as_u32().unwrap_or(0),
             _ => {}
         }
+    }
+    // WFM always outputs 48 kHz whatever was requested (radiod wfm.c).
+    if ch.preset == "wfm" {
+        ch.samprate = 48_000;
+    }
+    if ch.samprate != old_samprate || ch.demod != old_demod {
+        ch.restarts += 1;
     }
     ch.cmd_cnt += 1;
     ch.last_tag = pkt.command_tag().unwrap_or(0);
