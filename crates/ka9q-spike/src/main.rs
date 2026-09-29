@@ -29,7 +29,7 @@ use anyhow::{Context, Result, bail};
 use backend_ka9q::client::{
     AudioChannelParams, ClientConfig, Ka9qClient, MAX_BIN_COUNT, SpectrumParams,
 };
-use backend_ka9q::spectrum::{Quantization, compress_row, requantize};
+use backend_ka9q::spectrum::{DEFAULT_QUANTIZATION, Quantization, compress_row, requantize};
 use backend_ka9q::status::ChannelStatus;
 use clap::{Args, Parser, Subcommand};
 use tokio::time::Instant;
@@ -38,11 +38,9 @@ use crate::ogg::{OggOpusWriter, OpusHeadParams};
 
 /// radiod's RTP payload type for Opus.
 const OPUS_PT: u8 = 111;
-/// Our waterfall quantization for the spike (station-protocol §6.2).
-const WATERFALL_Q: Quantization = Quantization {
-    offset_db: -160.0,
-    step_db: 0.5,
-};
+/// Our waterfall quantization for the spike: the default scale, in dB/Hz
+/// (station-protocol §6.2).
+const WATERFALL_Q: Quantization = DEFAULT_QUANTIZATION;
 /// Longest gap filled with packet-loss-concealment frames, in packets.
 const MAX_PLC_FILL: u32 = 50;
 /// Opus pre-skip written to the Ogg header (see `ogg::OpusHeadParams`).

@@ -20,7 +20,7 @@ use backend_ka9q::client::{
     SpectrumUpdate,
 };
 use backend_ka9q::command::Command;
-use backend_ka9q::spectrum::{Quantization, requantize};
+use backend_ka9q::spectrum::{DEFAULT_QUANTIZATION, requantize};
 use backend_ka9q::tags::{PktType, StatusType};
 use backend_ka9q::tlv::Encoder;
 use support::{FakeRadiod, fake_scale};
@@ -411,7 +411,7 @@ async fn spectrum_rows_arrive_at_the_poll_rate() {
     assert_eq!((fc.demod, fc.bin_count, fc.rbw), (4, 1024, 100.0));
 
     let start = tokio::time::Instant::now();
-    let q = Quantization::new(-160.0, 0.5);
+    let q = DEFAULT_QUANTIZATION;
     let mut rows = 0;
     while start.elapsed() < Duration::from_secs(10) {
         let frame = sp.recv().await.unwrap();
@@ -432,7 +432,8 @@ async fn spectrum_rows_arrive_at_the_poll_rate() {
         let valid_scales: Vec<(f32, f32)> = (0..12).map(fake_scale).collect();
         assert!(valid_scales.contains(&(frame.base_db, frame.step_db)));
         let ours = requantize(&frame, &q);
-        let want = q.quantize(frame.base_db + 255.0 * frame.step_db);
+        // Normalised to dB/Hz: 100 Hz bins -> subtract 20 dB.
+        let want = q.quantize(frame.base_db + 255.0 * frame.step_db - 20.0);
         assert_eq!(ours[512], want);
     }
     assert!((98..=101).contains(&rows), "{rows} rows in 10 s");

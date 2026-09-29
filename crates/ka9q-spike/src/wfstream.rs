@@ -19,7 +19,7 @@
 //! Then one record per row: `t_us` (u64, microseconds since the channel was
 //! opened), `len` (u32), and `len` bytes: the row's `bins` bytes compressed
 //! as one zstd frame (`backend_ka9q::spectrum::compress_row`). A byte `v`
-//! means `offset_db + v * step_db` dB (station-protocol §6.2).
+//! means `offset_db + v * step_db` dB/Hz (station-protocol §6.2).
 //!
 //! # Image (`--pgm`)
 //!
@@ -211,7 +211,7 @@ mod tests {
             bins: 4,
             center_hz: 10e6,
             bin_width_hz: 1000.0,
-            offset_db: -160.0,
+            offset_db: -130.0,
             step_db: 0.5,
         }
     }

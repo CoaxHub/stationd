@@ -65,12 +65,15 @@ enum WaterfallCompression {
   WATERFALL_COMPRESSION_ZSTD = 2;
 }
 
-// Linear mapping from a uint8 bin value v to power in dBFS:
-//   power_dbfs = offset_db + v * step_db
+// Linear mapping from a uint8 bin value v to power spectral density in dB/Hz:
+//   density_db_hz = offset_db + v * step_db
+// Rows are normalised to density (per-bin power minus 10*log10(bin width)), so
+// the same noise floor gives the same value at every zoom level. The scale is
+// the backend's, uncalibrated: it is for display, not measurement.
 // v = 0 means "at or below offset_db"; v = 255 means "at or above the top".
 message Quantization {
-  float offset_db = 1;  // e.g. -160.0
-  float step_db = 2;    // e.g. 0.5 (range 127.5 dB)
+  float offset_db = 1;  // default -130.0 (dB/Hz)
+  float step_db = 2;    // default 0.5 (range 127.5 dB: -130 .. -2.5 dB/Hz)
 }
 
 // Result of a request. Codes are stable across minor versions.
