@@ -2,7 +2,7 @@
 # except the station protocol (proto/, station-proto crate), which is MIT.
 [workspace]
 resolver = "3"
-members = ["crates/backend-ka9q"]
+members = ["crates/*"]
 
 [workspace.package]
 edition = "2024"

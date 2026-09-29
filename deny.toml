@@ -1,0 +1,67 @@
+# cargo-deny configuration for the stationd workspace.
+#
+# This tree mixes MIT (the protocol, station-proto, station-conformance) and
+# GPL-3.0-only (stationd, backend adapters, installer, packaging) code, and GPL-3.0 is
+# expected and allowed here. What cargo-deny alone cannot express is the *direction* of that split:
+# that the MIT crates must not depend on the GPL ones. That per-crate boundary is checked
+# separately by `scripts/check-license-boundary.sh` (via `cargo metadata` + `jq`), which CI
+# runs alongside this file.
+#
+# cargo-deny 0.14+ has no separate `licenses.deny` list: every license NOT in `allow` below
+# is rejected by default.
+
+[graph]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2026-0009", reason = """
+        Stack exhaustion via time's RFC 2822 parser (time::parsing, feature `parsing`).
+        Pulled in transitively (x509-parser/asn1-rs, and rcgen as a dev-dependency of
+        station-proto) without the `parsing` feature enabled anywhere in this workspace, so
+        the vulnerable code path is not compiled in, and nothing here parses
+        attacker-controlled date strings in RFC 2822 or any other textual format. The fix
+        (time >=0.3.47) requires rustc 1.88, above this workspace's rust-version = 1.85;
+        revisit when the toolchain floor moves.
+    """ },
+]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "Unicode-3.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    # Expected and intentional here: stationd, the backend adapters, packaging
+    # and the installer are GPL-3.0-only, and radiod itself (vendored headers only, not
+    # linked code) is GPL-3.0.
+    "GPL-3.0-only",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+ignore = false
+
+[bans]
+multiple-versions = "warn"
+# "allow" (the default): workspace-internal path dependencies (e.g. stationd ->
+# backend-ka9q) have no version requirement and would otherwise be flagged as "wildcard"
+# dependencies, which is a false positive for intra-workspace deps.
+wildcards = "allow"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow-workspace = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
