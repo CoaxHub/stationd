@@ -5,7 +5,8 @@
 //! - Format: `STATIOND_LOG_FORMAT=json` for one JSON object per line
 //!   (journald/log shippers); anything else, or unset, for human-readable
 //!   text.
-//! - Output: stderr.
+//! - Output: stderr. Colours only when stderr is a terminal, so the
+//!   journal (systemd) and redirected logs get plain text.
 //!
 //! Nothing in `stationd` logs key material; hub-authored strings are logged
 //! with `Debug` formatting so control characters are escaped.
@@ -40,6 +41,7 @@ pub fn init() -> bool {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_writer(std::io::stderr);
     match format {
         Format::Json => builder.json().try_init().is_ok(),

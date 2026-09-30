@@ -331,13 +331,15 @@ fn enroll_errors() {
     std::fs::write(&root, "x").expect("write");
     enroll_support::write_config(dir.path(), "https://localhost:1", &root);
     let out = stationd(&["enroll", "--token", "chs_enr_SECRETSECRET"], &config);
-    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out));
     assert!(
         text(&out).contains("not an enrollment token"),
         "{}",
         text(&out)
     );
     assert!(!text(&out).contains("SECRETSECRET"), "{}", text(&out));
+    // Logs to a pipe (the journal, the installer) carry no colour codes.
+    assert!(!text(&out).contains('\u{1b}'), "{:?}", text(&out));
     // An empty line on stdin.
     let out = Command::new(BIN)
         .args(["enroll", "--config"])
@@ -345,7 +347,7 @@ fn enroll_errors() {
         .stdin(Stdio::null())
         .output()
         .expect("run");
-    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out));
     assert!(text(&out).contains("no enrollment token"), "{}", text(&out));
 }
 
@@ -426,4 +428,77 @@ async fn static_credentials_cannot_enroll_or_unenroll() {
         "{}",
         text(&out)
     );
+}
+
+/// The token prompt on a terminal: echo is off before the prompt appears,
+/// the token is never echoed, and the terminal is restored afterwards
+/// (the installer hands stationd the terminal).
+#[test]
+fn token_prompt_hides_the_input() {
+    use rustix::termios::{LocalModes, tcgetattr};
+    use std::io::{Read as _, Write as _};
+
+    let dir = tempfile::tempdir().expect("tmp");
+    let root = dir.path().join("root.pem");
+    std::fs::write(&root, "x").expect("write");
+    let config = enroll_support::write_config(dir.path(), "https://localhost:1", &root);
+
+    let master =
+        rustix::pty::openpt(rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY)
+            .expect("openpt");
+    rustix::pty::grantpt(&master).expect("grantpt");
+    rustix::pty::unlockpt(&master).expect("unlockpt");
+    let name = rustix::pty::ptsname(&master, Vec::new()).expect("ptsname");
+    let slave = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(name.to_str().expect("utf-8 name"))
+        .expect("open the terminal");
+    assert!(
+        tcgetattr(&slave)
+            .expect("termios")
+            .local_modes
+            .contains(LocalModes::ECHO)
+    );
+
+    let child = Command::new(BIN)
+        .args(["enroll", "--config"])
+        .arg(&config)
+        .stdin(slave.try_clone().expect("clone"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    // Wait for stationd to turn echo off, then "type" a malformed token.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while tcgetattr(&slave)
+        .expect("termios")
+        .local_modes
+        .contains(LocalModes::ECHO)
+    {
+        assert!(std::time::Instant::now() < deadline, "echo never went off");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut typing = std::fs::File::from(master.try_clone().expect("clone master"));
+    typing.write_all(b"chs_enr_SECRETSECRET\n").expect("type");
+    let out = child.wait_with_output().expect("wait");
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out));
+    assert!(
+        text(&out).contains("Enrollment token (input hidden)"),
+        "{}",
+        text(&out)
+    );
+    assert!(!text(&out).contains("SECRETSECRET"), "{}", text(&out));
+    // Echo is back on, and nothing was echoed to the terminal.
+    assert!(
+        tcgetattr(&slave)
+            .expect("termios")
+            .local_modes
+            .contains(LocalModes::ECHO)
+    );
+    rustix::fs::fcntl_setfl(&master, rustix::fs::OFlags::NONBLOCK).expect("nonblocking");
+    let mut screen = Vec::new();
+    let _ = std::fs::File::from(master).read_to_end(&mut screen);
+    let screen = String::from_utf8_lossy(&screen);
+    assert!(!screen.contains("SECRET"), "echoed: {screen:?}");
 }

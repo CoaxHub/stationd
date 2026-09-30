@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Template of /usr/share/doc/coaxhub-stationd/copyright (DEP-5); assemble.sh
+# fills the @…@ fields and drops these comment lines.
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: coaxhub-stationd
+Upstream-Contact: CoaxHub <packages@@COAXHUB_DOMAIN@>
+Source: https://github.com/CoaxHub/stationd
+Comment:
+ This package bundles ka9q-radio's radiod, built from commit
+ @KA9Q_COMMIT@
+ of https://github.com/ka9q/ka9q-radio (radiod, rtlsdr.so and presets.conf
+ under /usr/lib/coaxhub/radiod/). The corresponding source is published next
+ to this package in the CoaxHub APT repository as
+ ka9q-radio-@KA9Q_SHORT@.tar.gz (SHA-256 @KA9Q_TARBALL_SHA256@),
+ and the scripts that build it are in the CoaxHub/stationd repository
+ (packaging/). radiod was built with ARCHOPTS "@ARCHOPTS@".
+
+Files: *
+Copyright: CoaxHub contributors
+License: GPL-3.0-only
+
+Files: usr/bin/stationd
+Copyright: CoaxHub contributors, and the authors of the crates below
+License: GPL-3.0-only
+Comment:
+ stationd statically links these Rust crates (name, version, licence
+ expression); each crate's licence is compatible with GPL-3.0-only:
+@RUST_CRATES@
+
+Files: usr/lib/coaxhub/radiod/*
+Copyright: 2017-2026 Phil Karn, KA9Q
+License: GPL-3
+
+License: GPL-3.0-only
+ This program is free software: you can redistribute it and/or modify it
+ under the terms of the GNU General Public License as published by the Free
+ Software Foundation, version 3.
+ .
+ This program is distributed in the hope that it will be useful, but WITHOUT
+ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ more details.
+ .
+ On Debian systems, the complete text of the GNU General Public License
+ version 3 can be found in /usr/share/common-licenses/GPL-3.
+
+License: GPL-3
+ ka9q-radio is distributed under the GNU General Public License version 3
+ (its LICENSE.TXT).
+ .
+ On Debian systems, the complete text of the GNU General Public License
+ version 3 can be found in /usr/share/common-licenses/GPL-3.

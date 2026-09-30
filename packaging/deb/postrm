@@ -1,0 +1,61 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# coaxhub-stationd postrm. `remove` keeps the configuration, the station's
+# credentials and the users, so reinstalling needs no new enrollment.
+# `purge` removes all of them: /etc/coaxhub, /var/lib/coaxhub (the station
+# key and certificate), /var/lib/coaxhub-radiod, the users, and the
+# services' enablement.
+set -e
+
+TIME_WAIT_MARKER=/var/lib/coaxhub/.enabled-time-wait-sync
+
+remove_system_user() {
+	if getent passwd "$1" >/dev/null; then
+		if command -v deluser >/dev/null 2>&1; then
+			deluser --system --quiet "$1" || true
+		else
+			userdel "$1" || true
+		fi
+	fi
+	if getent group "$1" >/dev/null; then
+		if command -v delgroup >/dev/null 2>&1; then
+			delgroup --system --quiet --only-if-empty "$1" || true
+		else
+			groupdel "$1" || true
+		fi
+	fi
+}
+
+case "$1" in
+remove)
+	if [ -d /run/systemd/system ]; then
+		systemctl daemon-reload || true
+	fi
+	;;
+purge)
+	for unit in stationd.service coaxhub-radiod.service; do
+		rm -f /etc/systemd/system/*.wants/"$unit"
+	done
+	if [ -e "$TIME_WAIT_MARKER" ] && command -v systemctl >/dev/null 2>&1; then
+		systemctl disable --quiet systemd-time-wait-sync.service 2>/dev/null || true
+	fi
+	rm -rf /var/lib/coaxhub /var/lib/coaxhub-radiod /etc/coaxhub \
+		/run/coaxhub /run/coaxhub-radiod
+	remove_system_user coaxhub
+	remove_system_user coaxhub-radiod
+	if [ -d /run/systemd/system ]; then
+		systemctl daemon-reload || true
+	fi
+	if command -v udevadm >/dev/null 2>&1 && [ -d /run/udev ]; then
+		udevadm control --reload-rules 2>/dev/null || true
+	fi
+	;;
+upgrade | failed-upgrade | abort-install | abort-upgrade | disappear) ;;
+*)
+	echo "postrm called with unknown argument '$1'" >&2
+	exit 1
+	;;
+esac
+
+exit 0

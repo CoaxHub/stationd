@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Build context of packaging/deb/Dockerfile: the repository without build output.
+target
+**/target
+.git
+**/*.rs.bk

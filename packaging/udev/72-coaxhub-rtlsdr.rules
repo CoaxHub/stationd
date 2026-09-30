@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# RTL-SDR dongles (RTL2832U, 0bda:2838 and 0bda:2832) belong to the bundled
+# radiod (coaxhub-radiod.service) and to nobody else.
+#
+# Numbered 72 so it runs after 60-librtlsdr0.rules (GROUP plugdev) and
+# 70-uaccess.rules (which tags software radios for the desktop user), and
+# before 73-seat-late.rules applies the uaccess tag. `:=` makes the
+# assignments final.
+
+ACTION=="remove", GOTO="coaxhub_rtlsdr_end"
+SUBSYSTEM!="usb", GOTO="coaxhub_rtlsdr_end"
+ENV{DEVTYPE}!="usb_device", GOTO="coaxhub_rtlsdr_end"
+
+ATTR{idVendor}=="0bda", ATTR{idProduct}=="2838", GOTO="coaxhub_rtlsdr"
+ATTR{idVendor}=="0bda", ATTR{idProduct}=="2832", GOTO="coaxhub_rtlsdr"
+GOTO="coaxhub_rtlsdr_end"
+
+LABEL="coaxhub_rtlsdr"
+OWNER:="root", GROUP:="coaxhub-radiod", MODE:="0660", TAG-="uaccess"
+
+LABEL="coaxhub_rtlsdr_end"
