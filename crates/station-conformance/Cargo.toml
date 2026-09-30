@@ -1,0 +1,37 @@
+[package]
+name = "station-conformance"
+description = "Scripted fake CoaxHub hub and conformance scenarios for station implementations (coaxhub.station.v1)"
+version = "0.1.0"
+edition.workspace = true
+# MIT like the protocol: usable by non-GPL station implementations.
+# Depends on station-proto only, never on a GPL crate of this workspace
+# (scripts/check-license-boundary.sh).
+license = "MIT"
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = "0.1.92"
+coaxhub-station-proto = { path = "../station-proto" }
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+tokio = { version = "1.53.1", features = ["rt", "net", "time", "sync", "macros", "fs"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
+tokio-stream = { version = "0.1.19", features = ["net"] }
+tokio-util = "0.7.19"
+tonic = { version = "0.14.6", default-features = false, features = ["server", "codegen"] }
+tracing = "0.1.44"
+uuid = { version = "1.26.1", features = ["v4"] }
+
+[dev-dependencies]
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
+tower-service = "0.3.3"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "test-util"] }
+tonic = { version = "0.14.6", default-features = false, features = ["channel"] }
