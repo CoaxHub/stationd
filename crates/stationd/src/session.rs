@@ -15,7 +15,7 @@ use station_backend::{ChannelOutput, EventStream};
 use station_proto::v1::station_gateway_client::StationGatewayClient;
 use station_proto::validate::negotiate_welcome;
 use station_proto::{limits, v1};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
@@ -25,6 +25,7 @@ use tracing::{debug, error, info, warn};
 use crate::daemon::{ConnectionState, Ctx, Link};
 use crate::dispatch::{self, Media, RequestContext, truncate_utf8};
 use crate::outbound::Outbound;
+use crate::renew::Signal;
 use crate::status;
 
 use v1::hub_message::Body as HubBody;
@@ -40,6 +41,10 @@ pub(crate) enum End {
     Goodbye(v1::Goodbye),
     /// Connect failure, stream error or end, welcome timeout.
     Lost(String),
+    /// A renewed certificate is stored: reconnect with it at once.
+    Renewed,
+    /// `station-api` refused the certificate with this serial as revoked.
+    Revoked(String),
 }
 
 /// A session's result for the reconnect loop.
@@ -97,6 +102,7 @@ pub(crate) async fn run(
     link: &Link,
     shutdown: &CancellationToken,
     state: &watch::Sender<ConnectionState>,
+    signals: &mut mpsc::Receiver<Signal>,
 ) -> Outcome {
     let endpoint = match endpoint(ctx, link) {
         Ok(e) => e,
@@ -128,31 +134,9 @@ pub(crate) async fn run(
             return Outcome::before_welcome(End::Lost(format!("Connect failed: {status}")));
         }
     };
-    let first = tokio::select! {
-        r = tokio::time::timeout(ctx.welcome_timeout, inbound.message()) => r,
-        () = shutdown.cancelled() => return Outcome::before_welcome(End::Shutdown),
-    };
-    let welcome = match first {
-        Err(_) => {
-            return Outcome::before_welcome(End::Lost("no Welcome from the hub in time".into()));
-        }
-        Ok(Err(status)) => {
-            return Outcome::before_welcome(End::Lost(format!("stream error: {status}")));
-        }
-        Ok(Ok(None)) => {
-            return Outcome::before_welcome(End::Lost(
-                "hub closed the stream before Welcome".into(),
-            ));
-        }
-        Ok(Ok(Some(msg))) => match msg.body {
-            Some(HubBody::Welcome(w)) => w,
-            Some(HubBody::Goodbye(g)) => return Outcome::before_welcome(End::Goodbye(g)),
-            Some(HubBody::Request(_)) | None => {
-                return Outcome::before_welcome(End::Lost(
-                    "hub sent something other than Welcome or Goodbye first".into(),
-                ));
-            }
-        },
+    let welcome = match await_welcome(ctx, &mut inbound, shutdown).await {
+        Ok(w) => w,
+        Err(end) => return Outcome::before_welcome(end),
     };
     let version = match negotiate_welcome(&welcome) {
         Ok(v) => v,
@@ -167,6 +151,7 @@ pub(crate) async fn run(
         }
     };
     let established_at = tokio::time::Instant::now().into_std();
+    record_clock_skew(ctx, welcome.hub_time_unix_ms, unix_now_ms());
     let connection_id = truncate_utf8(&welcome.connection_id, 64);
     info!(
         connection_id = ?connection_id,
@@ -192,11 +177,64 @@ pub(crate) async fn run(
             tables: Arc::default(),
         },
     };
-    let end = session.serve(inbound, status_interval, shutdown).await;
+    let end = session
+        .serve(inbound, status_interval, shutdown, signals, &link.serial)
+        .await;
     Outcome {
         end,
         established_at: Some(established_at),
     }
+}
+
+/// Waits for the hub's first message: `Welcome`, or the reason there is
+/// none.
+async fn await_welcome(
+    ctx: &Ctx,
+    inbound: &mut tonic::Streaming<v1::HubMessage>,
+    shutdown: &CancellationToken,
+) -> Result<v1::Welcome, End> {
+    let first = tokio::select! {
+        r = tokio::time::timeout(ctx.welcome_timeout, inbound.message()) => r,
+        () = shutdown.cancelled() => return Err(End::Shutdown),
+    };
+    match first {
+        Err(_) => Err(End::Lost("no Welcome from the hub in time".into())),
+        Ok(Err(status)) => Err(End::Lost(format!("stream error: {status}"))),
+        Ok(Ok(None)) => Err(End::Lost("hub closed the stream before Welcome".into())),
+        Ok(Ok(Some(msg))) => match msg.body {
+            Some(HubBody::Welcome(w)) => Ok(w),
+            Some(HubBody::Goodbye(g)) => Err(End::Goodbye(g)),
+            Some(HubBody::Request(_)) | None => Err(End::Lost(
+                "hub sent something other than Welcome or Goodbye first".into(),
+            )),
+        },
+    }
+}
+
+/// Local wall-clock time, Unix milliseconds.
+fn unix_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// Records hub time minus local time (`Welcome.hub_time_unix_ms`, 0 when
+/// the hub did not say), for `stationd status` and `doctor`. The round
+/// trip is ignored: this is a coarse diagnostic, never used to refuse
+/// anything.
+fn record_clock_skew(ctx: &Ctx, hub_time_unix_ms: i64, local_unix_ms: i64) {
+    if hub_time_unix_ms == 0 {
+        return;
+    }
+    let skew = hub_time_unix_ms.saturating_sub(local_unix_ms);
+    if skew.unsigned_abs() > crate::local_status::CLOCK_SKEW_WARN_MS.unsigned_abs() {
+        warn!(
+            clock_skew_ms = skew,
+            "this station's clock differs from the hub's by more than 30 s; check NTP \
+             (TLS certificates depend on the clock)"
+        );
+    }
+    ctx.observed.send_modify(|o| o.clock_skew_ms = Some(skew));
 }
 
 /// Closes the outbound queue when dropped.
@@ -220,6 +258,8 @@ impl Session {
         mut inbound: tonic::Streaming<v1::HubMessage>,
         status_interval: Duration,
         shutdown: &CancellationToken,
+        signals: &mut mpsc::Receiver<Signal>,
+        serial: &str,
     ) -> End {
         let mut tasks = JoinSet::new();
         let mut status_tick = tokio::time::interval(status_interval);
@@ -251,6 +291,15 @@ impl Session {
                 _ = status_tick.tick() => {
                     self.outbound.push_body(Body::Status(self.status()));
                 }
+                Some(signal) = signals.recv() => match signal {
+                    // Renewed before this connection loaded it: already in use.
+                    Signal::Renewed { serial: s } if s == serial => {}
+                    Signal::Renewed { .. } => {
+                        info!("certificate renewed: closing the tunnel to reconnect with it");
+                        break End::Renewed;
+                    }
+                    Signal::Revoked { serial } => break End::Revoked(serial),
+                },
                 event = events.next() => {
                     if let Some(event) = event {
                         self.forward_event(event);

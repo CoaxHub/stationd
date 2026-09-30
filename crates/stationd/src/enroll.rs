@@ -21,17 +21,16 @@ use std::time::Duration;
 
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ECDSA_P256_SHA256};
 use station_proto::identity;
-use station_proto::v1::enrollment_client::EnrollmentClient;
-use station_proto::v1::{EnrollRequest, EnrollResponse};
-use tonic::transport::Uri;
+use station_proto::v1::{self, EnrollRequest, EnrollResponse};
 use tracing::info;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::config::{Config, CredentialsMode, Endpoint, Endpoints, TrustAnchor};
 use crate::credentials::{CredentialSource as _, EnrolledSource};
+use crate::rpc::{self, Failure};
 use crate::state::{Assignment, Enrollment, StateDir, StateError};
-use crate::tls::{self, ConnectError, Connector, TlsError, Validity};
+use crate::tls::{self, Validity};
 
 /// The token prefix (station-protocol §8).
 pub const TOKEN_PREFIX: &str = "chs_enr_";
@@ -46,8 +45,6 @@ const MAX_CA_BUNDLE_BYTES: usize = 64 * 1024;
 const MAX_CHAIN_LEN: usize = 8;
 /// Longest accepted hub id.
 const MAX_HUB_ID_LEN: usize = 64;
-/// How much of a server message is shown.
-const MAX_SERVER_MESSAGE: usize = 200;
 
 /// An enrollment token. Its text is zeroed on drop and never printed.
 pub struct Token(Zeroizing<String>);
@@ -408,124 +405,110 @@ pub async fn call_enroll(
         endpoint: endpoint.url.clone(),
         detail: e.to_string(),
     })?;
-    let channel = channel(endpoint, Arc::new(tls_config), options).await?;
-    let mut client = EnrollmentClient::new(channel);
-    let request = EnrollRequest {
+    let channel = rpc::channel(
+        endpoint,
+        Arc::new(tls_config),
+        options.connect_timeout,
+        options.request_timeout,
+    )
+    .await
+    .map_err(|f| failure_error(endpoint, f))?;
+    let request = SecretEnrollRequest(EnrollRequest {
         token: token.expose().to_owned(),
         csr_der,
         daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
-    };
+    });
     drop(token);
     let mut request = tonic::Request::new(request);
     request.set_timeout(options.request_timeout);
-    let call = client.enroll(request);
-    match tokio::time::timeout(options.request_timeout, call).await {
-        Err(_) => Err(EnrollError::Timeout {
+    rpc::with_timeout(options.request_timeout, enroll_secret(channel, request))
+        .await
+        .map_err(|f| failure_error(endpoint, f))
+}
+
+/// The `Enrollment.Enroll` method path.
+const ENROLL_PATH: &str = "/coaxhub.station.v1.Enrollment/Enroll";
+
+/// An `EnrollRequest` whose token copy is zeroed when tonic drops it after
+/// encoding. The encoded bytes live in tonic's and
+/// rustls's buffers, which this cannot reach.
+#[derive(Default)]
+struct SecretEnrollRequest(EnrollRequest);
+
+impl Drop for SecretEnrollRequest {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        self.0.token.zeroize();
+    }
+}
+
+impl fmt::Debug for SecretEnrollRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("EnrollRequest(<redacted>)")
+    }
+}
+
+impl prost::Message for SecretEnrollRequest {
+    fn encode_raw(&self, buf: &mut impl prost::bytes::BufMut) {
+        self.0.encode_raw(buf);
+    }
+
+    fn merge_field(
+        &mut self,
+        tag: u32,
+        wire_type: prost::encoding::WireType,
+        buf: &mut impl prost::bytes::Buf,
+        ctx: prost::encoding::DecodeContext,
+    ) -> Result<(), prost::DecodeError> {
+        self.0.merge_field(tag, wire_type, buf, ctx)
+    }
+
+    fn encoded_len(&self) -> usize {
+        self.0.encoded_len()
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
+/// `Enrollment.Enroll` with [`SecretEnrollRequest`] (the generated client
+/// only takes a plain `EnrollRequest`).
+async fn enroll_secret(
+    channel: tonic::transport::Channel,
+    request: tonic::Request<SecretEnrollRequest>,
+) -> Result<tonic::Response<EnrollResponse>, tonic::Status> {
+    let mut grpc = tonic::client::Grpc::new(channel);
+    grpc.ready()
+        .await
+        .map_err(|e| tonic::Status::unavailable(format!("service was not ready: {e}")))?;
+    let codec = tonic_prost::ProstCodec::<SecretEnrollRequest, EnrollResponse>::default();
+    let path = tonic::codegen::http::uri::PathAndQuery::from_static(ENROLL_PATH);
+    grpc.unary(request, path, codec).await
+}
+
+/// Maps a call failure to an [`EnrollError`]; `UNAUTHENTICATED` is a
+/// refused token (`expired`, `used`, otherwise invalid).
+fn failure_error(endpoint: &Endpoint, failure: Failure) -> EnrollError {
+    match failure {
+        Failure::Network(detail) => EnrollError::Network {
             endpoint: endpoint.url.clone(),
-        }),
-        Ok(Ok(r)) => Ok(r.into_inner()),
-        Ok(Err(status)) => Err(status_error(endpoint, &status)),
-    }
-}
-
-async fn channel(
-    endpoint: &Endpoint,
-    config: Arc<rustls::ClientConfig>,
-    options: EnrollOptions,
-) -> Result<tonic::transport::Channel, EnrollError> {
-    let authority = endpoint.authority();
-    let bad = |detail: String| EnrollError::Network {
-        endpoint: endpoint.url.clone(),
-        detail,
-    };
-    let connector = Connector::new(config, endpoint).map_err(|e: TlsError| bad(e.to_string()))?;
-    let origin: Uri = format!("https://{authority}")
-        .parse()
-        .map_err(|e| bad(format!("{e}")))?;
-    let ep = tonic::transport::Endpoint::from_shared(format!("http://{authority}"))
-        .map_err(|e| bad(e.to_string()))?
-        .origin(origin)
-        .connect_timeout(options.connect_timeout)
-        .timeout(options.request_timeout);
-    match tokio::time::timeout(
-        options.connect_timeout,
-        ep.connect_with_connector(connector),
-    )
-    .await
-    {
-        Err(_) => Err(EnrollError::Timeout {
+            detail,
+        },
+        Failure::Tls(detail) => EnrollError::Tls {
             endpoint: endpoint.url.clone(),
-        }),
-        Ok(Ok(c)) => Ok(c),
-        Ok(Err(e)) => Err(connect_error(endpoint, &e)),
-    }
-}
-
-/// Maps a transport error to [`EnrollError::Tls`] or
-/// [`EnrollError::Network`] by its cause.
-fn connect_error(endpoint: &Endpoint, e: &(dyn std::error::Error + 'static)) -> EnrollError {
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(e);
-    while let Some(s) = source {
-        if let Some(c) = s.downcast_ref::<ConnectError>() {
-            return match c {
-                ConnectError::Tcp { .. } => EnrollError::Network {
-                    endpoint: endpoint.url.clone(),
-                    detail: c.to_string(),
-                },
-                _ => EnrollError::Tls {
-                    endpoint: endpoint.url.clone(),
-                    detail: c.to_string(),
-                },
-            };
-        }
-        source = s.source();
-    }
-    EnrollError::Network {
-        endpoint: endpoint.url.clone(),
-        detail: e.to_string(),
-    }
-}
-
-/// A server message fit for a terminal: control characters escaped,
-/// truncated.
-fn server_message(message: &str) -> String {
-    let escaped: String = message.escape_debug().collect();
-    let mut cut = escaped.len().min(MAX_SERVER_MESSAGE);
-    while !escaped.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    let mut out = escaped[..cut].to_owned();
-    if cut < escaped.len() {
-        out.push('…');
-    }
-    out
-}
-
-fn status_error(endpoint: &Endpoint, status: &tonic::Status) -> EnrollError {
-    use tonic::Code;
-    match status.code() {
-        Code::Unauthenticated => EnrollError::Token(TokenProblem::from_message(status.message())),
-        Code::DeadlineExceeded => EnrollError::Timeout {
+            detail,
+        },
+        Failure::Timeout => EnrollError::Timeout {
             endpoint: endpoint.url.clone(),
         },
-        Code::Unavailable | Code::Unknown | Code::Cancelled => {
-            if let Some(source) = std::error::Error::source(status) {
-                return connect_error(endpoint, source);
-            }
-            if status.code() == Code::Unavailable {
-                return EnrollError::Network {
-                    endpoint: endpoint.url.clone(),
-                    detail: server_message(status.message()),
-                };
-            }
-            EnrollError::Refused {
-                code: format!("{:?}", status.code()),
-                message: server_message(status.message()),
-            }
-        }
-        code => EnrollError::Refused {
+        Failure::Status {
+            code: tonic::Code::Unauthenticated,
+            message,
+        } => EnrollError::Token(TokenProblem::from_message(&message)),
+        Failure::Status { code, message } => EnrollError::Refused {
             code: format!("{code:?}"),
-            message: server_message(status.message()),
+            message,
         },
     }
 }
@@ -539,6 +522,22 @@ struct Checked {
     gateway_ca_pem: String,
     assignment: Assignment,
     validity: Validity,
+}
+
+/// A checked station certificate from `Enroll` or `RenewCertificate`, as
+/// PEM.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckedCertificate {
+    /// The station ID from the SAN.
+    pub station_id: Uuid,
+    /// The leaf.
+    pub cert_pem: String,
+    /// The intermediates (may be empty).
+    pub chain_pem: String,
+    /// The leaf's validity.
+    pub validity: Validity,
+    /// The leaf's serial, hex.
+    pub serial: String,
 }
 
 fn pem_cert(der: &[u8]) -> String {
@@ -556,70 +555,101 @@ fn hub_id_ok(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
-/// Checks that the certificate identifies `station_id`, carries our key and
-/// is valid now, and that the CA bundle and assignment are usable.
-fn check_response(r: EnrollResponse, public_key: &[u8]) -> Result<Checked, EnrollError> {
+/// Checks that `cert` identifies `station_id` (when given, else any
+/// station), carries `public_key` and is valid at `now` (Unix seconds).
+pub(crate) fn check_certificate(
+    cert: Option<v1::StationCertificate>,
+    station_id: Option<Uuid>,
+    public_key: &[u8],
+    now: i64,
+) -> Result<CheckedCertificate, String> {
     use x509_parser::prelude::FromDer as _;
-    let bad = |m: &str| EnrollError::BadResponse(m.to_owned());
-    let station_id = Uuid::try_parse(&r.station_id)
-        .ok()
-        .filter(|u| !u.is_nil())
-        .ok_or_else(|| bad("station_id is not a UUID"))?;
-    let cert = r.certificate.ok_or_else(|| bad("no certificate"))?;
+    let cert = cert.ok_or("no certificate")?;
     let (rest, leaf) = x509_parser::certificate::X509Certificate::from_der(&cert.certificate_der)
-        .map_err(|_| bad("the certificate is not DER X.509"))?;
+        .map_err(|_| "the certificate is not DER X.509")?;
     if !rest.is_empty() {
-        return Err(bad("trailing bytes after the certificate"));
+        return Err("trailing bytes after the certificate".into());
     }
     let san_id = identity::station_id_from_cert_der(&cert.certificate_der)
-        .map_err(|e| EnrollError::BadResponse(format!("the certificate: {e}")))?;
-    if san_id != station_id {
-        return Err(bad("the certificate is for another station"));
+        .map_err(|e| format!("the certificate: {e}"))?;
+    if station_id.is_some_and(|id| id != san_id) {
+        return Err("the certificate is for another station".into());
     }
     if leaf.public_key().subject_public_key.data.as_ref() != public_key {
-        return Err(bad("the certificate is not for this station's key"));
+        return Err("the certificate is not for this station's key".into());
     }
-    let validity = Validity::of_der(&cert.certificate_der).ok_or_else(|| bad("no validity"))?;
-    let now = crate::local_status::unix_now();
+    let validity = Validity::of_der(&cert.certificate_der).ok_or("no validity")?;
     if validity.not_after_unix_s <= now {
-        return Err(bad(
-            "the certificate has already expired (is this station's clock right?)",
-        ));
+        return Err("the certificate has already expired (is this station's clock right?)".into());
     }
+    let serial = tls::serial_hex(&cert.certificate_der).ok_or("no serial")?;
     if cert.chain_der.len() > MAX_CHAIN_LEN {
-        return Err(bad("the certificate chain is too long"));
+        return Err("the certificate chain is too long".into());
     }
     let mut chain_pem = String::new();
     for der in &cert.chain_der {
         if x509_parser::certificate::X509Certificate::from_der(der).is_err() {
-            return Err(bad("a chain certificate is not DER X.509"));
+            return Err("a chain certificate is not DER X.509".into());
         }
         chain_pem.push_str(&pem_cert(der));
     }
-    if r.gateway_ca_bundle_pem.len() > MAX_CA_BUNDLE_BYTES {
-        return Err(bad("the gateway CA bundle is too large"));
-    }
-    let roots = tls::parse_certs(&r.gateway_ca_bundle_pem)
-        .map_err(|e| EnrollError::BadResponse(format!("the gateway CA bundle: {e}")))?;
-    tls::root_store(roots.clone())
-        .map_err(|e| EnrollError::BadResponse(format!("the gateway CA bundle: {e}")))?;
-    let gateway_ca_pem: String = roots.iter().map(|c| pem_cert(c)).collect();
-    let a = r.assignment.ok_or_else(|| bad("no assignment"))?;
-    if !hub_id_ok(&a.hub_id) {
-        return Err(bad("the assignment's hub_id is malformed"));
-    }
-    Endpoint::parse("assignment.gateway_url", &a.gateway_url)
-        .map_err(|e| EnrollError::BadResponse(e.to_string()))?;
-    Ok(Checked {
-        station_id,
+    Ok(CheckedCertificate {
+        station_id: san_id,
         cert_pem: pem_cert(&cert.certificate_der),
         chain_pem,
-        gateway_ca_pem,
-        assignment: Assignment {
-            hub_id: a.hub_id,
-            gateway_url: a.gateway_url,
-        },
         validity,
+        serial,
+    })
+}
+
+/// Checks a gateway CA bundle and returns it re-encoded (certificates
+/// only).
+pub(crate) fn check_ca_bundle(pem_text: &str) -> Result<String, String> {
+    if pem_text.len() > MAX_CA_BUNDLE_BYTES {
+        return Err("the gateway CA bundle is too large".into());
+    }
+    let roots = tls::parse_certs(pem_text).map_err(|e| format!("the gateway CA bundle: {e}"))?;
+    tls::root_store(roots.clone()).map_err(|e| format!("the gateway CA bundle: {e}"))?;
+    Ok(roots.iter().map(|c| pem_cert(c)).collect())
+}
+
+/// Checks an assignment: a well-formed hub id and an `https` gateway URL.
+pub(crate) fn check_assignment(a: Option<v1::Assignment>) -> Result<Assignment, String> {
+    let a = a.ok_or("no assignment")?;
+    if !hub_id_ok(&a.hub_id) {
+        return Err("the assignment's hub_id is malformed".into());
+    }
+    Endpoint::parse("assignment.gateway_url", &a.gateway_url).map_err(|e| e.to_string())?;
+    Ok(Assignment {
+        hub_id: a.hub_id,
+        gateway_url: a.gateway_url,
+    })
+}
+
+/// Checks that the certificate identifies `station_id`, carries our key and
+/// is valid now, and that the CA bundle and assignment are usable.
+fn check_response(r: EnrollResponse, public_key: &[u8]) -> Result<Checked, EnrollError> {
+    let station_id = Uuid::try_parse(&r.station_id)
+        .ok()
+        .filter(|u| !u.is_nil())
+        .ok_or_else(|| EnrollError::BadResponse("station_id is not a UUID".into()))?;
+    let cert = check_certificate(
+        r.certificate,
+        Some(station_id),
+        public_key,
+        crate::local_status::unix_now(),
+    )
+    .map_err(EnrollError::BadResponse)?;
+    let gateway_ca_pem =
+        check_ca_bundle(&r.gateway_ca_bundle_pem).map_err(EnrollError::BadResponse)?;
+    let assignment = check_assignment(r.assignment).map_err(EnrollError::BadResponse)?;
+    Ok(Checked {
+        station_id,
+        cert_pem: cert.cert_pem,
+        chain_pem: cert.chain_pem,
+        gateway_ca_pem,
+        assignment,
+        validity: cert.validity,
     })
 }
 
@@ -697,57 +727,54 @@ mod tests {
     }
 
     #[test]
-    fn server_messages_are_escaped_and_truncated() {
-        assert_eq!(server_message("a\nb\u{1b}"), "a\\nb\\u{1b}");
-        let long = "é".repeat(300);
-        let m = server_message(&long);
-        assert!(m.ends_with('…'));
-        assert!(m.len() <= MAX_SERVER_MESSAGE + '…'.len_utf8());
-    }
-
-    #[test]
-    fn status_mapping() {
-        use tonic::{Code, Status};
+    fn failure_mapping() {
+        use tonic::Code;
         let ep = Endpoint::parse("x", "https://enroll.example").expect("ep");
+        let status = |code, message: &str| Failure::Status {
+            code,
+            message: message.to_owned(),
+        };
         assert!(matches!(
-            status_error(&ep, &Status::new(Code::Unauthenticated, "expired")),
+            failure_error(&ep, status(Code::Unauthenticated, "expired")),
             EnrollError::Token(TokenProblem::Expired)
         ));
         assert!(matches!(
-            status_error(&ep, &Status::new(Code::DeadlineExceeded, "")),
+            failure_error(&ep, Failure::Timeout),
             EnrollError::Timeout { .. }
         ));
         assert!(matches!(
-            status_error(&ep, &Status::new(Code::Unavailable, "down")),
+            failure_error(&ep, Failure::Network("down".into())),
             EnrollError::Network { .. }
         ));
-        let e = status_error(&ep, &Status::new(Code::ResourceExhausted, "slow\ndown"));
+        assert!(matches!(
+            failure_error(&ep, Failure::Tls("alpn".into())),
+            EnrollError::Tls { .. }
+        ));
+        let e = failure_error(&ep, status(Code::ResourceExhausted, "slow\\ndown"));
         assert_eq!(
             e.to_string(),
             "the enrollment service refused the request (ResourceExhausted): slow\\ndown"
         );
-        assert!(matches!(
-            status_error(&ep, &Status::new(Code::Unknown, "x")),
-            EnrollError::Refused { .. }
-        ));
-        let io = std::io::Error::other("refused");
-        let e = connect_error(
-            &ep,
-            &ConnectError::Tcp {
-                authority: "a:1".into(),
-                source: io,
-            },
-        );
-        assert!(matches!(e, EnrollError::Network { .. }), "{e}");
-        let e = connect_error(
-            &ep,
-            &ConnectError::Alpn {
-                authority: "a:1".into(),
-            },
-        );
-        assert!(matches!(e, EnrollError::Tls { .. }), "{e}");
-        let e = connect_error(&ep, &std::io::Error::other("other"));
-        assert!(matches!(e, EnrollError::Network { .. }), "{e}");
+    }
+
+    #[test]
+    fn secret_request_encodes_like_the_plain_one() {
+        use prost::Message as _;
+        let plain = EnrollRequest {
+            token: GOOD.into(),
+            csr_der: vec![1, 2, 3],
+            daemon_version: "1".into(),
+        };
+        let mut secret = SecretEnrollRequest(plain.clone());
+        assert_eq!(secret.encode_to_vec(), plain.encode_to_vec());
+        assert_eq!(secret.encoded_len(), plain.encoded_len());
+        assert!(!format!("{secret:?}").contains("0123"));
+        let decoded =
+            SecretEnrollRequest::decode(plain.encode_to_vec().as_slice()).expect("decode");
+        assert_eq!(decoded.0, plain);
+        secret.clear();
+        assert_eq!(secret.0, EnrollRequest::default());
+        assert_eq!(SecretEnrollRequest::default().0, EnrollRequest::default());
     }
 
     #[test]

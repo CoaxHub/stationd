@@ -94,6 +94,9 @@ pub struct ClientTls {
     pub trust_anchors: usize,
     /// The leaf certificate's validity.
     pub validity: Validity,
+    /// The leaf certificate's serial number, lowercase hex (for logs, and
+    /// to tell a renewed certificate from the one a refusal was about).
+    pub serial: String,
 }
 
 /// A certificate's validity period.
@@ -103,6 +106,24 @@ pub struct Validity {
     pub not_before_unix_s: i64,
     /// `notAfter`, Unix seconds.
     pub not_after_unix_s: i64,
+}
+
+/// The serial number of a DER certificate, lowercase hex without leading
+/// zero bytes.
+pub fn serial_hex(der: &[u8]) -> Option<String> {
+    use std::fmt::Write as _;
+    use x509_parser::prelude::FromDer as _;
+    let (_, cert) = x509_parser::certificate::X509Certificate::from_der(der).ok()?;
+    let raw = cert.raw_serial();
+    let start = raw.iter().position(|b| *b != 0).unwrap_or(raw.len());
+    let mut out = String::with_capacity(2 * raw.len());
+    for b in &raw[start..] {
+        let _ = write!(out, "{b:02x}");
+    }
+    if out.is_empty() {
+        out.push('0');
+    }
+    Some(out)
 }
 
 impl Validity {
@@ -203,6 +224,10 @@ pub fn load_files(files: CredentialFiles<'_>) -> Result<ClientTls, TlsError> {
         path: files.cert.to_owned(),
         reason: "the leaf certificate cannot be parsed".to_owned(),
     })?;
+    let serial = serial_hex(leaf).ok_or_else(|| TlsError::Certificates {
+        path: files.cert.to_owned(),
+        reason: "the leaf certificate cannot be parsed".to_owned(),
+    })?;
     let key = PrivateKeyDer::from_pem_file(files.key).map_err(|e| TlsError::Key {
         path: files.key.to_owned(),
         reason: pem_reason(&e),
@@ -220,6 +245,7 @@ pub fn load_files(files: CredentialFiles<'_>) -> Result<ClientTls, TlsError> {
         station_id,
         trust_anchors,
         validity,
+        serial,
     })
 }
 

@@ -32,6 +32,8 @@ coaxhub-station-proto = { path = "../station-proto" }
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
 pem = "4.0.0"
+# L-5: a request type whose token copy is zeroed after encoding.
+prost = "0.14.4"
 rand = "0.10.3"
 # Key generation and the enrollment CSR (ECDSA P-256).
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
@@ -47,6 +49,7 @@ tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring
 tokio-util = "0.7.19"
 toml = "0.9"
 tonic = { version = "0.14.6", default-features = false, features = ["channel", "codegen"] }
+tonic-prost = "0.14.6"
 tower-service = "0.3.3"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }

@@ -16,7 +16,10 @@
 //! - [`state`]: the state directory (atomic writes, strict permissions);
 //!   [`credentials`]: where the tunnel's credentials come from (static or
 //!   enrolled), re-read before every connect attempt.
-//! - [`enroll`]: `Enrollment.Enroll` against the `CoaxHub` root only.
+//! - [`enroll`]: `Enrollment.Enroll` against the `CoaxHub` root only;
+//!   [`station_api`]: `StationControl` (`GetAssignment`,
+//!   `RenewCertificate`) with the station certificate; [`renew`]: when to
+//!   renew, and the renewal task.
 //! - [`tls`]: TLS 1.3-only (m)TLS trusting one explicit bundle.
 //! - [`daemon`]: the reconnect loop and the in-process API ([`spawn`],
 //!   [`DaemonHandle`], [`ConnectionState`]).
@@ -41,12 +44,16 @@ pub mod local_status;
 pub mod logging;
 pub mod outbound;
 pub mod profile;
+pub mod renew;
+mod rpc;
 mod session;
 pub mod state;
+pub mod station_api;
 pub mod status;
 pub mod tls;
 
 pub use config::{Config, LocalPolicy};
 pub use daemon::{
-    ConnectionState, DaemonHandle, RunError, RunOptions, StopReason, run, spawn, spawn_with,
+    ConnectionState, DaemonHandle, Observed, RunError, RunOptions, StopReason, run, spawn,
+    spawn_with,
 };
