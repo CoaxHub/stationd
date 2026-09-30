@@ -8,15 +8,23 @@ repository.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 build = "build.rs"
+# cargo-fuzz targets are their own workspace (nightly only).
+exclude = ["fuzz"]
 
 [lints]
 workspace = true
 
 [dependencies]
+async-trait = "0.1.92"
+coaxhub-station-proto = { path = "../station-proto" }
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 rand = "0.10.3"
 socket2 = { version = "0.6.5", features = ["all"] }
+station-backend = { path = "../station-backend" }
 thiserror = "2.0.21"
 tokio = { version = "1.53.1", features = ["net", "rt", "time", "macros", "sync"] }
+tokio-stream = { version = "0.1.19", features = ["sync"] }
+tokio-util = "0.7.19"
 tracing = "0.1.44"
 zstd = "0.14.0"
 

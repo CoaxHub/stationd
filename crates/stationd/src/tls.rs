@@ -285,7 +285,7 @@ mod tests {
             key: write(dir, "key.pem", key),
             gateway_ca: write(dir, "ca.pem", ca),
             policy: crate::config::LocalPolicy::default(),
-            backend: crate::config::BackendKind::Fake,
+            backend: crate::config::BackendConfig::Fake,
         }
     }
 

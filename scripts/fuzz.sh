@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 #
-# Runs every cargo-fuzz target of coaxhub-station-proto for N seconds each
-# (station-protocol §10: protobuf decoding + hub validator, waterfall
-# decompression, certificate identity). CI calls this; it also works locally
+# Runs every cargo-fuzz target of the station workspace for N seconds each
+# (station-protocol §10): in coaxhub-station-proto, protobuf decoding + hub
+# validator, waterfall decompression and certificate identity; in
+# backend-ka9q, the radiod TLV decoder. CI calls this; it also works locally
 # locally.
 #
 # Usage: scripts/fuzz.sh [seconds-per-target]     (default 60)
@@ -19,10 +20,10 @@
 #   FUZZ_JOBS         parallel libFuzzer jobs per target (default: 1; with
 #                     more, libFuzzer logs to fuzz-<n>.log files instead)
 #
-# The committed seed corpus (crates/station-proto/fuzz/corpus/<target>) is
-# read only; new inputs go to a scratch directory that is deleted on exit.
-# Crashes are written to crates/station-proto/fuzz/artifacts/<target>/ and
-# make the script exit non-zero.
+# The committed seed corpus (crates/<crate>/fuzz/corpus/<target>) is read
+# only; new inputs go to a scratch directory that is deleted on exit.
+# Crashes are written to crates/<crate>/fuzz/artifacts/<target>/ and make the
+# script exit non-zero.
 
 set -euo pipefail
 
@@ -33,15 +34,21 @@ if ! [[ "$seconds" =~ ^[0-9]+$ ]] || [[ "$seconds" -eq 0 ]]; then
 fi
 
 station_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-crate_dir="$station_dir/crates/station-proto"
-fuzz_dir="$crate_dir/fuzz"
 target_dir="${FUZZ_TARGET_DIR:-${CARGO_TARGET_DIR:-$station_dir/target}/fuzz}"
 jobs="${FUZZ_JOBS:-1}"
 extra=()
 if [[ "$jobs" -gt 1 ]]; then
     extra+=(-jobs="$jobs" -workers="$jobs")
 fi
-targets="${FUZZ_TARGETS:-station_message waterfall_decompress identity}"
+targets="${FUZZ_TARGETS:-station_message waterfall_decompress identity tlv_status}"
+
+# The crate whose fuzz/ directory holds a target.
+crate_of() {
+    case "$1" in
+        tlv_status) echo backend-ka9q ;;
+        *) echo station-proto ;;
+    esac
+}
 
 if ! cargo +nightly fuzz --version >/dev/null 2>&1; then
     echo "error: cargo-fuzz on the nightly toolchain is required (see $0 header)" >&2
@@ -56,8 +63,10 @@ trap 'rm -rf "$scratch"' EXIT
 
 summary=()
 status=0
-cd "$crate_dir"
 for target in $targets; do
+    crate_dir="$station_dir/crates/$(crate_of "$target")"
+    fuzz_dir="$crate_dir/fuzz"
+    cd "$crate_dir"
     corpus="$fuzz_dir/corpus/$target"
     artifacts="$fuzz_dir/artifacts/$target"
     work="$scratch/$target"

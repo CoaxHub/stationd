@@ -256,6 +256,7 @@ async fn commands_are_serialized_per_ssrc() {
             low_edge_hz: Some(-3000.0),
             high_edge_hz: Some(3000.0),
             opus_bitrate: Some(24_000),
+            ..AudioUpdate::default()
         })
         .await
         .unwrap();

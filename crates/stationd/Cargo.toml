@@ -19,6 +19,7 @@ name = "stationd"
 path = "src/main.rs"
 
 [dependencies]
+backend-ka9q = { path = "../backend-ka9q" }
 clap = { version = "4.6.7", features = ["derive"] }
 coaxhub-station-proto = { path = "../station-proto" }
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }

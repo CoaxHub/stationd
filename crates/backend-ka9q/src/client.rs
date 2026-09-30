@@ -91,6 +91,11 @@ pub const DEFAULT_STATUS_ADDR: SocketAddr =
 pub const DEFAULT_DATA_ADDR: SocketAddr =
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(239, 77, 0, 4), 5004));
 
+/// radiod's per-channel status copy in the test config: the
+/// data group on port 5006 (radiod-notes.md §2).
+pub const DEFAULT_CHANNEL_STATUS_ADDR: SocketAddr =
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(239, 77, 0, 4), 5006));
+
 /// Largest bin count accepted for a spectrum channel (station-protocol's
 /// `max_bins` cap).
 pub const MAX_BIN_COUNT: u32 = 16_384;
@@ -171,6 +176,14 @@ pub struct ClientConfig {
     /// Where RTP arrives: radiod's `data =` group and port 5004, or a
     /// unicast address (port 0 picks a free one) in tests.
     pub data_addr: SocketAddr,
+    /// Where radiod multicasts each audio channel's **unsolicited** status
+    /// (every `STATUS_INTERVAL` frames, 0.5 s by default) and a copy of
+    /// every command reply: the data group on port 5006
+    /// (radiod-notes.md §2, §4). `None` (the default) does not listen
+    /// there; the client then only sees command replies on
+    /// [`ClientConfig::status_addr`]. A unicast address (port 0 picks a
+    /// free one) is the hermetic test mode.
+    pub channel_status_addr: Option<SocketAddr>,
     /// Local interface for group membership and multicast sends.
     pub interface: Ipv4Addr,
     /// Multicast TTL for commands; 0 keeps them on this host.
@@ -195,6 +208,7 @@ impl Default for ClientConfig {
         Self {
             status_addr: DEFAULT_STATUS_ADDR,
             data_addr: DEFAULT_DATA_ADDR,
+            channel_status_addr: None,
             interface: Ipv4Addr::LOCALHOST,
             ttl: 0,
             command_timeout: Duration::from_millis(250),
@@ -429,6 +443,11 @@ struct State {
     channels: HashMap<u32, Slot>,
     foreign: HashSet<u32>,
     next_tag: u32,
+    /// The newest status packet of any SSRC (front-end fields are global
+    /// to the radiod instance) and when it arrived.
+    last_status: Option<(Instant, Arc<ChannelStatus>)>,
+    /// When a command last failed with [`ClientError::Timeout`].
+    last_timeout: Option<Instant>,
 }
 
 /// State shared by the background tasks and the handles.
@@ -566,6 +585,7 @@ impl Shared {
         let _ = self.statuses.send(Arc::clone(&status));
 
         let mut st = self.lock();
+        st.last_status = Some((Instant::now(), Arc::clone(&status)));
         if let Some(slot) = st.channels.get_mut(&ssrc) {
             slot.latest = Some(Arc::clone(&status));
             if frame.is_some() {
@@ -679,7 +699,8 @@ struct Core {
     shared: Arc<Shared>,
     local_status: SocketAddr,
     local_data: SocketAddr,
-    tasks: [AbortHandle; 2],
+    local_channel_status: Option<SocketAddr>,
+    tasks: Vec<AbortHandle>,
 }
 
 impl Drop for Core {
@@ -731,6 +752,7 @@ impl Core {
                 }
             }
         }
+        self.shared.lock().last_timeout = Some(Instant::now());
         Err(ClientError::Timeout {
             ssrc: ctx.ssrc,
             attempts,
@@ -796,9 +818,36 @@ impl Ka9qClient {
             op: "data socket address",
             source,
         })?;
+        let channel_status = config
+            .channel_status_addr
+            .map(|addr| net::bind_receiver(addr, opts))
+            .transpose()?;
+        let local_channel_status = channel_status
+            .as_ref()
+            .map(UdpSocket::local_addr)
+            .transpose()
+            .map_err(|source| ClientError::Io {
+                op: "channel status socket address",
+                source,
+            })?;
         let shared = Arc::new(Shared::new());
-        let status = runtime.spawn(status_task(Arc::clone(&ctrl), Arc::clone(&shared)));
-        let rtp = runtime.spawn(rtp_task(data, Arc::clone(&shared)));
+        let mut tasks = vec![
+            runtime
+                .spawn(status_task(Arc::clone(&ctrl), Arc::clone(&shared)))
+                .abort_handle(),
+            runtime
+                .spawn(rtp_task(data, Arc::clone(&shared)))
+                .abort_handle(),
+        ];
+        if let Some(socket) = channel_status {
+            // Unsolicited channel status and reply copies are handled exactly
+            // like the control socket's packets.
+            tasks.push(
+                runtime
+                    .spawn(status_task(Arc::new(socket), Arc::clone(&shared)))
+                    .abort_handle(),
+            );
+        }
         Ok(Self {
             core: Arc::new(Core {
                 config,
@@ -806,7 +855,8 @@ impl Ka9qClient {
                 shared,
                 local_status,
                 local_data,
-                tasks: [status.abort_handle(), rtp.abort_handle()],
+                local_channel_status,
+                tasks,
             }),
         })
     }
@@ -828,9 +878,36 @@ impl Ka9qClient {
         self.core.local_data
     }
 
+    /// Local address of the channel status socket, if
+    /// [`ClientConfig::channel_status_addr`] is set (in unicast mode, where
+    /// a peer must send unsolicited channel status).
+    pub fn local_channel_status_addr(&self) -> Option<SocketAddr> {
+        self.core.local_channel_status
+    }
+
     /// Background-task counters.
     pub fn stats(&self) -> ClientStats {
         self.core.shared.counters.snapshot()
+    }
+
+    /// The newest status packet received for any SSRC (including other
+    /// clients' channels), and when it arrived. Its front-end fields
+    /// (`INPUT_SAMPRATE`, `FIRST_LO_FREQUENCY`, `FE_LOW_EDGE`, `IF_POWER`,
+    /// `AD_OVER`, ...) describe the radiod instance as a whole.
+    pub fn last_status(&self) -> Option<(Instant, Arc<ChannelStatus>)> {
+        self.core.shared.lock().last_status.clone()
+    }
+
+    /// The latest status of an SSRC this client owns (a channel opened
+    /// from it), or `None`.
+    pub fn status_of(&self, ssrc: u32) -> Option<Arc<ChannelStatus>> {
+        self.core.shared.latest(ssrc)
+    }
+
+    /// When a command last failed because radiod did not answer, including
+    /// retries.
+    pub fn last_command_timeout(&self) -> Option<Instant> {
+        self.core.shared.lock().last_timeout
     }
 
     /// Creates an Opus audio channel under a new SSRC and waits until radiod
@@ -951,12 +1028,24 @@ impl Ka9qClient {
     /// destroying it right after. Starting the channel starts radiod's front
     /// end if no other channel exists.
     pub async fn probe(&self) -> Result<Arc<ChannelStatus>, ClientError> {
+        self.probe_with(|c| c).await
+    }
+
+    /// Like [`Ka9qClient::probe`], but the temporary channel's command is
+    /// first passed through `extra`, which may add front-end fields such as
+    /// [`Command::first_lo_hz`]: radiod applies those to the shared front
+    /// end, whichever channel carries them. The reply shows whether radiod
+    /// applied them. `extra` must not change the SSRC or the lifetime.
+    pub async fn probe_with<F>(&self, extra: F) -> Result<Arc<ChannelStatus>, ClientError>
+    where
+        F: Fn(Command) -> Command,
+    {
         let core = &self.core;
         let ssrc = core.shared.allocate_ssrc(None)?;
         let ctx = ChannelCtx::new(ssrc);
         let res = core
             .execute(&ctx, |tag| {
-                Command::poll(ssrc, tag).lifetime(PROBE_LIFETIME_FRAMES)
+                extra(Command::poll(ssrc, tag)).lifetime(PROBE_LIFETIME_FRAMES)
             })
             .await;
         if let Err(e) = core.destroy(&ctx).await {
@@ -1002,6 +1091,65 @@ pub struct AudioChannelParams {
     pub samprate: Option<u32>,
     /// Opus bit rate, bit/s. 0 or `None` lets the encoder choose.
     pub opus_bitrate: Option<u32>,
+    /// `OUTPUT_CHANNELS`: 1 (mono) or 2. `None` keeps the preset's. For
+    /// `wfm`, 1 also turns FM stereo decoding off.
+    pub output_channels: Option<u32>,
+    /// The SNR squelch. `None` keeps the preset's.
+    pub squelch: Option<Squelch>,
+}
+
+/// SNR squelch of an audio channel.
+///
+/// radiod's FM demodulators (`fm`, `wfm`) squelch on the channel SNR even
+/// when `SNR_SQUELCH` is off (`fm.c`, and `wfm.c` forces `snr_enable` on at
+/// start), using `SQUELCH_OPEN`/`SQUELCH_CLOSE`. [`Squelch::Off`] therefore
+/// also sets both thresholds to [`SQUELCH_OFF_DB`], which keeps them open
+/// for any signal with a positive SNR. Linear modes only squelch with
+/// `SNR_SQUELCH` on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Squelch {
+    /// No squelch (see the type docs for FM).
+    Off,
+    /// Open above `open_db` SNR, close below `close_db` (hysteresis).
+    Snr {
+        /// Opening threshold, dB SNR.
+        open_db: f32,
+        /// Closing threshold, dB SNR; at most `open_db`.
+        close_db: f32,
+    },
+}
+
+/// The squelch thresholds [`Squelch::Off`] sends, dB SNR.
+pub const SQUELCH_OFF_DB: f32 = -100.0;
+
+impl Squelch {
+    fn validate(self) -> Result<(), ClientError> {
+        match self {
+            Self::Off => Ok(()),
+            Self::Snr { open_db, close_db } => {
+                if open_db.is_finite() && close_db.is_finite() && close_db <= open_db {
+                    Ok(())
+                } else {
+                    Err(ClientError::InvalidParams(format!(
+                        "squelch thresholds must be finite with close <= open, got open {open_db} close {close_db}"
+                    )))
+                }
+            }
+        }
+    }
+
+    fn apply(self, c: Command) -> Command {
+        match self {
+            Self::Off => c
+                .snr_squelch(false)
+                .squelch_open_db(SQUELCH_OFF_DB)
+                .squelch_close_db(SQUELCH_OFF_DB),
+            Self::Snr { open_db, close_db } => c
+                .snr_squelch(true)
+                .squelch_open_db(open_db)
+                .squelch_close_db(close_db),
+        }
+    }
 }
 
 /// Longest accepted preset name.
@@ -1022,6 +1170,8 @@ impl AudioChannelParams {
             high_edge_hz: None,
             samprate: None,
             opus_bitrate: None,
+            output_channels: None,
+            squelch: None,
         }
     }
 
@@ -1050,6 +1200,14 @@ impl AudioChannelParams {
                 "opus_bitrate {b} exceeds {MAX_OPUS_BITRATE}"
             )));
         }
+        if let Some(n) = self.output_channels.filter(|n| !(1..=2).contains(n)) {
+            return Err(ClientError::InvalidParams(format!(
+                "output_channels must be 1 or 2, got {n}"
+            )));
+        }
+        if let Some(sq) = self.squelch {
+            sq.validate()?;
+        }
         Ok(())
     }
 
@@ -1061,6 +1219,9 @@ impl AudioChannelParams {
         if let Some(sr) = self.samprate {
             c = c.output_samprate(sr);
         }
+        if let Some(n) = self.output_channels {
+            c = c.output_channels(n);
+        }
         c = c.output_encoding(Encoding::Opus);
         if let Some(b) = self.opus_bitrate {
             c = c.opus_bit_rate(b);
@@ -1071,6 +1232,9 @@ impl AudioChannelParams {
         }
         if let Some(hi) = self.high_edge_hz {
             c = c.high_edge_hz(hi);
+        }
+        if let Some(sq) = self.squelch {
+            c = sq.apply(c);
         }
         c.lifetime(lifetime)
     }
@@ -1142,8 +1306,13 @@ fn check_edges(low: Option<f32>, high: Option<f32>) -> Result<(), ClientError> {
 }
 
 /// A change to a live [`AudioChannel`]. `None` fields are left alone.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct AudioUpdate {
+    /// New preset (mode). radiod reloads the preset, which resets the
+    /// sample rate, passband and demodulator, so the client re-sends the
+    /// channel's full configuration with it (the other fields of this
+    /// update applied on top).
+    pub preset: Option<String>,
     /// New frequency, Hz.
     pub frequency_hz: Option<f64>,
     /// New passband low edge, Hz.
@@ -1152,6 +1321,8 @@ pub struct AudioUpdate {
     pub high_edge_hz: Option<f32>,
     /// New Opus bit rate, bit/s.
     pub opus_bitrate: Option<u32>,
+    /// New squelch.
+    pub squelch: Option<Squelch>,
 }
 
 /// Counters of one [`AudioChannel`].
@@ -1261,9 +1432,27 @@ impl AudioChannel {
         self.queue.try_recv()
     }
 
+    /// A handle that receives this channel's packets without borrowing
+    /// the channel, so that one task can consume audio while another
+    /// updates or closes the channel. It returns `None` once the channel is
+    /// closed or dropped. The queue has a single consumer: use either the
+    /// receiver or [`AudioChannel::recv`], not both.
+    pub fn receiver(&self) -> AudioReceiver {
+        AudioReceiver {
+            queue: Arc::clone(&self.queue),
+        }
+    }
+
     /// The latest status radiod sent for this channel.
     pub fn status(&self) -> Option<Arc<ChannelStatus>> {
         self.core.shared.latest(self.ssrc())
+    }
+
+    /// radiod's frame (block) duration for this channel, from its status
+    /// (`FILTER_BLOCKSIZE` / `INPUT_SAMPRATE`); one Opus packet per frame.
+    /// `None` until a status with both fields has arrived.
+    pub fn frame_duration(&self) -> Option<Duration> {
+        self.core.shared.frame(self.ssrc())
     }
 
     /// Counters.
@@ -1289,9 +1478,17 @@ impl AudioChannel {
         }
     }
 
-    /// Changes the channel and waits for radiod to confirm it.
+    /// Changes the channel and waits for radiod to confirm it. A new
+    /// preset re-sends the full configuration (see [`AudioUpdate::preset`]);
+    /// anything else sends only the changed fields.
     pub async fn update(&self, update: AudioUpdate) -> Result<Arc<ChannelStatus>, ClientError> {
         let mut next = self.shared.params();
+        if update.preset.is_some() {
+            next.preset.clone_from(&update.preset);
+        }
+        if update.squelch.is_some() {
+            next.squelch = update.squelch;
+        }
         if let Some(f) = update.frequency_hz {
             next.frequency_hz = f;
         }
@@ -1307,10 +1504,17 @@ impl AudioChannel {
         next.validate()?;
         let ssrc = self.ssrc();
         let lifetime = self.core.config.lifetime_frames;
+        let full = update.preset.is_some();
         let st = self
             .core
             .execute(&self.shared.ctx, |tag| {
+                if full {
+                    return next.create_command(ssrc, tag, lifetime);
+                }
                 let mut c = Command::new(ssrc, tag);
+                if let Some(sq) = update.squelch {
+                    c = sq.apply(c);
+                }
                 if let Some(b) = update.opus_bitrate {
                     c = c.opus_bit_rate(b);
                 }
@@ -1343,6 +1547,24 @@ impl AudioChannel {
         self.keepalive.abort();
         self.open = false;
         self.core.destroy(&self.shared.ctx).await
+    }
+}
+
+/// Receives an [`AudioChannel`]'s packets; see [`AudioChannel::receiver`].
+#[derive(Debug, Clone)]
+pub struct AudioReceiver {
+    queue: Arc<DropOldestQueue<AudioPacket>>,
+}
+
+impl AudioReceiver {
+    /// The next packet, or `None` after the channel was closed or dropped.
+    pub async fn recv(&self) -> Option<AudioPacket> {
+        self.queue.recv().await
+    }
+
+    /// The next packet if one is queued.
+    pub fn try_recv(&self) -> Option<AudioPacket> {
+        self.queue.try_recv()
     }
 }
 
@@ -1623,6 +1845,15 @@ impl SpectrumChannel {
         self.shared.queue.try_recv()
     }
 
+    /// A handle that receives this channel's rows without borrowing the
+    /// channel (see [`AudioChannel::receiver`]). It returns `None` once the
+    /// channel is closed or dropped.
+    pub fn receiver(&self) -> SpectrumReceiver {
+        SpectrumReceiver {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
     /// The latest status radiod sent for the current SSRC.
     pub fn status(&self) -> Option<Arc<ChannelStatus>> {
         self.core.shared.latest(self.ssrc())
@@ -1707,9 +1938,28 @@ impl SpectrumChannel {
     }
 }
 
+/// Receives a [`SpectrumChannel`]'s rows; see [`SpectrumChannel::receiver`].
+#[derive(Debug, Clone)]
+pub struct SpectrumReceiver {
+    shared: Arc<SpectrumShared>,
+}
+
+impl SpectrumReceiver {
+    /// The next row, or `None` after the channel was closed or dropped.
+    pub async fn recv(&self) -> Option<SpectrumFrame> {
+        self.shared.queue.recv().await
+    }
+
+    /// The next row if one is queued.
+    pub fn try_recv(&self) -> Option<SpectrumFrame> {
+        self.shared.queue.try_recv()
+    }
+}
+
 impl Drop for SpectrumChannel {
     fn drop(&mut self) {
         self.poller.abort();
+        self.shared.queue.close();
         if self.open {
             let ssrc = self.ssrc();
             self.core.destroy_nowait(ssrc);
