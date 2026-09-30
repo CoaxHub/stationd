@@ -32,7 +32,8 @@ pub fn fast_options() -> RunOptions {
     }
 }
 
-/// The `stationd.toml` for `target`.
+/// The `stationd.toml` for `target`: static `[credentials]` and the fake
+/// backend (development builds only), state under the work dir.
 pub fn config_toml(target: &Target) -> String {
     let ops: Vec<String> = target
         .policy
@@ -41,17 +42,19 @@ pub fn config_toml(target: &Target) -> String {
         .map(|n| format!("{n:?}"))
         .collect();
     format!(
-        "gateway_url = {:?}\ncert = {:?}\nkey = {:?}\ngateway_ca = {:?}\n\
-         allow_frontend_control = {}\nallowed_admin_ops = [{}]\nmax_channels = {}\n\
-         max_waterfall_subscriptions = {}\n[backend]\nkind = \"fake\"\n",
-        target.gateway_url,
-        target.cert,
-        target.key,
-        target.gateway_ca,
+        "allow_frontend_control = {}\nallowed_admin_ops = [{}]\nmax_channels = {}\n\
+         max_waterfall_subscriptions = {}\nstate_dir = {:?}\n\
+         [credentials]\ngateway_url = {:?}\ncert = {:?}\nkey = {:?}\ngateway_ca = {:?}\n\
+         [backend]\nkind = \"fake\"\n",
         target.policy.allow_frontend_control,
         ops.join(", "),
         target.policy.max_channels,
         target.policy.max_waterfall_subscriptions,
+        target.work_dir.join("state"),
+        target.gateway_url,
+        target.cert,
+        target.key,
+        target.gateway_ca,
     )
 }
 

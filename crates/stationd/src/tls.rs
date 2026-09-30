@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! mTLS to the hub gateway (station-protocol §1).
+//! TLS to the hub gateway and the control plane (station-protocol §1).
 //!
 //! - TLS 1.3 only, `ring` crypto provider (rustls 0.23).
-//! - The client presents the station certificate chain and key from
-//!   `stationd.toml`.
-//! - The gateway is authenticated against `gateway_ca` **only**: the root
-//!   store is built from that file alone. No `WebPKI` roots, no system roots:
-//!   `stationd` depends on neither `webpki-roots` nor
-//!   `rustls-native-certs`.
+//! - For the gateway and `StationControl`, the client presents the station
+//!   certificate chain and key (mTLS); enrollment presents none.
+//! - Servers are authenticated against one explicit bundle **only**: the
+//!   gateway CA bundle for the gateway and `StationControl`, the `CoaxHub`
+//!   root for enrollment. No `WebPKI` roots, no system roots: `stationd`
+//!   depends on neither `webpki-roots` nor `rustls-native-certs`.
 //! - ALPN `h2` is offered and required; the server name (SNI and
-//!   certificate check) is the host of `gateway_url` (a DNS name or an IP
+//!   certificate check) is the host of the endpoint URL (a DNS name or an IP
 //!   address).
 //!
 //! tonic's own TLS support cannot restrict the protocol version, so
@@ -32,7 +32,7 @@ use tokio_rustls::client::TlsStream;
 use tonic::transport::Uri;
 use uuid::Uuid;
 
-use crate::config::{Config, Gateway};
+use crate::config::Endpoint;
 
 /// The only ALPN protocol offered and accepted.
 pub const ALPN_H2: &[u8] = b"h2";
@@ -78,8 +78,8 @@ pub enum TlsError {
     /// certificate).
     #[error("cannot use the client certificate and key: {0}")]
     Credentials(rustls::Error),
-    /// The gateway host is not a valid TLS server name.
-    #[error("gateway host {0:?} is not a valid TLS server name")]
+    /// The endpoint host is not a valid TLS server name.
+    #[error("host {0:?} is not a valid TLS server name")]
     ServerName(String),
 }
 
@@ -90,8 +90,31 @@ pub struct ClientTls {
     pub config: Arc<ClientConfig>,
     /// The station ID from the certificate's URI SAN.
     pub station_id: Uuid,
-    /// How many trust anchors `gateway_ca` contributed.
+    /// How many trust anchors the CA bundle contributed.
     pub trust_anchors: usize,
+    /// The leaf certificate's validity.
+    pub validity: Validity,
+}
+
+/// A certificate's validity period.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Validity {
+    /// `notBefore`, Unix seconds.
+    pub not_before_unix_s: i64,
+    /// `notAfter`, Unix seconds.
+    pub not_after_unix_s: i64,
+}
+
+impl Validity {
+    /// The validity of a DER certificate.
+    pub fn of_der(der: &[u8]) -> Option<Self> {
+        use x509_parser::prelude::FromDer as _;
+        let (_, cert) = x509_parser::certificate::X509Certificate::from_der(der).ok()?;
+        Some(Self {
+            not_before_unix_s: cert.validity().not_before.timestamp(),
+            not_after_unix_s: cert.validity().not_after.timestamp(),
+        })
+    }
 }
 
 fn pem_reason(e: &pem::Error) -> String {
@@ -103,7 +126,7 @@ fn pem_reason(e: &pem::Error) -> String {
     }
 }
 
-/// Reads every certificate in a PEM file.
+/// Reads every certificate in a PEM file (at least one).
 fn read_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, pem::Error> {
     let certs = CertificateDer::pem_file_iter(path)?.collect::<Result<Vec<_>, _>>()?;
     if certs.is_empty() {
@@ -112,65 +135,117 @@ fn read_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, pem::Error> {
     Ok(certs)
 }
 
-/// Loads the credentials named in `config` and builds the client config.
-pub fn load(config: &Config) -> Result<ClientTls, TlsError> {
-    let chain = read_certs(&config.cert).map_err(|e| TlsError::Certificates {
-        path: config.cert.clone(),
+/// Parses every certificate in PEM text (at least one); errors never quote
+/// the input.
+pub fn parse_certs(pem_text: &str) -> Result<Vec<CertificateDer<'static>>, String> {
+    let certs = CertificateDer::pem_slice_iter(pem_text.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| pem_reason(&e))?;
+    if certs.is_empty() {
+        return Err(pem_reason(&pem::Error::NoItemsFound));
+    }
+    Ok(certs)
+}
+
+/// A root store holding exactly `certs`: never `WebPKI` or system roots.
+pub fn root_store(certs: Vec<CertificateDer<'static>>) -> Result<RootCertStore, String> {
+    let mut roots = RootCertStore::empty();
+    for cert in certs {
+        roots
+            .add(cert)
+            .map_err(|e| format!("not a usable CA certificate: {e}"))?;
+    }
+    Ok(roots)
+}
+
+/// Where the files of a certificate, its key and the CA bundle are.
+#[derive(Debug, Clone, Copy)]
+pub struct CredentialFiles<'a> {
+    /// The leaf certificate first, optionally followed by intermediates.
+    pub cert: &'a Path,
+    /// More intermediates (the state directory's `chain.pem`); may be empty.
+    pub chain: Option<&'a Path>,
+    /// The private key.
+    pub key: &'a Path,
+    /// The roots trusted for the server.
+    pub ca: &'a Path,
+}
+
+/// Loads a certificate chain, its key and a CA bundle and builds the mTLS
+/// client config.
+pub fn load_files(files: CredentialFiles<'_>) -> Result<ClientTls, TlsError> {
+    let mut chain = read_certs(files.cert).map_err(|e| TlsError::Certificates {
+        path: files.cert.to_owned(),
         reason: pem_reason(&e),
     })?;
-    let station_id = chain
-        .first()
-        .map(|leaf| identity::station_id_from_cert_der(leaf))
-        .ok_or_else(|| TlsError::Certificates {
-            path: config.cert.clone(),
-            reason: "empty chain".to_owned(),
-        })?
-        .map_err(|source| TlsError::StationId {
-            path: config.cert.clone(),
+    if let Some(extra) = files.chain {
+        match read_certs(extra) {
+            Ok(more) => chain.extend(more),
+            Err(pem::Error::NoItemsFound) => {}
+            Err(e) => {
+                return Err(TlsError::Certificates {
+                    path: extra.to_owned(),
+                    reason: pem_reason(&e),
+                });
+            }
+        }
+    }
+    let leaf = chain.first().ok_or_else(|| TlsError::Certificates {
+        path: files.cert.to_owned(),
+        reason: "empty chain".to_owned(),
+    })?;
+    let station_id =
+        identity::station_id_from_cert_der(leaf).map_err(|source| TlsError::StationId {
+            path: files.cert.to_owned(),
             source,
         })?;
-    let key = PrivateKeyDer::from_pem_file(&config.key).map_err(|e| TlsError::Key {
-        path: config.key.clone(),
+    let validity = Validity::of_der(leaf).ok_or_else(|| TlsError::Certificates {
+        path: files.cert.to_owned(),
+        reason: "the leaf certificate cannot be parsed".to_owned(),
+    })?;
+    let key = PrivateKeyDer::from_pem_file(files.key).map_err(|e| TlsError::Key {
+        path: files.key.to_owned(),
         reason: pem_reason(&e),
     })?;
     let ca_error = |reason: String| TlsError::GatewayCa {
-        path: config.gateway_ca.clone(),
+        path: files.ca.to_owned(),
         reason,
     };
-    let mut roots = RootCertStore::empty();
-    for cert in read_certs(&config.gateway_ca).map_err(|e| ca_error(pem_reason(&e)))? {
-        roots
-            .add(cert)
-            .map_err(|e| ca_error(format!("not a usable CA certificate: {e}")))?;
-    }
+    let roots = root_store(read_certs(files.ca).map_err(|e| ca_error(pem_reason(&e)))?)
+        .map_err(ca_error)?;
     let trust_anchors = roots.len();
-    let config = client_config(chain, key, roots)?;
+    let config = client_config(roots, Some((chain, key)))?;
     Ok(ClientTls {
         config: Arc::new(config),
         station_id,
         trust_anchors,
+        validity,
     })
 }
 
 /// A TLS 1.3-only client config with the `ring` provider, trusting exactly
-/// `roots`, presenting `chain`/`key`, offering ALPN h2.
+/// `roots`, offering ALPN h2, and presenting `client` (chain, key) when
+/// given (mTLS).
 pub fn client_config(
-    chain: Vec<CertificateDer<'static>>,
-    key: PrivateKeyDer<'static>,
     roots: RootCertStore,
+    client: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
 ) -> Result<ClientConfig, TlsError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut config = ClientConfig::builder_with_provider(provider)
+    let builder = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(TlsError::Credentials)?
-        .with_root_certificates(roots)
-        .with_client_auth_cert(chain, key)
-        .map_err(TlsError::Credentials)?;
+        .with_root_certificates(roots);
+    let mut config = match client {
+        Some((chain, key)) => builder
+            .with_client_auth_cert(chain, key)
+            .map_err(TlsError::Credentials)?,
+        None => builder.with_no_client_auth(),
+    };
     config.alpn_protocols = vec![ALPN_H2.to_vec()];
     Ok(config)
 }
 
-/// The TLS server name for a gateway host (an IP address or a DNS name).
+/// The TLS server name for a host (an IP address or a DNS name).
 pub fn server_name(host: &str) -> Result<ServerName<'static>, TlsError> {
     ServerName::try_from(host.to_owned()).map_err(|_| TlsError::ServerName(host.to_owned()))
 }
@@ -203,8 +278,9 @@ pub enum ConnectError {
     },
 }
 
-/// Dials the gateway: TCP, then TLS 1.3 with mTLS. Used by tonic as the
-/// channel's connector (the URI tonic passes in is ignored).
+/// Dials an endpoint: TCP, then TLS 1.3 (with mTLS when the config has a
+/// client certificate). Used by tonic as the channel's connector (the URI
+/// tonic passes in is ignored).
 #[derive(Debug, Clone)]
 pub struct Connector {
     config: Arc<ClientConfig>,
@@ -215,18 +291,18 @@ pub struct Connector {
 }
 
 impl Connector {
-    /// A connector for `gateway` using `config`.
-    pub fn new(config: Arc<ClientConfig>, gateway: &Gateway) -> Result<Self, TlsError> {
+    /// A connector for `endpoint` using `config`.
+    pub fn new(config: Arc<ClientConfig>, endpoint: &Endpoint) -> Result<Self, TlsError> {
         Ok(Self {
             config,
-            host: gateway.host.clone(),
-            port: gateway.port,
-            authority: gateway.authority(),
-            server_name: server_name(&gateway.host)?,
+            host: endpoint.host.clone(),
+            port: endpoint.port,
+            authority: endpoint.authority(),
+            server_name: server_name(&endpoint.host)?,
         })
     }
 
-    /// Opens one TLS connection to the gateway.
+    /// Opens one TLS connection to the endpoint.
     pub async fn connect(&self) -> Result<TlsStream<TcpStream>, ConnectError> {
         let tcp = TcpStream::connect((self.host.as_str(), self.port))
             .await
@@ -278,15 +354,27 @@ mod tests {
         p
     }
 
-    fn config(dir: &Path, cert: &str, key: &str, ca: &str) -> Config {
-        Config {
-            gateway: Gateway::parse("https://localhost:7443").expect("url"),
+    struct Files {
+        cert: PathBuf,
+        key: PathBuf,
+        ca: PathBuf,
+    }
+
+    fn config(dir: &Path, cert: &str, key: &str, ca: &str) -> Files {
+        Files {
             cert: write(dir, "cert.pem", cert),
             key: write(dir, "key.pem", key),
-            gateway_ca: write(dir, "ca.pem", ca),
-            policy: crate::config::LocalPolicy::default(),
-            backend: crate::config::BackendConfig::Fake,
+            ca: write(dir, "ca.pem", ca),
         }
+    }
+
+    fn load(f: &Files) -> Result<ClientTls, TlsError> {
+        load_files(CredentialFiles {
+            cert: &f.cert,
+            chain: None,
+            key: &f.key,
+            ca: &f.ca,
+        })
     }
 
     #[test]
@@ -365,5 +453,55 @@ mod tests {
             server_name("bad name"),
             Err(TlsError::ServerName(_))
         ));
+    }
+
+    fn files<'a>(f: &'a Files, chain: &'a Path) -> CredentialFiles<'a> {
+        CredentialFiles {
+            cert: &f.cert,
+            chain: Some(chain),
+            key: &f.key,
+            ca: &f.ca,
+        }
+    }
+
+    #[test]
+    fn chain_file_validity_and_bundles() {
+        let pki = TestPki::generate().expect("pki");
+        let dir = tempfile::tempdir().expect("dir");
+        let f = config(
+            dir.path(),
+            &pki.station_cert_pem,
+            &pki.station_key_pem,
+            &pki.ca_pem,
+        );
+        // An empty chain.pem is fine; a CA in it is sent as an intermediate.
+        let chain = write(dir.path(), "chain.pem", "");
+        let tls = load_files(files(&f, &chain)).expect("empty chain");
+        assert!(tls.validity.not_after_unix_s > tls.validity.not_before_unix_s);
+        write(dir.path(), "chain.pem", &pki.ca_pem);
+        assert!(load_files(files(&f, &chain)).is_ok());
+        write(
+            dir.path(),
+            "chain.pem",
+            "-----BEGIN CERTIFICATE-----\n!!\n-----END CERTIFICATE-----\n",
+        );
+        let e = load_files(files(&f, &chain)).expect_err("bad chain");
+        assert!(matches!(e, TlsError::Certificates { .. }), "{e}");
+        let e = load_files(files(&f, &dir.path().join("missing.pem"))).expect_err("missing");
+        assert!(matches!(e, TlsError::Certificates { .. }), "{e}");
+
+        assert_eq!(parse_certs(&pki.ca_pem).expect("one").len(), 1);
+        assert!(parse_certs("").is_err());
+        assert!(
+            parse_certs("-----BEGIN CERTIFICATE-----\n!!\n-----END CERTIFICATE-----\n").is_err()
+        );
+        let bad = CertificateDer::from(vec![1_u8, 2, 3]);
+        assert!(root_store(vec![bad]).is_err());
+        assert_eq!(Validity::of_der(&[1, 2, 3]), None);
+        // Without a client certificate (enrollment).
+        let roots = root_store(parse_certs(&pki.ca_pem).expect("ca")).expect("roots");
+        let c = client_config(roots, None).expect("config");
+        assert!(!c.client_auth_cert_resolver.has_certs());
+        assert_eq!(c.alpn_protocols, vec![b"h2".to_vec()]);
     }
 }

@@ -18,15 +18,28 @@ name = "stationd"
 name = "stationd"
 path = "src/main.rs"
 
+[features]
+# Release (packaged) build: the CoaxHub domain and root certificate are
+# compiled in from the build-time environment (`COAXHUB_DOMAIN`, and
+# `COAXHUB_ROOT_CA` naming a PEM file; see build.rs), and every test-only
+# setting of stationd.toml is rejected.
+packaged = []
+
 [dependencies]
 backend-ka9q = { path = "../backend-ka9q" }
 clap = { version = "4.6.7", features = ["derive"] }
 coaxhub-station-proto = { path = "../station-proto" }
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
+pem = "4.0.0"
 rand = "0.10.3"
+# Key generation and the enrollment CSR (ECDSA P-256).
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
+# No-echo token prompt.
+rustix = { version = "1.1.5", default-features = false, features = ["std", "termios"] }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "logging"] }
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 station-backend = { path = "../station-backend" }
 thiserror = "2.0.21"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "time", "net", "sync"] }
@@ -38,9 +51,17 @@ tower-service = "0.3.3"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 uuid = "1.26.1"
+x509-parser = "0.18.1"
+zeroize = "1.9.0"
 
 [dev-dependencies]
 async-trait = "0.1.92"
+proptest = "1.11.0"
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }
 station-conformance = { path = "../station-conformance" }
 tempfile = "3.27.0"
+time = "0.3.45"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "test-util"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"] }
+tokio-stream = { version = "0.1.19", features = ["net"] }
+tonic = { version = "0.14.6", default-features = false, features = ["channel", "codegen", "server"] }

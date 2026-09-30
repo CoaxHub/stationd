@@ -2,6 +2,9 @@
 //! Every station-conformance scenario against the real stationd, in-process,
 //! over real mTLS on loopback, with a `FakeBackend`.
 
+// Static [credentials] and [backend] are development-only settings.
+#![cfg(not(feature = "packaged"))]
+
 mod common;
 
 use station_conformance::scenarios::{self, ScenarioConfig};

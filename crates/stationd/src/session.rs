@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::transport::{Endpoint, Uri};
 use tracing::{debug, error, info, warn};
 
-use crate::daemon::{ConnectionState, Ctx};
+use crate::daemon::{ConnectionState, Ctx, Link};
 use crate::dispatch::{self, Media, RequestContext, truncate_utf8};
 use crate::outbound::Outbound;
 use crate::status;
@@ -74,10 +74,10 @@ fn chain(e: &(dyn std::error::Error + 'static)) -> String {
     out
 }
 
-fn endpoint(ctx: &Ctx) -> Result<Endpoint, String> {
+fn endpoint(ctx: &Ctx, link: &Link) -> Result<Endpoint, String> {
     // tonic dials through our own TLS connector; the endpoint URI only
     // selects it, and `origin` sets the :scheme/:authority of requests.
-    let authority = ctx.gateway.authority();
+    let authority = link.gateway.authority();
     let origin: Uri = format!("https://{authority}")
         .parse()
         .map_err(|e| format!("invalid gateway authority {authority}: {e}"))?;
@@ -94,15 +94,16 @@ fn endpoint(ctx: &Ctx) -> Result<Endpoint, String> {
 /// Runs one connection attempt and, if it is established, the session.
 pub(crate) async fn run(
     ctx: &Arc<Ctx>,
+    link: &Link,
     shutdown: &CancellationToken,
     state: &watch::Sender<ConnectionState>,
 ) -> Outcome {
-    let endpoint = match endpoint(ctx) {
+    let endpoint = match endpoint(ctx, link) {
         Ok(e) => e,
         Err(e) => return Outcome::before_welcome(End::Lost(e)),
     };
     let channel = tokio::select! {
-        r = endpoint.connect_with_connector(ctx.connector.clone()) => match r {
+        r = endpoint.connect_with_connector(link.connector.clone()) => match r {
             Ok(c) => c,
             Err(e) => return Outcome::before_welcome(End::Lost(chain(&e))),
         },
