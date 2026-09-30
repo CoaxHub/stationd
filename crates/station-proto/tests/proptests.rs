@@ -420,7 +420,7 @@ proptest! {
                     let retry = Duration::from_millis(u64::from(g.as_ref().map_or(0, |g| g.retry_after_ms)));
                     let reason = g.as_ref().map(|g| g.reason);
                     match reason {
-                        Some(5) => prop_assert_eq!(delay, retry.max(Duration::from_secs(900))),
+                        Some(5) => prop_assert_eq!(delay, retry.max(Duration::from_secs(300))),
                         Some(4) => prop_assert_eq!(delay, retry.max(Duration::from_secs(21_600))),
                         _ => {
                             prop_assert!(delay >= retry);

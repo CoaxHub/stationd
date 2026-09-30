@@ -54,7 +54,7 @@ pub const BACKOFF_MAX: Duration = Duration::from_secs(60);
 pub const BACKOFF_RESET_AFTER: Duration = Duration::from_secs(5 * 60);
 
 /// §2.2: after `Goodbye{DISABLED}` the station retries this often.
-pub const DISABLED_RETRY_INTERVAL: Duration = Duration::from_secs(15 * 60);
+pub const DISABLED_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// §2.2: after `Goodbye{UNSUPPORTED_VERSION}` the station retries this often.
 pub const UNSUPPORTED_VERSION_RETRY_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);

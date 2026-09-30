@@ -21,7 +21,7 @@
 //! | `SHUTDOWN`, `DRAINING` | backoff + `retry_after_ms` | `retry_after_ms` spreads the reconnect storm |
 //! | `REASSIGNED` (or `refresh_assignment`) | backoff + `retry_after_ms` | `refresh_assignment = true`: call `StationControl.GetAssignment` first |
 //! | `PROTOCOL_VIOLATION`, `QUOTA_EXCEEDED`, `DUPLICATE_CONNECTION` | backoff + `retry_after_ms` | |
-//! | `DISABLED` | max(15 min, `retry_after_ms`) | the owner may re-enable the station |
+//! | `DISABLED` | max(5 min, `retry_after_ms`) | the owner may re-enable the station |
 //! | `UNSUPPORTED_VERSION` | max(6 h, `retry_after_ms`) | log a prominent "update stationd" message |
 //! | `REVOKED` | — | [`Decision::Stop`], permanently: re-enrollment needed |
 //!
@@ -352,14 +352,14 @@ mod tests {
     }
 
     #[test]
-    fn disabled_retries_every_fifteen_minutes() {
+    fn disabled_retries_every_five_minutes() {
         let t0 = Instant::now();
         let mut b = Backoff::default();
         let mut rng = max_rng();
         for _ in 0..3 {
             assert_eq!(
                 delay(b.on_disconnected(Some(&goodbye(Reason::Disabled, 0)), t0, &mut rng)),
-                Duration::from_secs(900)
+                Duration::from_secs(300)
             );
         }
         assert_eq!(b.failures(), 0);
