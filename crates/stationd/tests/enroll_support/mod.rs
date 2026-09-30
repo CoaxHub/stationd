@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! A throwaway `CoaxHub`-like PKI (generated in memory with rcgen) and an
-//! in-test `Enrollment` gRPC server over TLS 1.3 on loopback.
+//! A throwaway `CoaxHub`-like PKI (generated in memory with rcgen), and
+//! in-test `Enrollment` and `StationControl` gRPC servers over TLS 1.3 on
+//! loopback.
 //!
 //! Hierarchy: a root; a station intermediate that
 //! signs station certificates from CSRs; a server intermediate that signs
@@ -119,6 +120,23 @@ impl TestCa {
     /// Signs a station CSR the way the CA does: the subject and requested
     /// extensions are ignored; SAN = the station URI, clientAuth, 30 days.
     pub fn sign_station(&self, csr_der: &[u8], id: Uuid) -> Vec<u8> {
+        let now = time_now();
+        self.sign_station_for(
+            csr_der,
+            id,
+            now - time::Duration::minutes(5),
+            now + time::Duration::days(30),
+        )
+    }
+
+    /// Signs a station CSR with this validity.
+    pub fn sign_station_for(
+        &self,
+        csr_der: &[u8],
+        id: Uuid,
+        not_before: time::OffsetDateTime,
+        not_after: time::OffsetDateTime,
+    ) -> Vec<u8> {
         let csr =
             CertificateSigningRequestParams::from_der(&csr_der.to_vec().into()).expect("valid CSR");
         let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
@@ -130,9 +148,8 @@ impl TestCa {
         )];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-        let now = time_now();
-        params.not_before = now - time::Duration::minutes(5);
-        params.not_after = now + time::Duration::days(30);
+        params.not_before = not_before;
+        params.not_after = not_after;
         let csr = CertificateSigningRequestParams {
             params,
             public_key: csr.public_key,
@@ -157,6 +174,48 @@ impl TestCa {
         .expect("hub")
     }
 
+    /// A new station key and a certificate for it with this validity:
+    /// (key PEM, certificate PEM, serial hex).
+    pub fn station_credentials(
+        &self,
+        id: Uuid,
+        not_before: time::OffsetDateTime,
+        not_after: time::OffsetDateTime,
+    ) -> (String, String, String) {
+        let key = stationd::enroll::generate_key().expect("key");
+        let der = self.sign_station_for(&key.csr_der, id, not_before, not_after);
+        let serial = stationd::tls::serial_hex(&der).expect("serial");
+        (key.key_pem.to_string(), pem_of(&der), serial)
+    }
+
+    /// An enrolled state directory in `state` for station `id` with a
+    /// certificate valid from `not_before` to `not_after`, assigned to
+    /// `hub_id` at `gateway_url`; returns the certificate's serial.
+    pub fn write_enrolled(
+        &self,
+        state: &stationd::state::StateDir,
+        id: Uuid,
+        (not_before, not_after): (time::OffsetDateTime, time::OffsetDateTime),
+        hub_id: &str,
+        gateway_url: &str,
+    ) -> String {
+        let (key, cert, serial) = self.station_credentials(id, not_before, not_after);
+        state
+            .write_enrollment(&stationd::state::Enrollment {
+                station_id: id,
+                key_pem: &key,
+                cert_pem: &cert,
+                chain_pem: &self.station.pem,
+                gateway_ca_pem: &self.root.pem,
+                assignment: &stationd::state::Assignment {
+                    hub_id: hub_id.into(),
+                    gateway_url: gateway_url.into(),
+                },
+            })
+            .expect("write state");
+        serial
+    }
+
     /// Writes the root to `dir/root.pem`.
     pub fn write_root(&self, dir: &Path) -> PathBuf {
         let p = dir.join("root.pem");
@@ -165,8 +224,13 @@ impl TestCa {
     }
 }
 
-fn time_now() -> time::OffsetDateTime {
+pub fn time_now() -> time::OffsetDateTime {
     time::OffsetDateTime::now_utc()
+}
+
+/// A DER certificate as PEM.
+pub fn pem_of(der: &[u8]) -> String {
+    pem::encode(&pem::Pem::new("CERTIFICATE", der))
 }
 
 /// What the server does with the next requests.
@@ -408,3 +472,322 @@ pub fn write_config(dir: &Path, enroll_url: &str, root: &Path) -> PathBuf {
 
 /// A well-formed token.
 pub const TOKEN: &str = "chs_enr_7K3M9Q2XA4B5C6D7E8F9G0H1J2K3M4N5";
+
+// ---------------------------------------------------------------- StationControl
+
+use station_proto::v1::station_control_server::{StationControl, StationControlServer};
+use station_proto::v1::{GetAssignmentRequest, RenewCertificateRequest, RenewCertificateResponse};
+
+/// What the `StationControl` server does with `RenewCertificate`.
+#[derive(Clone)]
+pub enum Renew {
+    /// Sign the CSR for the presented station, valid for `lifetime` (and
+    /// backdated 5 minutes, as the CA does).
+    Sign { lifetime: time::Duration },
+    /// Sign and rotate the gateway CA bundle to this PEM.
+    SignWithBundle {
+        lifetime: time::Duration,
+        bundle: String,
+    },
+    /// Sign for another station (a broken control plane).
+    OtherStation,
+    /// Fail with this status.
+    Fail(Status),
+}
+
+/// The server's script.
+#[derive(Clone)]
+pub struct Script {
+    /// `GetAssignment`: (hub id, gateway URL), or a status.
+    pub assignment: Result<(String, String), Status>,
+    /// `RenewCertificate`.
+    pub renew: Renew,
+}
+
+/// One call the server received.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Call {
+    /// `GetAssignment` or `RenewCertificate`.
+    pub method: &'static str,
+    /// The presented certificate's serial, hex.
+    pub serial: String,
+    /// The station from its SAN.
+    pub station_id: Uuid,
+}
+
+/// The client certificates of a TLS connection.
+#[derive(Clone, Debug)]
+pub struct PeerCerts(pub Vec<CertificateDer<'static>>);
+
+/// A server-side mTLS stream that tells tonic its peer's certificates.
+struct MtlsIo(TlsStream<TcpStream>);
+
+impl Connected for MtlsIo {
+    type ConnectInfo = PeerCerts;
+    fn connect_info(&self) -> Self::ConnectInfo {
+        PeerCerts(
+            self.0
+                .get_ref()
+                .1
+                .peer_certificates()
+                .map(<[_]>::to_vec)
+                .unwrap_or_default(),
+        )
+    }
+}
+
+impl AsyncRead for MtlsIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for MtlsIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
+struct ControlService {
+    ca: Arc<TestCa>,
+    script: Arc<Mutex<Script>>,
+    calls: Arc<Mutex<Vec<Call>>>,
+    gate: Arc<tokio::sync::Semaphore>,
+}
+
+impl ControlService {
+    fn record<T>(&self, method: &'static str, request: &Request<T>) -> Result<Call, Status> {
+        let leaf = request
+            .extensions()
+            .get::<PeerCerts>()
+            .and_then(|p| p.0.first().cloned())
+            .ok_or_else(|| Status::unauthenticated("no client certificate"))?;
+        let call = Call {
+            method,
+            serial: stationd::tls::serial_hex(&leaf).expect("serial"),
+            station_id: identity::station_id_from_cert_der(&leaf).expect("station SAN"),
+        };
+        self.calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(call.clone());
+        Ok(call)
+    }
+
+    fn script(&self) -> Script {
+        self.script
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[tonic::async_trait]
+impl StationControl for ControlService {
+    async fn get_assignment(
+        &self,
+        request: Request<GetAssignmentRequest>,
+    ) -> Result<Response<Assignment>, Status> {
+        self.record("GetAssignment", &request)?;
+        let (hub_id, gateway_url) = self.script().assignment?;
+        Ok(Response::new(Assignment {
+            hub_id,
+            gateway_url,
+        }))
+    }
+
+    async fn renew_certificate(
+        &self,
+        request: Request<RenewCertificateRequest>,
+    ) -> Result<Response<RenewCertificateResponse>, Status> {
+        let call = self.record("RenewCertificate", &request)?;
+        // Held until the test opens the gate (one permit per renewal).
+        self.gate
+            .acquire()
+            .await
+            .map_err(|_| Status::unavailable("closed"))?
+            .forget();
+        let csr = request.into_inner().csr_der;
+        let now = time_now();
+        let backdated = now - time::Duration::minutes(5);
+        let (der, bundle) = match self.script().renew {
+            Renew::Fail(s) => return Err(s),
+            Renew::Sign { lifetime } => (
+                self.ca
+                    .sign_station_for(&csr, call.station_id, backdated, now + lifetime),
+                None,
+            ),
+            Renew::SignWithBundle { lifetime, bundle } => (
+                self.ca
+                    .sign_station_for(&csr, call.station_id, backdated, now + lifetime),
+                Some(bundle),
+            ),
+            Renew::OtherStation => (
+                self.ca.sign_station_for(
+                    &csr,
+                    Uuid::new_v4(),
+                    backdated,
+                    now + time::Duration::days(1),
+                ),
+                None,
+            ),
+        };
+        Ok(Response::new(RenewCertificateResponse {
+            certificate: Some(StationCertificate {
+                certificate_der: der,
+                chain_der: vec![self.ca.station.der.clone()],
+                not_after_unix_s: 0,
+            }),
+            gateway_ca_bundle_pem: bundle,
+        }))
+    }
+}
+
+/// The in-test `StationControl` server: mTLS with the station intermediate
+/// as the only client anchor (contract A).
+pub struct ControlServer {
+    pub addr: SocketAddr,
+    script: Arc<Mutex<Script>>,
+    calls: Arc<Mutex<Vec<Call>>>,
+    gate: Arc<tokio::sync::Semaphore>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for ControlServer {
+    fn drop(&mut self) {
+        for t in &self.tasks {
+            t.abort();
+        }
+    }
+}
+
+fn mtls_server_config(cert: &ServerCert, client_anchor_pem: &str) -> Arc<ServerConfig> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let chain = CertificateDer::pem_slice_iter(cert.chain_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .expect("chain");
+    let key = PrivateKeyDer::from_pem_slice(cert.key_pem.as_bytes()).expect("key");
+    let mut roots = rustls::RootCertStore::empty();
+    for c in CertificateDer::pem_slice_iter(client_anchor_pem.as_bytes()) {
+        roots.add(c.expect("anchor")).expect("add");
+    }
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots),
+        Arc::clone(&provider),
+    )
+    .build()
+    .expect("verifier");
+    let mut config = ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("versions")
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(chain, key)
+        .expect("cert");
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    Arc::new(config)
+}
+
+impl ControlServer {
+    /// Serves `StationControl` with `cert` on 127.0.0.1 (port 0). The
+    /// renewal gate starts open.
+    pub async fn start(ca: Arc<TestCa>, cert: &ServerCert, script: Script) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let acceptor = TlsAcceptor::from(mtls_server_config(cert, &ca.station.pem));
+        let (tx, rx) = mpsc::channel::<Result<MtlsIo, std::io::Error>>(8);
+        let accept = tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    continue;
+                };
+                let acceptor = acceptor.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    if let Ok(Ok(tls)) =
+                        tokio::time::timeout(Duration::from_secs(5), acceptor.accept(tcp)).await
+                    {
+                        let _ = tx.send(Ok(MtlsIo(tls))).await;
+                    }
+                });
+            }
+        });
+        let script = Arc::new(Mutex::new(script));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let gate = Arc::new(tokio::sync::Semaphore::new(1_000_000));
+        let service = StationControlServer::new(ControlService {
+            ca,
+            script: Arc::clone(&script),
+            calls: Arc::clone(&calls),
+            gate: Arc::clone(&gate),
+        });
+        let serve = tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .serve_with_incoming(service, ReceiverStream::new(rx))
+                .await;
+        });
+        Self {
+            addr,
+            script,
+            calls,
+            gate,
+            tasks: vec![accept, serve],
+        }
+    }
+
+    /// `https://localhost:<port>`.
+    pub fn url(&self) -> String {
+        format!("https://localhost:{}", self.addr.port())
+    }
+
+    pub fn set(&self, script: Script) {
+        *self.script.lock().unwrap_or_else(PoisonError::into_inner) = script;
+    }
+
+    pub fn calls(&self) -> Vec<Call> {
+        self.calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Holds every renewal until [`Self::open_gate`].
+    pub fn close_gate(&self) {
+        let n = u32::try_from(self.gate.available_permits()).expect("few permits");
+        if let Ok(p) = self.gate.try_acquire_many(n) {
+            p.forget();
+        }
+    }
+
+    /// Lets `n` renewals through.
+    pub fn open_gate(&self, n: usize) {
+        self.gate.add_permits(n);
+    }
+}
+
+/// A dev `stationd.toml` for an enrolled station with the fake backend,
+/// its state in `dir/state`, `station-api` at `station_api_url`; returns
+/// its path.
+pub fn write_enrolled_config(dir: &Path, station_api_url: &str, root: &Path) -> PathBuf {
+    let text = format!(
+        "state_dir = {:?}\n[endpoints]\nenroll_url = \"https://localhost:9\"\n\
+         station_api_url = {station_api_url:?}\nroot_ca = {root:?}\n[backend]\nkind = \"fake\"\n",
+        dir.join("state"),
+    );
+    let path = dir.join("stationd.toml");
+    std::fs::write(&path, text).expect("write config");
+    path
+}

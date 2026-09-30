@@ -8,9 +8,10 @@
 //! | `sdr` | no USB device of the profile (RTL-SDR `0bda:2838`/`0bda:2832`) |
 //! | `radiod` | radiod's status group does not answer within 3 s |
 //! | `enroll` | DNS or the TLS handshake with the enrollment service fails, against the `CoaxHub` root (a warning once enrolled) |
-//! | `station-api` | the mTLS handshake with `StationControl` fails, against the gateway CA bundle (a warning in this release: renewal arrives in a later one) |
+//! | `station-api` | the mTLS handshake with `StationControl` fails, against the gateway CA bundle (a warning: the station keeps running on its stored assignment, and renewal retries) |
 //! | `gateway` | the mTLS handshake with the home hub's gateway fails, against the gateway CA bundle |
 //! | `clock` | the clock is before the certificate's `notBefore`, or the certificate expired (a warning once two thirds of its lifetime passed) |
+//! | `clock-skew` | never: a warning when the daemon measured more than 30 s between this clock and the hub's |
 
 use std::fmt::{self, Write as _};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -23,7 +24,7 @@ use backend_ka9q::client::{ClientConfig, Ka9qClient};
 use crate::config::{BackendConfig, Config, Endpoint};
 use crate::credentials::{self, Credentials};
 use crate::enroll;
-use crate::local_status::format_duration;
+use crate::local_status::{self, RuntimeStatus, describe_skew, format_duration, format_utc};
 use crate::profile::UsbId;
 use crate::tls::{self, Connector};
 
@@ -136,7 +137,33 @@ pub async fn run_config(config: &Config, path: &Path, env: &Environment) -> Vec<
     out.push(enroll_endpoint(config, creds.is_some(), env.timeout).await);
     out.extend(mtls_checks(config, creds.as_ref(), env.timeout).await);
     out.push(clock(creds.as_ref(), env.now_unix_s));
+    out.push(clock_skew(
+        RuntimeStatus::read(&config.status_path()).as_ref(),
+    ));
     out
+}
+
+/// The skew the daemon measured against the hub (`status.json`): a
+/// warning above 30 s, never a failure.
+fn clock_skew(status: Option<&RuntimeStatus>) -> Check {
+    let Some((skew, at)) = status.and_then(|s| s.clock_skew_ms.map(|k| (k, s.updated_unix_s)))
+    else {
+        return check(
+            "clock-skew",
+            Level::Skip,
+            "not measured yet (the daemon measures it when it connects to the hub)",
+        );
+    };
+    let level = if skew.unsigned_abs() > local_status::CLOCK_SKEW_WARN_MS.unsigned_abs() {
+        Level::Warn
+    } else {
+        Level::Pass
+    };
+    check(
+        "clock-skew",
+        level,
+        format!("{} (as of {})", describe_skew(skew), format_utc(at)),
+    )
 }
 
 /// Whether any check failed.
@@ -328,11 +355,11 @@ async fn mtls_checks(
         Some(e) => out.push(
             match handshake(&e.station_api, Arc::clone(&c.tls.config), timeout).await {
                 Ok(d) => check("station-api", Level::Pass, d),
-                // Renewal (the only use of StationControl so far) retries hourly.
+                // The stored assignment keeps working; renewal retries.
                 Err(err) => check(
                     "station-api",
                     Level::Warn,
-                    format!("{err} (needed for certificate renewal)"),
+                    format!("{err} (needed for certificate renewal and hub assignment)"),
                 ),
             },
         ),
@@ -465,6 +492,33 @@ mod tests {
         let expired = clock(Some(&c), 1000 + 31 * 86_400);
         assert_eq!(expired.level, Level::Fail);
         assert!(expired.detail.contains("enroll"), "{}", expired.detail);
+    }
+
+    #[test]
+    fn clock_skew_checks() {
+        assert_eq!(clock_skew(None).level, Level::Skip);
+        let status = |skew| RuntimeStatus {
+            pid: 1,
+            updated_unix_s: 0,
+            station_id: "s".into(),
+            gateway_url: "g".into(),
+            tunnel: local_status::Tunnel::Connected,
+            connection_id: None,
+            backoff_ms: None,
+            backend: "running".into(),
+            backend_version: "v".into(),
+            last_error: None,
+            clock_skew_ms: skew,
+            renewal: crate::renew::RenewalStatus::default(),
+        };
+        assert_eq!(clock_skew(Some(&status(None))).level, Level::Skip);
+        let ok = clock_skew(Some(&status(Some(-2000))));
+        assert_eq!(ok.level, Level::Pass);
+        assert!(ok.detail.contains("2.0 s ahead"), "{}", ok.detail);
+        let off = clock_skew(Some(&status(Some(90_000))));
+        assert_eq!(off.level, Level::Warn, "never a failure");
+        assert!(off.detail.contains("90.0 s behind"), "{}", off.detail);
+        assert!(off.detail.contains("1970-01-01"), "{}", off.detail);
     }
 
     #[test]

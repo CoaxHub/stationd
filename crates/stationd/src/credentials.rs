@@ -7,9 +7,9 @@
 //!
 //! - [`StaticSource`]: `[credentials]` in `stationd.toml` (development
 //!   builds: tests, conformance, LAN setups).
-//! - [`EnrolledSource`]: the state directory `stationd enroll` wrote. A
-//!   station is enrolled when every file is present and parseable and the
-//!   key matches the certificate.
+//! - [`EnrolledSource`]: the state directory `stationd enroll` wrote (and
+//!   certificate renewals update). A station is enrolled when every file is
+//!   present and parseable and the key matches the certificate.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -114,16 +114,21 @@ impl CredentialSource for EnrolledSource {
         dir.station_id()?;
         let gateway = Endpoint::parse("assignment.json gateway_url", &assignment.gateway_url)
             .map_err(CredentialsError::Assignment)?;
-        let cert = dir.file(state::CERT_FILE);
-        let chain = dir.file(state::CHAIN_FILE);
-        let key = dir.file(state::KEY_FILE);
-        let ca = dir.file(state::GATEWAY_CA_FILE);
-        let tls = tls::load_files(CredentialFiles {
-            cert: &cert,
-            chain: Some(&chain),
-            key: &key,
-            ca: &ca,
-        })?;
+        // A renewal swaps these as one set: read them under the swap lock,
+        // from `next/` when a committed swap is not finished yet.
+        let tls = {
+            let _guard = state::swap_guard();
+            let cert = dir.credential_file(state::CERT_FILE);
+            let chain = dir.credential_file(state::CHAIN_FILE);
+            let key = dir.credential_file(state::KEY_FILE);
+            let ca = dir.credential_file(state::GATEWAY_CA_FILE);
+            tls::load_files(CredentialFiles {
+                cert: &cert,
+                chain: Some(&chain),
+                key: &key,
+                ca: &ca,
+            })?
+        };
         Ok(Credentials {
             gateway,
             hub_id: Some(assignment.hub_id),
@@ -204,6 +209,38 @@ mod tests {
         std::fs::remove_file(dir.file(state::CHAIN_FILE)).expect("rm");
         let e = src.load().expect_err("missing chain");
         assert!(e.to_string().contains("chain.pem"), "{e}");
+    }
+
+    #[test]
+    fn enrolled_source_reads_a_staged_swap_consistently() {
+        let pki = TestPki::generate().expect("pki");
+        let renewed = TestPki::generate_for(pki.station_id).expect("pki");
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dir = StateDir::new(tmp.path().join("state"));
+        enroll(&dir, &pki, "https://localhost:7443");
+        let src = EnrolledSource(dir.clone());
+        let before = src.load().expect("load").tls.serial;
+        dir.stage_credentials(&state::NewCredentials {
+            key_pem: &renewed.station_key_pem,
+            cert_pem: &renewed.station_cert_pem,
+            chain_pem: "",
+            gateway_ca_pem: None,
+        })
+        .expect("stage");
+        let staged = src.load().expect("staged set");
+        assert_ne!(staged.tls.serial, before);
+        // Half moved: the same, consistent new set.
+        std::fs::rename(
+            dir.path().join(state::NEXT_DIR).join(state::KEY_FILE),
+            dir.file(state::KEY_FILE),
+        )
+        .expect("move key");
+        assert_eq!(
+            src.load().expect("half moved").tls.serial,
+            staged.tls.serial
+        );
+        assert!(dir.complete_swap().expect("complete"));
+        assert_eq!(src.load().expect("done").tls.serial, staged.tls.serial);
     }
 
     #[test]

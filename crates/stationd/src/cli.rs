@@ -43,7 +43,9 @@ pub const EXIT_OK: u8 = 0;
 pub const EXIT_FAILURE: u8 = 1;
 /// Invalid configuration or credentials (or command-line usage).
 pub const EXIT_CONFIG: u8 = 2;
-/// The hub revoked the station's certificate: re-enroll.
+/// The station's certificate was revoked (`Goodbye{REVOKED}`, or
+/// `revoked` from `station-api`): re-enroll. The service unit does not
+/// restart on it.
 pub const EXIT_REVOKED: u8 = 3;
 /// The station is not enrolled: enroll it (the same code as
 /// [`EXIT_REVOKED`]).
@@ -286,8 +288,8 @@ pub async fn run(
     let status = tokio::spawn(local_status::keep_written(
         config.status_path(),
         handle.station_id().to_string(),
-        handle.gateway_url().to_owned(),
         handle.state(),
+        handle.observed(),
         handle.last_error(),
         backend,
     ));

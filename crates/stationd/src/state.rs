@@ -16,11 +16,29 @@
 //! directory, `fsync`, `rename`, then `fsync` of the directory. A station
 //! is enrolled when all six files are present and parseable (checked by
 //! [`crate::credentials`]).
+//!
+//! A certificate renewal replaces the key, the certificate, the chain and
+//! (rarely) the CA bundle as **one** swap, so that no reader ever pairs a
+//! new certificate with the old key or the reverse, even across a crash
+//! ([`StateDir::swap_credentials`]):
+//!
+//! 1. the new files are written into a fresh `.next.tmp-*` directory and
+//!    synced; a crash here leaves the old credentials in place and the
+//!    temporary directory is removed by the next swap;
+//! 2. that directory is renamed to `next/` (the commit point);
+//! 3. each file is renamed from `next/` over the live one, then `next/` is
+//!    removed.
+//!
+//! Readers take each swapped file from `next/` when it is there, else the
+//! live one ([`StateDir::credential_file`]): before the commit they see
+//! only old files, after it only new ones. An interrupted step 3 is
+//! finished by the next swap or by [`StateDir::complete_swap`] at startup.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -49,6 +67,27 @@ pub const CREDENTIAL_FILES: [&str; 6] = [
     ASSIGNMENT_FILE,
     STATION_ID_FILE,
 ];
+
+/// The staging directory of a committed credential swap.
+pub const NEXT_DIR: &str = "next";
+
+/// Prefix of the uncommitted staging directories.
+const STAGING_PREFIX: &str = ".next.tmp-";
+
+/// The files a credential swap replaces, in the order they are moved into
+/// place (the key last: until then, readers take it from `next/` too).
+pub const SWAP_FILES: [&str; 4] = [CHAIN_FILE, CERT_FILE, GATEWAY_CA_FILE, KEY_FILE];
+
+/// Serialises credential swaps and credential reads within this process, so
+/// the daemon never loads a half-moved set (another process, such as
+/// `stationd status`, may at worst see a transient key mismatch, which the
+/// TLS loader refuses).
+static SWAP_LOCK: Mutex<()> = Mutex::new(());
+
+/// Holds off credential swaps in this process while the guard lives.
+pub fn swap_guard() -> MutexGuard<'static, ()> {
+    SWAP_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Mode of the state directory.
 pub const DIR_MODE: u32 = 0o700;
@@ -101,6 +140,19 @@ pub struct Enrollment<'a> {
     pub assignment: &'a Assignment,
 }
 
+/// What a certificate renewal stores ([`StateDir::swap_credentials`]).
+#[derive(Debug)]
+pub struct NewCredentials<'a> {
+    /// The new private key, PEM.
+    pub key_pem: &'a str,
+    /// The new leaf certificate, PEM.
+    pub cert_pem: &'a str,
+    /// Its intermediates, PEM (may be empty).
+    pub chain_pem: &'a str,
+    /// A rotated gateway CA bundle, PEM; `None` keeps the current one.
+    pub gateway_ca_pem: Option<&'a str>,
+}
+
 /// The state directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateDir {
@@ -138,8 +190,12 @@ impl StateDir {
 
     /// Writes every enrollment file atomically (the key 0600, the rest
     /// 0644), after creating the directory.
+    ///
+    /// A staged renewal of an earlier enrollment is discarded first.
     pub fn write_enrollment(&self, e: &Enrollment<'_>) -> Result<(), StateError> {
         self.ensure()?;
+        let _guard = swap_guard();
+        self.discard_staging(true)?;
         let assignment = serde_json::to_string_pretty(e.assignment)
             .map_err(|x| err(&self.file(ASSIGNMENT_FILE))(std::io::Error::other(x)))?;
         let station_id = e.station_id.to_string();
@@ -153,6 +209,117 @@ impl StateDir {
         ];
         for (name, contents, mode) in files {
             write_atomic(&self.file(name), contents, mode)?;
+        }
+        Ok(())
+    }
+
+    /// The file a reader should use for `name`: the staged one of a
+    /// committed swap when there is one ([`SWAP_FILES`]), else the live one.
+    pub fn credential_file(&self, name: &str) -> PathBuf {
+        if SWAP_FILES.contains(&name) {
+            let staged = self.path.join(NEXT_DIR).join(name);
+            if staged.is_file() {
+                return staged;
+            }
+        }
+        self.file(name)
+    }
+
+    /// Replaces the key, certificate, chain and optionally the CA bundle as
+    /// one atomic swap (see the [module docs](self)).
+    pub fn swap_credentials(&self, c: &NewCredentials<'_>) -> Result<(), StateError> {
+        let _guard = swap_guard();
+        self.stage_locked(c)?;
+        self.complete_locked().map(|_| ())
+    }
+
+    /// Steps 1 and 2 of a swap only: the new credentials are committed to
+    /// `next/` but not moved into place (what a crash after the commit
+    /// leaves behind). Readers already see the new set.
+    pub fn stage_credentials(&self, c: &NewCredentials<'_>) -> Result<(), StateError> {
+        let _guard = swap_guard();
+        self.stage_locked(c)
+    }
+
+    /// Finishes an interrupted swap (moves what is left in `next/` into
+    /// place) and removes uncommitted staging directories. Returns whether
+    /// there was a swap to finish.
+    pub fn complete_swap(&self) -> Result<bool, StateError> {
+        let _guard = swap_guard();
+        let finished = self.complete_locked()?;
+        self.discard_staging(false)?;
+        Ok(finished)
+    }
+
+    fn stage_locked(&self, c: &NewCredentials<'_>) -> Result<(), StateError> {
+        self.complete_locked()?;
+        self.discard_staging(false)?;
+        let tmp = self
+            .path
+            .join(format!("{STAGING_PREFIX}{:016x}", rand::random::<u64>()));
+        create_private_dir(&tmp)?;
+        let mut files: Vec<(&str, &[u8], u32)> = vec![
+            (KEY_FILE, c.key_pem.as_bytes(), KEY_MODE),
+            (CERT_FILE, c.cert_pem.as_bytes(), PUBLIC_MODE),
+            (CHAIN_FILE, c.chain_pem.as_bytes(), PUBLIC_MODE),
+        ];
+        if let Some(ca) = c.gateway_ca_pem {
+            files.push((GATEWAY_CA_FILE, ca.as_bytes(), PUBLIC_MODE));
+        }
+        let written = files
+            .into_iter()
+            .try_for_each(|(name, contents, mode)| write_atomic(&tmp.join(name), contents, mode));
+        if let Err(e) = written {
+            let _ = fs::remove_dir_all(&tmp);
+            return Err(e);
+        }
+        let next = self.path.join(NEXT_DIR);
+        if let Err(e) = fs::rename(&tmp, &next) {
+            let _ = fs::remove_dir_all(&tmp);
+            return Err(err(&next)(e));
+        }
+        sync_dir(&self.path)
+    }
+
+    fn complete_locked(&self) -> Result<bool, StateError> {
+        let next = self.path.join(NEXT_DIR);
+        if !next.is_dir() {
+            return Ok(false);
+        }
+        for name in SWAP_FILES {
+            let staged = next.join(name);
+            match fs::rename(&staged, self.file(name)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(err(&staged)(e)),
+            }
+        }
+        sync_dir(&self.path)?;
+        fs::remove_dir_all(&next).map_err(err(&next))?;
+        sync_dir(&self.path)?;
+        Ok(true)
+    }
+
+    /// Removes uncommitted staging directories, and `next/` too when
+    /// `committed` (enrollment and unenrollment replace everything).
+    fn discard_staging(&self, committed: bool) -> Result<(), StateError> {
+        let entries = match fs::read_dir(&self.path) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(err(&self.path)(e)),
+        };
+        let mut removed = false;
+        for entry in entries.filter_map(Result::ok) {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(STAGING_PREFIX) || (committed && name == NEXT_DIR) {
+                let path = entry.path();
+                fs::remove_dir_all(&path).map_err(err(&path))?;
+                removed = true;
+            }
+        }
+        if removed {
+            sync_dir(&self.path)?;
         }
         Ok(())
     }
@@ -180,6 +347,8 @@ impl StateDir {
     /// Deletes every credential file (keeps the directory and anything
     /// else in it). Returns the files that were removed.
     pub fn remove_credentials(&self) -> Result<Vec<&'static str>, StateError> {
+        let _guard = swap_guard();
+        self.discard_staging(true)?;
         let mut removed = Vec::new();
         for name in CREDENTIAL_FILES {
             let path = self.file(name);
@@ -194,6 +363,37 @@ impl StateDir {
         }
         Ok(removed)
     }
+
+    /// Writes `assignment.json` atomically unless it already holds
+    /// `assignment`; returns whether it changed.
+    pub fn write_assignment(&self, assignment: &Assignment) -> Result<bool, StateError> {
+        if self.assignment().ok().as_ref() == Some(assignment) {
+            return Ok(false);
+        }
+        let path = self.file(ASSIGNMENT_FILE);
+        let json = serde_json::to_string_pretty(assignment)
+            .map_err(|x| err(&path)(std::io::Error::other(x)))?;
+        write_atomic(&path, json.as_bytes(), PUBLIC_MODE)?;
+        Ok(true)
+    }
+}
+
+/// Creates the new directory `dir` with mode 0700, owned like its parent.
+fn create_private_dir(dir: &Path) -> Result<(), StateError> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    fs::DirBuilder::new()
+        .mode(DIR_MODE)
+        .create(dir)
+        .map_err(err(dir))?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(DIR_MODE)).map_err(err(dir))?;
+    if let Some(parent) = dir.parent() {
+        let p = fs::metadata(parent).map_err(err(parent))?;
+        let d = fs::metadata(dir).map_err(err(dir))?;
+        if (p.uid(), p.gid()) != (d.uid(), d.gid()) {
+            std::os::unix::fs::chown(dir, Some(p.uid()), Some(p.gid())).map_err(err(dir))?;
+        }
+    }
+    Ok(())
 }
 
 /// Creates `dir` (and parents) if needed and sets it to 0700.
@@ -354,6 +554,155 @@ mod tests {
             dir.station_id().expect_err("missing").source.kind(),
             std::io::ErrorKind::NotFound
         );
+    }
+
+    fn read(dir: &StateDir, name: &str) -> String {
+        fs::read_to_string(dir.credential_file(name)).expect("read")
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut n: Vec<String> = fs::read_dir(dir)
+            .expect("ls")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        n.sort();
+        n
+    }
+
+    const NEW: NewCredentials<'static> = NewCredentials {
+        key_pem: "KEY2",
+        cert_pem: "CERT2",
+        chain_pem: "CHAIN2",
+        gateway_ca_pem: None,
+    };
+
+    #[test]
+    fn swap_replaces_the_set_at_once() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dir = StateDir::new(tmp.path().join("state"));
+        sample(&dir);
+        dir.swap_credentials(&NEW).expect("swap");
+        assert_eq!(read(&dir, KEY_FILE), "KEY2");
+        assert_eq!(read(&dir, CERT_FILE), "CERT2");
+        assert_eq!(read(&dir, CHAIN_FILE), "CHAIN2");
+        assert_eq!(read(&dir, GATEWAY_CA_FILE), "CA", "kept");
+        assert_eq!(mode(&dir.file(KEY_FILE)), 0o600);
+        assert_eq!(mode(&dir.file(CERT_FILE)), 0o644);
+        assert_eq!(names(dir.path()).len(), 6, "{:?}", names(dir.path()));
+        // A rotated CA bundle.
+        dir.swap_credentials(&NewCredentials {
+            gateway_ca_pem: Some("CA3"),
+            key_pem: "KEY3",
+            ..NEW
+        })
+        .expect("swap");
+        assert_eq!(read(&dir, GATEWAY_CA_FILE), "CA3");
+        assert_eq!(read(&dir, KEY_FILE), "KEY3");
+        assert!(!dir.complete_swap().expect("nothing to do"));
+    }
+
+    #[test]
+    fn a_crash_after_the_commit_is_rolled_forward() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dir = StateDir::new(tmp.path());
+        sample(&dir);
+        dir.stage_credentials(&NEW).expect("stage");
+        // Committed but not moved: readers already see the new set.
+        assert_eq!(fs::read_to_string(dir.file(KEY_FILE)).expect("live"), "KEY");
+        assert_eq!(read(&dir, KEY_FILE), "KEY2");
+        assert_eq!(read(&dir, CERT_FILE), "CERT2");
+        assert_eq!(read(&dir, GATEWAY_CA_FILE), "CA");
+        assert_eq!(
+            dir.credential_file(ASSIGNMENT_FILE),
+            dir.file(ASSIGNMENT_FILE)
+        );
+        assert_eq!(mode(&dir.path().join(NEXT_DIR)), 0o700);
+        assert_eq!(mode(&dir.path().join(NEXT_DIR).join(KEY_FILE)), 0o600);
+        // A crash half-way through the moves: still the new set.
+        fs::rename(
+            dir.path().join(NEXT_DIR).join(CERT_FILE),
+            dir.file(CERT_FILE),
+        )
+        .expect("move");
+        assert_eq!(read(&dir, CERT_FILE), "CERT2");
+        assert_eq!(read(&dir, KEY_FILE), "KEY2");
+        // Startup finishes it.
+        assert!(dir.complete_swap().expect("complete"));
+        assert!(!dir.path().join(NEXT_DIR).exists());
+        assert_eq!(
+            fs::read_to_string(dir.file(KEY_FILE)).expect("live"),
+            "KEY2"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.file(CHAIN_FILE)).expect("live"),
+            "CHAIN2"
+        );
+        // A later swap also finishes an interrupted one first.
+        dir.stage_credentials(&NEW).expect("stage");
+        dir.swap_credentials(&NewCredentials {
+            key_pem: "KEY4",
+            ..NEW
+        })
+        .expect("swap");
+        assert_eq!(read(&dir, KEY_FILE), "KEY4");
+        assert!(!dir.path().join(NEXT_DIR).exists());
+    }
+
+    #[test]
+    fn a_crash_before_the_commit_keeps_the_old_set() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dir = StateDir::new(tmp.path());
+        sample(&dir);
+        let partial = dir.path().join(".next.tmp-0000000000000001");
+        fs::create_dir(&partial).expect("mkdir");
+        fs::write(partial.join(KEY_FILE), "HALF").expect("write");
+        assert_eq!(read(&dir, KEY_FILE), "KEY");
+        assert!(!dir.complete_swap().expect("nothing committed"));
+        assert!(!partial.exists(), "uncommitted staging removed");
+        // A failed write leaves the old files and no staging behind.
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500)).expect("chmod");
+        let e = dir.swap_credentials(&NEW);
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).expect("chmod");
+        if e.is_ok() {
+            // Running as root: permissions are not enforced.
+            return;
+        }
+        assert_eq!(read(&dir, KEY_FILE), "KEY");
+        assert_eq!(names(dir.path()).len(), 6, "{:?}", names(dir.path()));
+    }
+
+    #[test]
+    fn enrollment_and_removal_discard_staged_renewals() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dir = StateDir::new(tmp.path());
+        sample(&dir);
+        dir.stage_credentials(&NEW).expect("stage");
+        sample(&dir);
+        assert_eq!(read(&dir, KEY_FILE), "KEY", "a new enrollment wins");
+        assert!(!dir.path().join(NEXT_DIR).exists());
+        dir.stage_credentials(&NEW).expect("stage");
+        fs::create_dir(dir.path().join(".next.tmp-2")).expect("mkdir");
+        assert_eq!(dir.remove_credentials().expect("rm").len(), 6);
+        assert!(names(dir.path()).is_empty(), "{:?}", names(dir.path()));
+        // Nothing to discard in a directory that does not exist.
+        let gone = StateDir::new(tmp.path().join("gone"));
+        assert!(gone.remove_credentials().expect("rm").is_empty());
+        assert!(!gone.complete_swap().expect("none"));
+    }
+
+    #[test]
+    fn assignment_is_written_only_when_it_changes() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dir = StateDir::new(tmp.path());
+        let a = sample(&dir);
+        assert!(!dir.write_assignment(&a).expect("same"));
+        let b = Assignment {
+            hub_id: "eu1".into(),
+            gateway_url: "https://gw.eu1.example".into(),
+        };
+        assert!(dir.write_assignment(&b).expect("new"));
+        assert_eq!(dir.assignment().expect("read"), b);
+        assert_eq!(mode(&dir.file(ASSIGNMENT_FILE)), 0o644);
     }
 
     #[test]

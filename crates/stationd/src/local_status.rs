@@ -3,10 +3,11 @@
 //!
 //! `stationd run` writes `status.json` into the runtime directory
 //! (`/run/coaxhub/stationd/` in packaged builds, the state directory in
-//! development builds) whenever the tunnel state changes and every
-//! [`STATUS_WRITE_INTERVAL`]: tunnel state, backend state, last error. It
-//! holds nothing secret. `stationd status` combines it with the enrollment
-//! state.
+//! development builds) whenever the tunnel state or what the daemon
+//! observed changes, and every [`STATUS_WRITE_INTERVAL`]: tunnel state,
+//! backend state, last error, clock skew against the hub, and certificate
+//! renewal. It holds nothing secret. `stationd status` combines it with the
+//! enrollment state.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -20,8 +21,12 @@ use tracing::warn;
 
 use crate::config::{Config, CredentialsMode};
 use crate::credentials::{self, CredentialsError};
-use crate::daemon::{ConnectionState, StopReason};
+use crate::daemon::{ConnectionState, Observed, StopReason};
+use crate::renew::RenewalStatus;
 use crate::state::{self, StateDir};
+
+/// Clock skew above which `status` and `doctor` warn (never an error).
+pub const CLOCK_SKEW_WARN_MS: i64 = 30_000;
 
 /// How often the daemon refreshes `status.json` without a state change.
 pub const STATUS_WRITE_INTERVAL: Duration = Duration::from_secs(10);
@@ -85,7 +90,7 @@ pub enum Tunnel {
     Backoff,
     /// Stopped on request.
     Stopped,
-    /// The hub revoked the certificate (`Goodbye{REVOKED}`).
+    /// The certificate was revoked (`Goodbye{REVOKED}` or `station-api`).
     Revoked,
 }
 
@@ -112,6 +117,12 @@ pub struct RuntimeStatus {
     pub backend_version: String,
     /// Why the last attempt or session failed.
     pub last_error: Option<String>,
+    /// Hub time minus local time at the last `Welcome`, milliseconds.
+    #[serde(default)]
+    pub clock_skew_ms: Option<i64>,
+    /// Certificate renewal.
+    #[serde(default)]
+    pub renewal: RenewalStatus,
 }
 
 fn backend_state(state: v1::backend_health::State) -> &'static str {
@@ -124,11 +135,11 @@ fn backend_state(state: v1::backend_health::State) -> &'static str {
 }
 
 impl RuntimeStatus {
-    /// The status for `state`, `backend` and `last_error`.
+    /// The status for `state`, `observed`, `backend` and `last_error`.
     pub fn new(
         station_id: &str,
-        gateway_url: &str,
         state: &ConnectionState,
+        observed: &Observed,
         backend: &dyn Backend,
         last_error: Option<String>,
     ) -> Self {
@@ -150,13 +161,15 @@ impl RuntimeStatus {
             pid: std::process::id(),
             updated_unix_s: unix_now(),
             station_id: station_id.to_owned(),
-            gateway_url: gateway_url.to_owned(),
+            gateway_url: observed.gateway_url.clone(),
             tunnel,
             connection_id,
             backoff_ms,
             backend: backend_state(health.backend.state()).to_owned(),
             backend_version: backend.info().version,
             last_error,
+            clock_skew_ms: observed.clock_skew_ms,
+            renewal: observed.renewal.clone(),
         }
     }
 
@@ -185,19 +198,21 @@ pub fn process_alive(pid: u32) -> bool {
 pub async fn keep_written(
     path: std::path::PathBuf,
     station_id: String,
-    gateway_url: String,
     mut state: watch::Receiver<ConnectionState>,
+    mut observed: watch::Receiver<Observed>,
     last_error: watch::Receiver<Option<String>>,
     backend: std::sync::Arc<dyn Backend>,
 ) {
     let mut warned = false;
+    let mut observing = true;
     let mut tick = tokio::time::interval(STATUS_WRITE_INTERVAL);
     loop {
         let current = state.borrow_and_update().clone();
+        let seen = observed.borrow_and_update().clone();
         let status = RuntimeStatus::new(
             &station_id,
-            &gateway_url,
             &current,
+            &seen,
             backend.as_ref(),
             last_error.borrow().clone(),
         );
@@ -214,6 +229,7 @@ pub async fn keep_written(
         }
         tokio::select! {
             r = state.changed() => if r.is_err() { return },
+            r = observed.changed(), if observing => observing = r.is_ok(),
             _ = tick.tick() => {}
         }
     }
@@ -234,6 +250,11 @@ pub struct StatusReport {
     pub cert_not_after_unix_s: Option<i64>,
     /// Seconds left on the certificate (negative when expired).
     pub cert_expires_in_s: Option<i64>,
+    /// The certificate's serial, hex.
+    pub cert_serial: Option<String>,
+    /// When the certificate is due for renewal (two thirds of its
+    /// lifetime), Unix seconds.
+    pub cert_renew_at_unix_s: Option<i64>,
     /// The home hub id (enrolled stations).
     pub hub_id: Option<String>,
     /// The gateway.
@@ -261,6 +282,8 @@ pub fn report(config: &Config, now: i64) -> StatusReport {
         station_id: None,
         cert_not_after_unix_s: None,
         cert_expires_in_s: None,
+        cert_serial: None,
+        cert_renew_at_unix_s: None,
         hub_id: None,
         gateway_url: None,
         sdr_profile: config.sdr.map(|s| s.profile.name),
@@ -273,6 +296,10 @@ pub fn report(config: &Config, now: i64) -> StatusReport {
             r.station_id = Some(c.tls.station_id.to_string());
             r.cert_not_after_unix_s = Some(c.tls.validity.not_after_unix_s);
             r.cert_expires_in_s = Some(c.tls.validity.not_after_unix_s - now);
+            r.cert_serial = Some(c.tls.serial);
+            if let CredentialsMode::Enrolled = config.credentials {
+                r.cert_renew_at_unix_s = Some(crate::renew::due_at(c.tls.validity));
+            }
             r.hub_id = c.hub_id;
             r.gateway_url = Some(c.gateway.url);
         }
@@ -320,6 +347,12 @@ impl StatusReport {
             };
             line("certificate", &format!("expires {when}"));
         }
+        if let Some(serial) = &self.cert_serial {
+            line("serial", serial);
+        }
+        if let Some(at) = self.cert_renew_at_unix_s {
+            line("renewal due", &format_utc(at));
+        }
         if let Some(h) = &self.hub_id {
             line("home hub", h);
         }
@@ -343,7 +376,10 @@ impl StatusReport {
                         d.backoff_ms.unwrap_or(0)
                     ),
                     Tunnel::Stopped => "stopped".to_owned(),
-                    Tunnel::Revoked => "revoked by the hub: enroll this station again".to_owned(),
+                    Tunnel::Revoked => {
+                        "revoked: this station's certificate was revoked; enroll it again"
+                            .to_owned()
+                    }
                 };
                 let as_of = format_utc(d.updated_unix_s);
                 if running {
@@ -356,10 +392,36 @@ impl StatusReport {
                 if let Some(e) = &d.last_error {
                     line("last error", &format!("{e:?}"));
                 }
+                if let Some(skew) = d.clock_skew_ms {
+                    line("clock skew", &describe_skew(skew));
+                }
+                let r = &d.renewal;
+                if let Some(at) = r.last_renewal_unix_s {
+                    line("renewed", &format_utc(at));
+                }
+                if let Some(at) = r.next_renewal_unix_s {
+                    line("next renewal", &format_utc(at));
+                }
+                if let Some(e) = &r.last_error {
+                    line("renewal", &format!("failed: {e:?}"));
+                }
             }
         }
         out
     }
+}
+
+/// The clock skew in words, with a warning above
+/// [`CLOCK_SKEW_WARN_MS`].
+pub fn describe_skew(skew_ms: i64) -> String {
+    let secs = skew_ms.unsigned_abs() / 1000;
+    let tenths = skew_ms.unsigned_abs() % 1000 / 100;
+    let direction = if skew_ms >= 0 { "behind" } else { "ahead of" };
+    let mut text = format!("this clock is {secs}.{tenths} s {direction} the hub's");
+    if skew_ms.unsigned_abs() > CLOCK_SKEW_WARN_MS.unsigned_abs() {
+        text.push_str(" (WARNING: more than 30 s; check NTP, certificates depend on the clock)");
+    }
+    text
 }
 
 #[cfg(test)]
@@ -413,9 +475,16 @@ mod tests {
                 Tunnel::Revoked,
             ),
         ];
+        let observed = Observed {
+            gateway_url: "https://gw".into(),
+            clock_skew_ms: Some(-1500),
+            ..Observed::default()
+        };
         for (state, tunnel) in states {
-            let s = RuntimeStatus::new("id", "https://gw", &state, &backend, Some("boom".into()));
+            let s = RuntimeStatus::new("id", &state, &observed, &backend, Some("boom".into()));
             assert_eq!(s.tunnel, tunnel);
+            assert_eq!(s.gateway_url, "https://gw");
+            assert_eq!(s.clock_skew_ms, Some(-1500));
             s.write(&path).expect("write");
             assert_eq!(RuntimeStatus::read(&path), Some(s));
         }
@@ -424,8 +493,8 @@ mod tests {
         assert!(
             RuntimeStatus::new(
                 "id",
-                "g",
                 &ConnectionState::Connecting { attempt: 1 },
+                &Observed::default(),
                 &backend,
                 None
             )
@@ -443,6 +512,34 @@ mod tests {
     }
 
     #[test]
+    fn skew_in_words() {
+        assert_eq!(describe_skew(0), "this clock is 0.0 s behind the hub's");
+        assert_eq!(
+            describe_skew(-1250),
+            "this clock is 1.2 s ahead of the hub's"
+        );
+        assert!(!describe_skew(30_000).contains("WARNING"));
+        assert!(describe_skew(-30_001).contains("WARNING"));
+        assert!(describe_skew(i64::MIN).contains("WARNING"));
+    }
+
+    #[test]
+    fn old_status_files_still_parse() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("status.json");
+        std::fs::write(
+            &path,
+            r#"{"pid":1,"updated_unix_s":0,"station_id":"s","gateway_url":"g","tunnel":"connected",
+               "connection_id":null,"backoff_ms":null,"backend":"running","backend_version":"v",
+               "last_error":null}"#,
+        )
+        .expect("write");
+        let s = RuntimeStatus::read(&path).expect("parses");
+        assert_eq!(s.clock_skew_ms, None);
+        assert_eq!(s.renewal, RenewalStatus::default());
+    }
+
+    #[test]
     fn render_every_tunnel_state() {
         let base = StatusReport {
             credentials: "enrolled",
@@ -451,6 +548,8 @@ mod tests {
             station_id: Some("s".into()),
             cert_not_after_unix_s: Some(1_790_000_000),
             cert_expires_in_s: Some(86_400 * 20),
+            cert_serial: Some("abc".into()),
+            cert_renew_at_unix_s: Some(1_789_000_000),
             hub_id: Some("sa1".into()),
             gateway_url: Some("https://gw".into()),
             sdr_profile: Some("rtlsdr"),
@@ -495,11 +594,26 @@ mod tests {
                     backend: "running".into(),
                     backend_version: "fake-1".into(),
                     last_error: Some("x\ny".into()),
+                    clock_skew_ms: Some(45_000),
+                    renewal: RenewalStatus {
+                        last_renewal_unix_s: Some(1_780_000_000),
+                        next_renewal_unix_s: Some(1_789_000_000),
+                        last_error: Some("down".into()),
+                    },
                 }),
                 ..base.clone()
             };
             let text = r.render();
             assert!(text.contains("tunnel"), "{text}");
+            assert!(text.contains("serial       abc"), "{text}");
+            assert!(
+                text.contains("clock skew   this clock is 45.0 s behind"),
+                "{text}"
+            );
+            assert!(text.contains("WARNING"), "{text}");
+            assert!(text.contains("renewed      2026-05-28"), "{text}");
+            assert!(text.contains("next renewal"), "{text}");
+            assert!(text.contains("renewal      failed: \"down\""), "{text}");
             assert!(text.contains("x\\ny"), "control characters escaped: {text}");
         }
     }

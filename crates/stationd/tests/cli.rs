@@ -126,7 +126,11 @@ async fn revoked_exits_3() {
         std::fs::read_to_string(h.target.work_dir.join("state/status.json")).expect("status.json");
     assert!(status.contains("\"revoked\""), "{status}");
     let out = stationd(&["status"], &path);
-    assert!(text(&out).contains("revoked by the hub"), "{}", text(&out));
+    assert!(
+        text(&out).contains("certificate was revoked"),
+        "{}",
+        text(&out)
+    );
 }
 
 mod enroll_support;

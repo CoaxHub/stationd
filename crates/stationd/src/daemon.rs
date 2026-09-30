@@ -8,8 +8,22 @@
 //! Reconnection follows `station_proto::backoff` exactly: every session end
 //! (connect failure, lost stream, `Goodbye`) goes through
 //! [`Backoff::on_disconnected`], which also handles `retry_after_ms`,
-//! `DISABLED` (15 min), `UNSUPPORTED_VERSION` (6 h) and `REVOKED` (stop for
-//! good: [`run`] returns [`RunError::Revoked`]).
+//! `DISABLED` (15 min) and `UNSUPPORTED_VERSION` (6 h).
+//!
+//! Enrolled stations with a `station-api` endpoint also talk to the control
+//! plane ([`crate::station_api`]):
+//!
+//! - **Assignment:** `GetAssignment` before the first connection and after
+//!   `Goodbye{refresh_assignment}` or `REASSIGNED`, stored in
+//!   `assignment.json`; if `station-api` cannot be reached, the stored
+//!   assignment is used.
+//! - **Renewal:** a task ([`crate::renew`]) renews the certificate at two
+//!   thirds of its lifetime; the tunnel then reconnects at once with it.
+//! - **Revocation:** `Goodbye{REVOKED}`, or `revoked` from `station-api`,
+//!   stops the daemon ([`RunError::Revoked`], exit code 3), **unless** the
+//!   state directory now holds a different, unexpired certificate than the
+//!   refused one (a renewal or a re-enrollment just landed): then it
+//!   reconnects with that one.
 
 use std::fmt;
 use std::sync::Arc;
@@ -18,17 +32,20 @@ use std::time::Duration;
 use station_backend::Backend;
 use station_proto::backoff::{Backoff, Decision, Policy};
 use station_proto::{limits, v1};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::config::{Config, Endpoint, LocalPolicy};
+use crate::config::{Config, CredentialsMode, Endpoint, LocalPolicy};
 use crate::credentials::{self, CredentialSource, Credentials, CredentialsError};
 use crate::dispatch::truncate_utf8;
 use crate::outbound::{DropCounters, QueueLimits};
+use crate::renew::{self, ApiRenewal, RenewalOptions, RenewalStatus, Signal, UnixClock};
 use crate::session::{self, End};
+use crate::state::StateDir;
+use crate::station_api::{ControlError, StationApi};
 use crate::tls::{Connector, TlsError};
 
 use v1::goodbye::Reason;
@@ -55,6 +72,12 @@ pub struct RunOptions {
     pub queue: QueueLimits,
     /// The `Hello.boot_id`; random when `None` (once per daemon).
     pub boot_id: Option<u64>,
+    /// Certificate renewal timing (and the wall clock the daemon uses).
+    pub renewal: RenewalOptions,
+    /// Timeout of `StationControl.GetAssignment` (connect and call).
+    pub assignment_timeout: Duration,
+    /// Timeout of `StationControl.RenewCertificate` (connect and call).
+    pub renew_timeout: Duration,
 }
 
 impl Default for RunOptions {
@@ -69,6 +92,9 @@ impl Default for RunOptions {
             shutdown_grace: Duration::from_secs(2),
             queue: QueueLimits::default(),
             boot_id: None,
+            renewal: RenewalOptions::default(),
+            assignment_timeout: crate::station_api::ASSIGNMENT_TIMEOUT,
+            renew_timeout: crate::station_api::RENEW_TIMEOUT,
         }
     }
 }
@@ -84,6 +110,9 @@ impl fmt::Debug for RunOptions {
             .field("shutdown_grace", &self.shutdown_grace)
             .field("queue", &self.queue)
             .field("boot_id", &self.boot_id)
+            .field("renewal", &self.renewal)
+            .field("assignment_timeout", &self.assignment_timeout)
+            .field("renew_timeout", &self.renew_timeout)
             .finish_non_exhaustive()
     }
 }
@@ -93,8 +122,27 @@ impl fmt::Debug for RunOptions {
 pub enum StopReason {
     /// Graceful shutdown was requested.
     Shutdown,
-    /// The hub sent `Goodbye{REVOKED}`: re-enrollment is required.
+    /// The certificate was revoked (`Goodbye{REVOKED}`, or `revoked` from
+    /// `station-api`): re-enrollment is required.
     Revoked,
+}
+
+/// What the daemon learned beyond the connection state, observable through
+/// [`DaemonHandle::observed`] (and written to `status.json`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Observed {
+    /// The gateway being dialed (it changes with the assignment).
+    pub gateway_url: String,
+    /// The home hub, when known (enrolled stations).
+    pub hub_id: Option<String>,
+    /// The serial of the certificate in use, hex.
+    pub serial: String,
+    /// Hub time minus local time when the last `Welcome` arrived,
+    /// milliseconds (round-trip time ignored); `None` until a hub reported
+    /// its time.
+    pub clock_skew_ms: Option<i64>,
+    /// Certificate renewal.
+    pub renewal: RenewalStatus,
 }
 
 /// The tunnel's state, observable through [`DaemonHandle::state`].
@@ -132,8 +180,9 @@ pub enum RunError {
     /// state).
     #[error(transparent)]
     Credentials(CredentialsError),
-    /// The hub revoked this station's credential (`Goodbye{REVOKED}`).
-    #[error("the hub revoked this station's certificate; enroll the station again")]
+    /// The station's certificate was revoked (`Goodbye{REVOKED}`, or
+    /// `revoked` from `station-api`).
+    #[error("this station's certificate was revoked; enroll the station again")]
     Revoked,
     /// The daemon task panicked or was aborted.
     #[error("daemon task failed: {0}")]
@@ -157,6 +206,9 @@ impl From<CredentialsError> for RunError {
 pub(crate) struct Link {
     pub gateway: Endpoint,
     pub connector: Connector,
+    pub hub_id: Option<String>,
+    /// The serial of the certificate this link presents.
+    pub serial: String,
 }
 
 impl Link {
@@ -164,7 +216,17 @@ impl Link {
         Ok(Self {
             gateway: credentials.gateway.clone(),
             connector: Connector::new(Arc::clone(&credentials.tls.config), &credentials.gateway)?,
+            hub_id: credentials.hub_id.clone(),
+            serial: credentials.tls.serial.clone(),
         })
+    }
+
+    fn publish(&self, observed: &watch::Sender<Observed>) {
+        observed.send_modify(|o| {
+            o.gateway_url.clone_from(&self.gateway.url);
+            o.hub_id.clone_from(&self.hub_id);
+            o.serial.clone_from(&self.serial);
+        });
     }
 }
 
@@ -182,6 +244,13 @@ pub(crate) struct Ctx {
     pub keepalive_timeout: Duration,
     pub shutdown_grace: Duration,
     pub queue: QueueLimits,
+    /// `StationControl`, for enrolled stations with a `station-api`
+    /// endpoint.
+    pub control: Option<Arc<StationApi>>,
+    /// What the daemon observed.
+    pub observed: watch::Sender<Observed>,
+    /// The wall clock, Unix seconds.
+    pub clock: UnixClock,
 }
 
 /// A running daemon.
@@ -189,6 +258,7 @@ pub(crate) struct Ctx {
 pub struct DaemonHandle {
     state: watch::Receiver<ConnectionState>,
     last_error: watch::Receiver<Option<String>>,
+    observed: watch::Receiver<Observed>,
     shutdown: CancellationToken,
     task: Option<JoinHandle<Result<(), RunError>>>,
     station_id: Uuid,
@@ -213,12 +283,19 @@ impl DaemonHandle {
         self.last_error.clone()
     }
 
+    /// A receiver of what the daemon observed (gateway, clock skew,
+    /// renewal).
+    pub fn observed(&self) -> watch::Receiver<Observed> {
+        self.observed.clone()
+    }
+
     /// The station ID from the client certificate.
     pub fn station_id(&self) -> Uuid {
         self.station_id
     }
 
-    /// The gateway the daemon started with.
+    /// The gateway the daemon started with (see [`Self::observed`] for the
+    /// current one).
     pub fn gateway_url(&self) -> &str {
         &self.gateway_url
     }
@@ -275,6 +352,7 @@ pub fn spawn_with(
     backend: Arc<dyn Backend>,
     options: RunOptions,
 ) -> Result<DaemonHandle, RunError> {
+    finish_interrupted_swap(config);
     let first = source.load()?;
     let link = Link::new(&first)?;
     let station_id = first.tls.station_id;
@@ -292,10 +370,13 @@ pub fn spawn_with(
         hub = first.hub_id.as_deref().unwrap_or("-"),
         credentials = source.kind(),
         trust_anchors = first.tls.trust_anchors,
+        serial = %first.tls.serial,
         boot_id,
         "stationd starting"
     );
-    let ctx = context(source, config, backend, &options);
+    let (ctx, options) = context(source, config, backend, options);
+    link.publish(&ctx.observed);
+    let observed = ctx.observed.subscribe();
     let task = tokio::spawn(run_loop(
         ctx,
         link,
@@ -307,6 +388,7 @@ pub fn spawn_with(
     Ok(DaemonHandle {
         state,
         last_error,
+        observed,
         shutdown,
         task: Some(task),
         station_id,
@@ -324,20 +406,49 @@ pub async fn run(
     shutdown: CancellationToken,
     state: watch::Sender<ConnectionState>,
 ) -> Result<(), RunError> {
+    finish_interrupted_swap(config);
     let source = credentials::source(config);
     let link = Link::new(&source.load()?)?;
-    let ctx = context(source, config, backend, &options);
+    let (ctx, options) = context(source, config, backend, options);
+    link.publish(&ctx.observed);
     let (error_tx, _) = watch::channel(None);
     run_loop(ctx, link, options, shutdown, state, error_tx).await
+}
+
+/// Completes a credential swap a crash interrupted (enrolled stations).
+fn finish_interrupted_swap(config: &Config) {
+    if let CredentialsMode::Enrolled = config.credentials {
+        match StateDir::new(&config.state_dir).complete_swap() {
+            Ok(true) => info!("completed a certificate swap interrupted by a restart"),
+            Ok(false) => {}
+            Err(e) => warn!(error = %e, "cannot complete an interrupted certificate swap"),
+        }
+    }
+}
+
+/// The options the reconnect loop keeps (the renewal task takes the rest).
+pub(crate) struct LoopOptions {
+    backoff: Policy,
+    random: Box<dyn FnMut() -> u64 + Send>,
+    renewal: Option<RenewalOptions>,
 }
 
 fn context(
     credentials: Arc<dyn CredentialSource>,
     config: &Config,
     backend: Arc<dyn Backend>,
-    options: &RunOptions,
-) -> Arc<Ctx> {
-    Arc::new(Ctx {
+    options: RunOptions,
+) -> (Arc<Ctx>, LoopOptions) {
+    let control = StationApi::from_config(config).map(|mut api| {
+        api.assignment_timeout = options.assignment_timeout;
+        api.renew_timeout = options.renew_timeout;
+        Arc::new(api)
+    });
+    if control.is_none() && matches!(config.credentials, CredentialsMode::Enrolled) {
+        info!("no station-api endpoint: assignment refresh and certificate renewal are off");
+    }
+    let (observed, _) = watch::channel(Observed::default());
+    let ctx = Arc::new(Ctx {
         credentials,
         policy: Arc::new(config.policy.clone()),
         backend,
@@ -350,7 +461,16 @@ fn context(
         keepalive_timeout: options.keepalive_timeout,
         shutdown_grace: options.shutdown_grace,
         queue: options.queue,
-    })
+        control,
+        observed,
+        clock: Arc::clone(&options.renewal.clock),
+    });
+    let rest = LoopOptions {
+        backoff: options.backoff,
+        random: options.random,
+        renewal: Some(options.renewal),
+    };
+    (ctx, rest)
 }
 
 /// The link for the next attempt: fresh credentials when they load (a
@@ -368,10 +488,121 @@ fn refresh(ctx: &Ctx, link: &mut Link) {
             if next.gateway != link.gateway {
                 info!(gateway = %c.gateway.url, hub = c.hub_id.as_deref().unwrap_or("-"), "gateway changed");
             }
+            if next.serial != link.serial {
+                info!(serial = %next.serial, previous = %link.serial, "using a new certificate");
+            }
             *link = next;
+            link.publish(&ctx.observed);
         }
         Err(e) => warn!(error = %e, "cannot reload the credentials; using the previous ones"),
     }
+}
+
+/// The credentials on disk when they hold a different, unexpired
+/// certificate than `refused` (a renewal or a re-enrollment landed).
+fn newer_than(ctx: &Ctx, refused: &str) -> Option<Credentials> {
+    let c = ctx.credentials.load().ok()?;
+    (c.tls.serial != refused && c.tls.validity.not_after_unix_s > (ctx.clock)()).then_some(c)
+}
+
+/// After `by` refused the certificate `serial` as revoked: `Ok` to
+/// reconnect at once with a newer certificate from disk, else the daemon
+/// stops (status `revoked`, exit code 3).
+fn on_revoked(
+    ctx: &Ctx,
+    serial: &str,
+    by: &str,
+    state: &watch::Sender<ConnectionState>,
+    last_error: &watch::Sender<Option<String>>,
+) -> Result<(), RunError> {
+    if let Some(c) = newer_than(ctx, serial) {
+        info!(
+            refused_serial = %serial,
+            serial = %c.tls.serial,
+            "{by} refused the previous certificate as revoked; a newer certificate is on disk, \
+             reconnecting with it"
+        );
+        return Ok(());
+    }
+    error!(
+        serial = %serial,
+        "{by} revoked this station's certificate; stationd stops. Enroll the station again \
+         (stationd enroll --force) to reconnect"
+    );
+    last_error.send_replace(Some(format!("certificate revoked ({by})")));
+    state.send_replace(ConnectionState::Stopped(StopReason::Revoked));
+    Err(RunError::Revoked)
+}
+
+/// How a `GetAssignment` round ended.
+enum Assigned {
+    /// Done, or failed and the stored assignment stays.
+    Done,
+    /// `station-api` refused the certificate with this serial as revoked.
+    Revoked(String),
+    /// Shutdown was requested meanwhile.
+    Shutdown,
+}
+
+/// `GetAssignment` (station-protocol §2.2, brief contract C): stores a new
+/// home hub; on any failure but `revoked`, keeps the stored one.
+async fn refresh_assignment(ctx: &Ctx, shutdown: &CancellationToken) -> Assigned {
+    let Some(api) = &ctx.control else {
+        return Assigned::Done;
+    };
+    let result = tokio::select! {
+        r = api.refresh_assignment() => r,
+        () = shutdown.cancelled() => return Assigned::Shutdown,
+    };
+    match result {
+        Ok(u) if u.changed => {
+            info!(
+                hub = %u.assignment.hub_id,
+                gateway = %u.assignment.gateway_url,
+                "new home hub assignment stored"
+            );
+            Assigned::Done
+        }
+        Ok(u) => {
+            debug!(hub = %u.assignment.hub_id, "home hub assignment unchanged");
+            Assigned::Done
+        }
+        Err(ControlError::Revoked { serial }) => Assigned::Revoked(serial),
+        Err(e) => {
+            warn!(error = %e, "cannot refresh the home hub assignment; using the stored one");
+            Assigned::Done
+        }
+    }
+}
+
+/// Aborts a task when dropped.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn start_renewal(
+    ctx: &Arc<Ctx>,
+    options: RenewalOptions,
+    shutdown: &CancellationToken,
+    signals: mpsc::Sender<Signal>,
+) -> Option<AbortOnDrop> {
+    let api = ctx.control.as_ref()?;
+    let renewal = Arc::new(ApiRenewal {
+        api: Arc::clone(api),
+        source: Arc::clone(&ctx.credentials),
+    });
+    let observed = ctx.observed.clone();
+    Some(AbortOnDrop(tokio::spawn(renew::run(
+        renewal,
+        options,
+        shutdown.clone(),
+        signals,
+        move |s: &RenewalStatus| observed.send_modify(|o| o.renewal = s.clone()),
+    ))))
 }
 
 fn std_now() -> std::time::Instant {
@@ -398,10 +629,9 @@ fn log_goodbye(g: &v1::Goodbye) {
             hub_message = ?message,
             "this station is disabled by its owner or a moderator; retrying every 15 minutes"
         ),
-        Ok(Reason::Revoked) => error!(
+        Ok(Reason::Revoked) => warn!(
             hub_message = ?message,
-            "the hub revoked this station's certificate; stationd stops. \
-             Enroll the station again to reconnect"
+            "the hub refused this station's certificate as revoked"
         ),
         Ok(Reason::ProtocolViolation) => error!(
             hub_message = ?message,
@@ -425,32 +655,63 @@ fn log_goodbye(g: &v1::Goodbye) {
 async fn run_loop(
     ctx: Arc<Ctx>,
     mut link: Link,
-    mut options: RunOptions,
+    mut options: LoopOptions,
     shutdown: CancellationToken,
     state: watch::Sender<ConnectionState>,
     last_error: watch::Sender<Option<String>>,
 ) -> Result<(), RunError> {
+    // The sender stays here too, so `recv` never reports a closed channel.
+    let (signal_tx, mut signals) = mpsc::channel(4);
+    let _renewal = options
+        .renewal
+        .take()
+        .and_then(|r| start_renewal(&ctx, r, &shutdown, signal_tx.clone()));
     let mut backoff = Backoff::new(options.backoff);
     let mut attempt: u64 = 0;
+    let mut assign = ctx.control.is_some();
+    let stopped = |state: &watch::Sender<ConnectionState>| {
+        info!("stationd stopped");
+        state.send_replace(ConnectionState::Stopped(StopReason::Shutdown));
+        Ok(())
+    };
     loop {
-        attempt = attempt.saturating_add(1);
-        if attempt > 1 {
-            refresh(&ctx, &mut link);
+        let assign_now = std::mem::take(&mut assign);
+        if !before_attempt(
+            &ctx,
+            assign_now,
+            &shutdown,
+            &mut signals,
+            &state,
+            &last_error,
+        )
+        .await?
+        {
+            return stopped(&state);
         }
+        attempt = attempt.saturating_add(1);
+        refresh(&ctx, &mut link);
         state.send_replace(ConnectionState::Connecting { attempt });
-        let outcome = session::run(&ctx, &link, &shutdown, &state).await;
+        let outcome = session::run(&ctx, &link, &shutdown, &state, &mut signals).await;
         if let Some(at) = outcome.established_at {
             backoff.on_connected(at);
             last_error.send_replace(None);
         }
         let goodbye = match outcome.end {
-            End::Shutdown => {
-                info!("stationd stopped");
-                state.send_replace(ConnectionState::Stopped(StopReason::Shutdown));
-                return Ok(());
+            End::Shutdown => return stopped(&state),
+            End::Renewed => {
+                info!("reconnecting with the renewed certificate");
+                continue;
+            }
+            End::Revoked(serial) => {
+                on_revoked(&ctx, &serial, "station-api", &state, &last_error)?;
+                continue;
             }
             End::Goodbye(g) => {
                 log_goodbye(&g);
+                if g.reason() == Reason::Revoked {
+                    on_revoked(&ctx, &link.serial, "the hub", &state, &last_error)?;
+                    continue;
+                }
                 last_error.send_replace(Some(format!(
                     "hub said goodbye: {}",
                     g.reason().as_str_name()
@@ -465,6 +726,7 @@ async fn run_loop(
         };
         match backoff.on_disconnected(goodbye.as_ref(), std_now(), &mut options.random) {
             Decision::Stop => {
+                // Only REVOKED stops, and it is handled above.
                 state.send_replace(ConnectionState::Stopped(StopReason::Revoked));
                 return Err(RunError::Revoked);
             }
@@ -473,25 +735,76 @@ async fn run_loop(
                 refresh_assignment,
             } => {
                 if refresh_assignment {
-                    warn!(
-                        "the hub asked to refresh the assignment; StationControl.GetAssignment \
-                         is not implemented yet, reconnecting to the stored gateway"
-                    );
+                    if ctx.control.is_some() {
+                        assign = true;
+                    } else {
+                        warn!(
+                            "the hub asked to refresh the assignment, but there is no station-api \
+                             endpoint; reconnecting to the configured gateway"
+                        );
+                    }
                 }
                 info!(
                     delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
                     "reconnecting after backoff"
                 );
                 state.send_replace(ConnectionState::Backoff { delay });
-                tokio::select! {
-                    () = tokio::time::sleep(delay) => {}
-                    () = shutdown.cancelled() => {
-                        info!("stationd stopped");
-                        state.send_replace(ConnectionState::Stopped(StopReason::Shutdown));
-                        return Ok(());
-                    }
+                if !wait_backoff(&ctx, delay, &shutdown, &mut signals, &state, &last_error).await? {
+                    return stopped(&state);
                 }
             }
         }
+    }
+}
+
+/// Between sessions: handles signals that arrived meanwhile (a renewal is
+/// picked up by the reload that follows; a revocation is handled now), then
+/// refreshes the assignment when `assign`. `Ok(false)` on shutdown.
+async fn before_attempt(
+    ctx: &Ctx,
+    assign: bool,
+    shutdown: &CancellationToken,
+    signals: &mut mpsc::Receiver<Signal>,
+    state: &watch::Sender<ConnectionState>,
+    last_error: &watch::Sender<Option<String>>,
+) -> Result<bool, RunError> {
+    while let Ok(signal) = signals.try_recv() {
+        if let Signal::Revoked { serial } = signal {
+            on_revoked(ctx, &serial, "station-api", state, last_error)?;
+        }
+    }
+    if assign {
+        match refresh_assignment(ctx, shutdown).await {
+            Assigned::Done => {}
+            Assigned::Revoked(serial) => {
+                on_revoked(ctx, &serial, "station-api", state, last_error)?;
+            }
+            Assigned::Shutdown => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+/// Sleeps `delay` before the next attempt, ending early for new
+/// credentials. `Ok(false)` on shutdown; an error when a revocation stops
+/// the daemon.
+async fn wait_backoff(
+    ctx: &Ctx,
+    delay: Duration,
+    shutdown: &CancellationToken,
+    signals: &mut mpsc::Receiver<Signal>,
+    state: &watch::Sender<ConnectionState>,
+    last_error: &watch::Sender<Option<String>>,
+) -> Result<bool, RunError> {
+    tokio::select! {
+        () = tokio::time::sleep(delay) => Ok(true),
+        () = shutdown.cancelled() => Ok(false),
+        Some(signal) = signals.recv() => match signal {
+            // New credentials: try them now.
+            Signal::Renewed { .. } => Ok(true),
+            Signal::Revoked { serial } => {
+                on_revoked(ctx, &serial, "station-api", state, last_error).map(|()| true)
+            }
+        },
     }
 }
