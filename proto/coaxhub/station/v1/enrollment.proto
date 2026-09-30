@@ -7,7 +7,8 @@
 // Flow: docs/architecture.md.
 //
 // Transport: gRPC over HTTPS to the control plane.
-//   Enrollment      https://api.{domain}          public WebPKI TLS + one-time token
+//   Enrollment      https://enroll.{domain}       TLS + one-time token; server verified
+//                   against the CoaxHub root built into stationd (never WebPKI)
 //   StationControl  https://station-api.{domain}  mTLS with the station certificate;
 //                   server verified against gateway_ca_bundle_pem
 
@@ -56,7 +57,7 @@ message GetAssignmentRequest {}
 
 message Assignment {
   string hub_id = 1;
-  // e.g. "https://gw.sa1.{domain}:443"
+  // e.g. "https://gw.sa1.{domain}:443" (hostnames are per hub)
   string gateway_url = 2;
 }
 
