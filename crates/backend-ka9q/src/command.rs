@@ -67,6 +67,7 @@ pub struct Command {
     output_encoding: Option<Encoding>,
     opus_bit_rate: Option<u32>,
     radio_frequency_hz: Option<f64>,
+    first_lo_hz: Option<f64>,
     low_edge_hz: Option<f32>,
     high_edge_hz: Option<f32>,
     gain_db: Option<f32>,
@@ -181,6 +182,16 @@ impl Command {
     /// takes the absolute value).
     pub fn radio_frequency_hz(mut self, hz: f64) -> Self {
         self.radio_frequency_hz = Some(hz);
+        self
+    }
+
+    /// `FIRST_LO_FREQUENCY`: the front end's tuner frequency, Hz
+    /// (`encode_double`; radiod `decode_double`, absolute value). Shared by
+    /// every channel; radiod ignores it when the tuner is locked (a fixed
+    /// `frequency =` in its config) or cannot tune (the signal generator), so
+    /// check `FIRST_LO_FREQUENCY` in the reply.
+    pub fn first_lo_hz(mut self, hz: f64) -> Self {
+        self.first_lo_hz = Some(hz);
         self
     }
 
@@ -334,6 +345,9 @@ impl Command {
         }
         if let Some(f) = self.radio_frequency_hz {
             e = e.f64(S::RadioFrequency, f);
+        }
+        if let Some(f) = self.first_lo_hz {
+            e = e.f64(S::FirstLoFrequency, f);
         }
         let floats = [
             (S::LowEdge, self.low_edge_hz),

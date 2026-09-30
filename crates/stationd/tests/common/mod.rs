@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use station_backend::FakeBackend;
+use station_backend::{Backend, FakeBackend};
 use station_conformance::{BoxError, Exit, StationUnderTest, Target};
 use station_proto::backoff::Policy;
 use stationd::{Config, DaemonHandle, RunError, RunOptions};
@@ -79,19 +79,37 @@ fn exit_of(result: Result<(), RunError>) -> Exit {
     }
 }
 
-/// stationd running in this process with a `FakeBackend`.
-#[derive(Default)]
+/// stationd running in this process with a `FakeBackend` (the default)
+/// or any other backend.
 pub struct InProcess {
     pub handle: Option<DaemonHandle>,
-    pub backend: FakeBackend,
+    pub backend: Arc<dyn Backend>,
     exit: Option<Exit>,
+}
+
+impl Default for InProcess {
+    fn default() -> Self {
+        Self::with_backend(Arc::new(FakeBackend::default()))
+    }
+}
+
+impl InProcess {
+    /// stationd driving `backend` (the config file still says `fake`: the
+    /// in-process daemon takes the backend directly).
+    pub fn with_backend(backend: Arc<dyn Backend>) -> Self {
+        Self {
+            handle: None,
+            backend,
+            exit: None,
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl StationUnderTest for InProcess {
     async fn start(&mut self, target: &Target) -> Result<(), BoxError> {
         let config = Config::load(&write_config(target))?;
-        let handle = stationd::spawn(&config, Arc::new(self.backend.clone()), fast_options())?;
+        let handle = stationd::spawn(&config, Arc::clone(&self.backend), fast_options())?;
         assert_eq!(handle.station_id(), target.station_id);
         self.handle = Some(handle);
         self.exit = None;

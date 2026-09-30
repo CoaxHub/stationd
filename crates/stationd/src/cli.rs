@@ -16,11 +16,12 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use backend_ka9q::backend::{Ka9qBackend, Ka9qConfig};
 use clap::{Parser, Subcommand};
-use station_backend::{Backend, FakeBackend};
+use station_backend::{Backend, BackendError, FakeBackend};
 use tracing::{error, info, warn};
 
-use crate::config::{BackendKind, Config, DEFAULT_CONFIG_PATH};
+use crate::config::{BackendConfig, Config, DEFAULT_CONFIG_PATH};
 use crate::daemon::{RunError, RunOptions};
 use crate::tls;
 
@@ -74,6 +75,10 @@ pub enum CommandError {
     /// Signal handling could not be set up.
     #[error("cannot install signal handlers: {0}")]
     Signals(std::io::Error),
+    /// The backend could not be started (for example, radiod's multicast
+    /// sockets could not be bound).
+    #[error("cannot start the backend: {0}")]
+    Backend(BackendError),
 }
 
 impl CommandError {
@@ -82,15 +87,22 @@ impl CommandError {
         match self {
             Self::Config(_) | Self::Tls(_) | Self::Run(RunError::Tls(_)) => EXIT_CONFIG,
             Self::Run(RunError::Revoked) => EXIT_REVOKED,
-            Self::Run(_) | Self::Signals(_) => EXIT_FAILURE,
+            Self::Run(_) | Self::Signals(_) | Self::Backend(_) => EXIT_FAILURE,
         }
     }
 }
 
-/// The backend named in the config.
-pub fn backend_for(kind: BackendKind) -> Arc<dyn Backend> {
-    match kind {
-        BackendKind::Fake => Arc::new(FakeBackend::default()),
+/// The backend named in the config. Must run inside a Tokio runtime (the
+/// ka9q backend binds its sockets and starts its monitor here; it reaches
+/// radiod lazily, so radiod may start later).
+pub fn backend_for(config: &BackendConfig) -> Result<Arc<dyn Backend>, CommandError> {
+    match config {
+        BackendConfig::Fake => Ok(Arc::new(FakeBackend::default())),
+        BackendConfig::Ka9q(k) => {
+            let backend = Ka9qBackend::new(Ka9qConfig::new(k.status_group, k.data_group))
+                .map_err(CommandError::Backend)?;
+            Ok(Arc::new(backend))
+        }
     }
 }
 
@@ -135,8 +147,11 @@ pub async fn run(
     if let Some(w) = config.key_permission_warning() {
         warn!("{w}");
     }
-    let mut handle =
-        crate::daemon::spawn(&config, backend_for(config.backend), RunOptions::default())?;
+    let mut handle = crate::daemon::spawn(
+        &config,
+        backend_for(&config.backend)?,
+        RunOptions::default(),
+    )?;
     tokio::select! {
         result = handle.join() => return result.map_err(CommandError::from),
         () = stop => info!("stop requested"),
@@ -224,5 +239,28 @@ mod tests {
         assert_eq!(exit_code(Err(revoked)), ExitCode::from(EXIT_REVOKED));
         let sig = CommandError::Signals(std::io::Error::other("x"));
         assert_eq!(sig.exit_code(), EXIT_FAILURE);
+        let backend = CommandError::Backend(BackendError::backend("x"));
+        assert_eq!(backend.exit_code(), EXIT_FAILURE);
+        assert!(backend.to_string().contains("backend"));
+    }
+
+    #[tokio::test]
+    async fn backends_are_built_from_the_config() {
+        let fake = backend_for(&BackendConfig::Fake).expect("fake");
+        assert!(fake.info().version.starts_with("fake-"));
+        let ka9q = backend_for(&BackendConfig::Ka9q(crate::config::Ka9qSettings {
+            status_group: "127.0.0.1:9".parse().expect("addr"),
+            data_group: Some("127.0.0.1:0".parse().expect("addr")),
+        }))
+        .expect("ka9q");
+        assert!(ka9q.info().version.starts_with("ka9q-radio"));
+        // A backend that cannot even bind its sockets.
+        let err = backend_for(&BackendConfig::Ka9q(crate::config::Ka9qSettings {
+            status_group: "127.0.0.1:9".parse().expect("addr"),
+            data_group: Some("192.0.2.1:5004".parse().expect("addr")),
+        }))
+        .err()
+        .expect("unbindable data address");
+        assert_eq!(err.exit_code(), EXIT_FAILURE);
     }
 }

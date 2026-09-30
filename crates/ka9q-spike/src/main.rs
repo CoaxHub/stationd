@@ -225,6 +225,8 @@ impl AudioArgs {
             high_edge_hz: self.high,
             samprate: self.samprate,
             opus_bitrate: self.bitrate,
+            output_channels: None,
+            squelch: None,
         }
     }
 }

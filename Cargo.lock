@@ -176,12 +176,18 @@ dependencies = [
 name = "backend-ka9q"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
+ "coaxhub-station-proto",
+ "futures-util",
  "proptest",
  "rand 0.10.3",
  "sha2",
  "socket2",
+ "station-backend",
  "thiserror",
  "tokio",
+ "tokio-stream",
+ "tokio-util",
  "tracing",
  "zstd",
 ]
@@ -1457,6 +1463,7 @@ name = "stationd"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "backend-ka9q",
  "clap",
  "coaxhub-station-proto",
  "futures-util",

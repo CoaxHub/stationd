@@ -15,8 +15,17 @@
 //! max_channels = 16                        # default 16, at most 64
 //! max_waterfall_subscriptions = 4          # default 4, at most 16
 //! [backend]
-//! kind = "fake"                            # "fake" only
+//! kind = "ka9q"                            # or "fake"
+//! [backend.ka9q]                           # required with kind = "ka9q", refused otherwise
+//! status_group = "239.77.0.6:5006"         # radiod's status group, or its status name
+//! data_group = "239.77.0.4:5004"           # optional; default: asked from radiod
 //! ```
+//!
+//! `status_group` and `data_group` take an IP address with an optional port
+//! (5006 and 5004 by default) or a radiod name such as
+//! `coaxhub-status.local`, which is hashed into a `239.x.y.z` group exactly
+//! as radiod does with its default `dns = no`
+//! (`backend_ka9q::backend::group`).
 //!
 //! Relative paths are resolved against the directory of the config file.
 //! Unknown keys are errors, so a typo never silently falls back to a
@@ -25,6 +34,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use backend_ka9q::backend::group::{self, DEFAULT_DATA_PORT, DEFAULT_STATUS_PORT};
 use serde::Deserialize;
 use station_proto::{limits, v1};
 use tonic::transport::Uri;
@@ -104,22 +114,113 @@ impl From<AdminOpName> for v1::AdminOpKind {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum BackendKind {
-    /// `station_backend::FakeBackend`.
+    /// `station_backend::FakeBackend`: synthetic media, no radio.
     Fake,
+    /// `backend_ka9q::backend::Ka9qBackend`: ka9q-radio's radiod.
+    Ka9q,
 }
 
 impl fmt::Display for BackendKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Fake => f.write_str("fake"),
+            Self::Ka9q => f.write_str("ka9q"),
+        }
+    }
+}
+
+/// `[backend.ka9q]`: how to reach radiod (station-protocol §7, §9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ka9qSettings {
+    /// radiod's status and command group.
+    pub status_group: std::net::SocketAddr,
+    /// radiod's RTP group; `None` asks radiod.
+    pub data_group: Option<std::net::SocketAddr>,
+}
+
+/// The configured backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BackendConfig {
+    /// `kind = "fake"`.
+    Fake,
+    /// `kind = "ka9q"` with its `[backend.ka9q]` settings.
+    Ka9q(Ka9qSettings),
+}
+
+impl BackendConfig {
+    /// The backend kind.
+    pub fn kind(&self) -> BackendKind {
+        match self {
+            Self::Fake => BackendKind::Fake,
+            Self::Ka9q(_) => BackendKind::Ka9q,
+        }
+    }
+}
+
+impl fmt::Display for BackendConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Fake => f.write_str("fake"),
+            Self::Ka9q(k) => {
+                write!(f, "ka9q, status {}", k.status_group)?;
+                match k.data_group {
+                    Some(d) => write!(f, ", data {d}"),
+                    None => f.write_str(", data from radiod"),
+                }
+            }
         }
     }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawKa9q {
+    status_group: String,
+    data_group: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawBackend {
     kind: BackendKind,
+    ka9q: Option<RawKa9q>,
+}
+
+impl RawBackend {
+    fn validate(self) -> Result<BackendConfig, ConfigError> {
+        match (self.kind, self.ka9q) {
+            (BackendKind::Fake, None) => Ok(BackendConfig::Fake),
+            (BackendKind::Fake, Some(_)) => Err(ConfigError::Invalid {
+                field: "backend.ka9q",
+                message: "only valid with kind = \"ka9q\"".to_owned(),
+            }),
+            (BackendKind::Ka9q, None) => Err(ConfigError::Invalid {
+                field: "backend.ka9q",
+                message: "kind = \"ka9q\" needs a [backend.ka9q] section with status_group"
+                    .to_owned(),
+            }),
+            (BackendKind::Ka9q, Some(raw)) => {
+                let status_group = group::parse_group(&raw.status_group, DEFAULT_STATUS_PORT)
+                    .map_err(|e| ConfigError::Invalid {
+                        field: "backend.ka9q.status_group",
+                        message: e.to_string(),
+                    })?;
+                let data_group = raw
+                    .data_group
+                    .map(|d| group::parse_group(&d, DEFAULT_DATA_PORT))
+                    .transpose()
+                    .map_err(|e| ConfigError::Invalid {
+                        field: "backend.ka9q.data_group",
+                        message: e.to_string(),
+                    })?;
+                Ok(BackendConfig::Ka9q(Ka9qSettings {
+                    status_group,
+                    data_group,
+                }))
+            }
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -266,7 +367,7 @@ pub struct Config {
     /// The owner's local policy.
     pub policy: LocalPolicy,
     /// The backend to drive.
-    pub backend: BackendKind,
+    pub backend: BackendConfig,
 }
 
 impl Config {
@@ -321,6 +422,7 @@ impl Config {
             .collect();
         allowed_admin_ops.sort_unstable();
         allowed_admin_ops.dedup();
+        let backend = raw.backend.validate()?;
         Ok(Self {
             gateway,
             cert: existing_file("cert", base_dir, &raw.cert)?,
@@ -332,7 +434,7 @@ impl Config {
                 max_channels: raw.max_channels,
                 max_waterfall_subscriptions: raw.max_waterfall_subscriptions,
             },
-            backend: raw.backend.kind,
+            backend,
         })
     }
 
@@ -450,8 +552,10 @@ mod tests {
         assert_eq!(c.key, dir.path().join("station.key"));
         assert_eq!(c.gateway_ca, dir.path().join("ca.pem"));
         assert_eq!(c.policy, LocalPolicy::default());
-        assert_eq!(c.backend, BackendKind::Fake);
+        assert_eq!(c.backend, BackendConfig::Fake);
+        assert_eq!(c.backend.kind(), BackendKind::Fake);
         assert_eq!(c.backend.to_string(), "fake");
+        assert_eq!(BackendKind::Ka9q.to_string(), "ka9q");
     }
 
     #[test]
@@ -525,8 +629,8 @@ mod tests {
         let dir = Dir::new();
         let e = parse(&dir, &with("max_chanels = 3")).expect_err("typo");
         assert!(e.to_string().contains("max_chanels"), "{e}");
-        let e = parse(&dir, &MINIMAL.replace("\"fake\"", "\"ka9q\"")).expect_err("kind");
-        assert!(e.to_string().contains("ka9q"), "{e}");
+        let e = parse(&dir, &MINIMAL.replace("\"fake\"", "\"sdrplay\"")).expect_err("kind");
+        assert!(e.to_string().contains("sdrplay"), "{e}");
         let e = parse(
             &dir,
             &MINIMAL.replace("[backend]\n        kind = \"fake\"", ""),
@@ -535,6 +639,70 @@ mod tests {
         assert!(e.to_string().contains("backend"), "{e}");
         assert!(matches!(
             parse(&dir, "not toml ="),
+            Err(ConfigError::Parse { .. })
+        ));
+    }
+
+    #[test]
+    fn ka9q_backend_section() {
+        let dir = Dir::new();
+        let ka9q = |section: &str| {
+            MINIMAL.replace(
+                "kind = \"fake\"",
+                &format!("kind = \"ka9q\"\n[backend.ka9q]\n{section}"),
+            )
+        };
+        let c = parse(
+            &dir,
+            &ka9q("status_group = \"239.77.0.6:5006\"\ndata_group = \"239.77.0.4\""),
+        )
+        .expect("valid");
+        assert_eq!(
+            c.backend,
+            BackendConfig::Ka9q(Ka9qSettings {
+                status_group: "239.77.0.6:5006".parse().expect("addr"),
+                data_group: Some("239.77.0.4:5004".parse().expect("addr")),
+            })
+        );
+        assert_eq!(c.backend.kind(), BackendKind::Ka9q);
+        assert_eq!(
+            c.backend.to_string(),
+            "ka9q, status 239.77.0.6:5006, data 239.77.0.4:5004"
+        );
+        // A radiod status name, no data group.
+        let c = parse(&dir, &ka9q("status_group = \"coaxhub-status.local\"")).expect("valid");
+        let BackendConfig::Ka9q(k) = c.backend else {
+            panic!("ka9q expected");
+        };
+        assert!(k.status_group.ip().is_multicast());
+        assert_eq!(k.status_group.port(), 5006);
+        assert_eq!(k.data_group, None);
+        assert!(c.backend.to_string().ends_with("data from radiod"));
+        // Errors.
+        assert_eq!(
+            invalid_field(parse(&dir, &ka9q("status_group = \"a b\""))),
+            "backend.ka9q.status_group"
+        );
+        assert_eq!(
+            invalid_field(parse(
+                &dir,
+                &ka9q("status_group = \"239.77.0.6\"\ndata_group = \"x:0\"")
+            )),
+            "backend.ka9q.data_group"
+        );
+        assert_eq!(
+            invalid_field(parse(&dir, &MINIMAL.replace("\"fake\"", "\"ka9q\""))),
+            "backend.ka9q"
+        );
+        assert_eq!(
+            invalid_field(parse(
+                &dir,
+                &format!("{MINIMAL}\n[backend.ka9q]\nstatus_group = \"239.77.0.6\"\n")
+            )),
+            "backend.ka9q"
+        );
+        assert!(matches!(
+            parse(&dir, &ka9q("status_group = \"239.77.0.6\"\nttl = 1")),
             Err(ConfigError::Parse { .. })
         ));
     }

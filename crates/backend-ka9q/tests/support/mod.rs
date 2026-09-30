@@ -19,9 +19,18 @@
 //!   `BIN_BYTE_DATA` with a fresh `SPECTRUM_BASE`/`SPECTRUM_STEP` each time;
 //! - changing `BIN_COUNT` on a live spectrum2 channel "crashes" the fake
 //!   (it stops answering), as it crashes radiod;
-//! - a linear Opus channel with a non-zero frequency sends one RTP packet
-//!   per frame (PT 111, +1 sequence, +960 timestamp), with optional loss,
-//!   duplication and reordering.
+//! - an audio (linear, FM or WFM) Opus channel with a non-zero frequency
+//!   sends one RTP packet per frame (PT 111, +1 sequence, +960 timestamp),
+//!   with optional loss, duplication and reordering;
+//! - audio channels also send unsolicited status every 25 frames (0.5 s) to
+//!   [`FakeState::status_dest`], the unicast stand-in for the data group's
+//!   port 5006;
+//! - presets set the demodulator, sample rate and passband (`wfm` always
+//!   outputs 48 kHz, like `wfm.c`), and every status carries the front-end
+//!   fields of the signal-generator config (24 MS/s real, 0 to 12 MHz);
+//! - `FIRST_LO_FREQUENCY` retunes the front end only when
+//!   [`FakeState::fe_tunable`] is set, as radiod ignores it for a locked or
+//!   fixed tuner.
 //!
 //! It also records what the client did, so tests can assert on it: every
 //! command, the deepest per-SSRC queue ever seen (the client must never have
@@ -45,6 +54,14 @@ pub const FRAME: Duration = Duration::from_millis(20);
 pub const QUEUE_DEPTH: usize = 2;
 /// Input sample rate reported in status (24 MS/s like the `sig_gen` config).
 pub const INPUT_SAMPRATE: u32 = 24_000_000;
+/// Frames between unsolicited status packets of an audio channel.
+pub const STATUS_INTERVAL_FRAMES: u32 = 25;
+/// The reported `BASEBAND_POWER` of audio channels, dB.
+pub const BASEBAND_POWER_DB: f64 = -19.5;
+/// The reported `NOISE_DENSITY`, dB/Hz.
+pub const NOISE_DENSITY_DB: f64 = -91.5;
+/// The reported `IF_POWER`, dBFS.
+pub const IF_POWER_DB: f64 = -20.4;
 
 /// One command as the fake received it.
 #[derive(Debug, Clone, PartialEq)]
@@ -67,6 +84,10 @@ pub struct FakeChannel {
     pub samprate: u32,
     pub encoding: i32,
     pub opus_bitrate: i32,
+    pub output_channels: u32,
+    pub snr_squelch: bool,
+    pub squelch_open: f64,
+    pub squelch_close: f64,
     pub bin_count: u32,
     pub rbw: f64,
     pub avg: u32,
@@ -97,6 +118,10 @@ impl FakeChannel {
             samprate: 12_000,
             encoding: 2, // S16BE
             opus_bitrate: 0,
+            output_channels: 1,
+            snr_squelch: false,
+            squelch_open: 8.0,
+            squelch_close: 7.0,
             bin_count: 0,
             rbw: 0.0,
             avg: 10,
@@ -118,6 +143,7 @@ impl FakeChannel {
 
 /// Everything the fake knows and records.
 #[derive(Debug, Default)]
+#[allow(clippy::struct_excessive_bools, reason = "independent test switches")]
 pub struct FakeState {
     pub channels: BTreeMap<u32, FakeChannel>,
     pub rtp_dest: Option<SocketAddr>,
@@ -141,6 +167,33 @@ pub struct FakeState {
     pub rtp_duplicate_every: u16,
     /// Swap every Nth RTP packet with the next one (0 = never).
     pub rtp_swap_every: u16,
+    /// Where audio channels send unsolicited status (none if `None`).
+    pub status_dest: Option<SocketAddr>,
+    /// `OUTPUT_DATA_DEST_SOCKET` reported in status (none if `None`).
+    pub data_dest: Option<SocketAddr>,
+    /// Front end: `FIRST_LO_FREQUENCY`, Hz.
+    pub fe_lo: f64,
+    /// Front end: `FE_LOW_EDGE` and `FE_HIGH_EDGE`, Hz (relative to the LO).
+    pub fe_low: f64,
+    pub fe_high: f64,
+    /// Front end: `FE_ISREAL`.
+    pub fe_isreal: bool,
+    /// Whether `FIRST_LO_FREQUENCY` commands retune the front end.
+    pub fe_tunable: bool,
+    /// Front end: `AD_OVER`, A/D overrange count.
+    pub ad_over: u64,
+    /// Frames since start (for the unsolicited status cadence).
+    pub frames: u64,
+}
+
+impl FakeState {
+    fn new() -> Self {
+        Self {
+            fe_high: f64::from(INPUT_SAMPRATE / 2),
+            fe_isreal: true,
+            ..Self::default()
+        }
+    }
 }
 
 impl FakeState {
@@ -173,7 +226,7 @@ impl FakeRadiod {
                 .expect("bind fake radiod"),
         );
         let addr = socket.local_addr().expect("fake address");
-        let state = Arc::new(Mutex::new(FakeState::default()));
+        let state = Arc::new(Mutex::new(FakeState::new()));
         let task = tokio::spawn(run(Arc::clone(&socket), Arc::clone(&state)));
         Self {
             addr,
@@ -191,6 +244,11 @@ impl FakeRadiod {
 
     pub fn set_rtp_dest(&self, dest: SocketAddr) {
         self.state().rtp_dest = Some(dest);
+    }
+
+    /// Where audio channels send their unsolicited status.
+    pub fn set_status_dest(&self, dest: SocketAddr) {
+        self.state().status_dest = Some(dest);
     }
 
     /// Removes a channel as if its lifetime had run out.
@@ -310,7 +368,7 @@ fn receive(state: &Mutex<FakeState>, bytes: &[u8], from: SocketAddr) -> Outgoing
         return st
             .channels
             .iter()
-            .map(|(&s, ch)| (status_packet(s, ch, false), from))
+            .map(|(&s, ch)| (status_packet(&st, s, ch, false), from))
             .collect();
     }
     let mut created = false;
@@ -343,6 +401,8 @@ fn frame(state: &Mutex<FakeState>) -> Outgoing {
         return Vec::new();
     }
     let mut out = Vec::new();
+    st.frames += 1;
+    let periodic = st.frames % u64::from(STATUS_INTERVAL_FRAMES) == 0;
     let ssrcs: Vec<u32> = st.channels.keys().copied().collect();
     for ssrc in ssrcs {
         let Some(mut ch) = st.channels.remove(&ssrc) else {
@@ -354,7 +414,7 @@ fn frame(state: &Mutex<FakeState>) -> Outgoing {
                 return Vec::new();
             }
             let with_bins = ch.demod == 4 && ch.spectrum_ready;
-            let reply = status_packet(ssrc, &ch, with_bins);
+            let reply = status_packet(&st, ssrc, &ch, with_bins);
             if ch.demod == 4 {
                 ch.spectrum_ready = true;
                 ch.polls += 1;
@@ -374,9 +434,12 @@ fn frame(state: &Mutex<FakeState>) -> Outgoing {
                 continue;
             }
         }
-        let audio = ch.demod == 0 && ch.encoding == 3 && ch.frequency != 0.0;
+        let audio = ch.demod <= 2 && ch.encoding == 3 && ch.frequency != 0.0;
         if let Some(dest) = st.rtp_dest.filter(|_| audio) {
             send_rtp(&st, ssrc, &mut ch, dest, &mut out);
+        }
+        if let Some(dest) = st.status_dest.filter(|_| periodic && ch.demod <= 2) {
+            out.push((status_packet(&st, ssrc, &ch, false), dest));
         }
         st.channels.insert(ssrc, ch);
     }
@@ -421,10 +484,21 @@ fn apply(st: &mut FakeState, ch: &mut FakeChannel, cmd: &[u8]) -> bool {
     // First pass: PRESET.
     if let Some(p) = pkt.last(StatusType::Preset) {
         let name = p.as_string_lossy().into_owned();
-        ch.demod = 0;
-        ch.samprate = 12_000;
-        ch.low_edge = -5000.0;
-        ch.high_edge = 5000.0;
+        // (demod, samprate, low, high) of the pinned presets.conf.
+        let (demod, samprate, low, high) = match name.as_str() {
+            "fm" => (1, 24_000, -8000.0, 8000.0),
+            "nfm" => (1, 24_000, -6250.0, 6250.0),
+            "wfm" => (2, 48_000, -110_000.0, 110_000.0),
+            "usb" => (0, 12_000, 50.0, 3000.0),
+            "lsb" => (0, 12_000, -3000.0, -50.0),
+            "cwu" => (0, 12_000, -200.0, 200.0),
+            _ => (0, 12_000, -5000.0, 5000.0),
+        };
+        ch.demod = demod;
+        ch.samprate = samprate;
+        ch.low_edge = low;
+        ch.high_edge = high;
+        ch.output_channels = 1;
         ch.preset = name;
     }
     let was_spectrum = ch.demod == 4;
@@ -449,6 +523,18 @@ fn apply(st: &mut FakeState, ch: &mut FakeChannel, cmd: &[u8]) -> bool {
             StatusType::OutputSamprate => ch.samprate = f.as_u32().unwrap_or(0),
             StatusType::OutputEncoding => ch.encoding = f.as_i32().unwrap_or(0),
             StatusType::OpusBitRate => ch.opus_bitrate = f.as_i32().unwrap_or(0),
+            StatusType::OutputChannels => {
+                let n = f.as_u32().unwrap_or(0);
+                if n == 1 || n == 2 {
+                    ch.output_channels = n;
+                }
+            }
+            StatusType::SnrSquelch => ch.snr_squelch = f.as_bool().unwrap_or(false),
+            StatusType::SquelchOpen => ch.squelch_open = f.as_f32_or_f64().unwrap_or(0.0),
+            StatusType::SquelchClose => ch.squelch_close = f.as_f32_or_f64().unwrap_or(0.0),
+            StatusType::FirstLoFrequency if st.fe_tunable => {
+                st.fe_lo = f.as_f64().unwrap_or(0.0).abs();
+            }
             StatusType::BinCount => {
                 let n = f.as_u32().unwrap_or(0);
                 if was_spectrum && ch.demod == 4 && n != ch.bin_count {
@@ -503,7 +589,7 @@ pub fn fake_scale(n: u32) -> (f32, f32) {
     (base, step)
 }
 
-fn status_packet(ssrc: u32, ch: &FakeChannel, with_bins: bool) -> Vec<u8> {
+fn status_packet(st: &FakeState, ssrc: u32, ch: &FakeChannel, with_bins: bool) -> Vec<u8> {
     let mut e = Encoder::new(PktType::Status)
         .u32(StatusType::OutputSsrc, ssrc)
         .u64(StatusType::CommandTag, ch.last_tag)
@@ -511,10 +597,19 @@ fn status_packet(ssrc: u32, ch: &FakeChannel, with_bins: bool) -> Vec<u8> {
         .str(StatusType::Description, "fake radiod")
         .u32(StatusType::Lifetime, ch.lifetime_left)
         .u32(StatusType::InputSamprate, INPUT_SAMPRATE)
+        .bool(StatusType::FeIsreal, st.fe_isreal)
+        .f32(StatusType::FeLowEdge, st.fe_low)
+        .f32(StatusType::FeHighEdge, st.fe_high)
+        .f64(StatusType::FirstLoFrequency, st.fe_lo)
+        .f32(StatusType::IfPower, IF_POWER_DB)
+        .u64(StatusType::AdOver, st.ad_over)
         .u32(StatusType::FilterBlocksize, INPUT_SAMPRATE / 50)
         .f64(StatusType::RadioFrequency, ch.frequency)
         .i32(StatusType::DemodType, ch.demod)
         .str(StatusType::Preset, &ch.preset);
+    if let Some(dest) = st.data_dest {
+        e = e.socket(StatusType::OutputDataDestSocket, dest);
+    }
     if ch.demod == 4 {
         e = e
             .u32(StatusType::BinCount, ch.bin_count)
@@ -532,10 +627,15 @@ fn status_packet(ssrc: u32, ch: &FakeChannel, with_bins: bool) -> Vec<u8> {
             .f32(StatusType::LowEdge, ch.low_edge)
             .f32(StatusType::HighEdge, ch.high_edge)
             .u32(StatusType::OutputSamprate, ch.samprate)
-            .u32(StatusType::OutputChannels, 1)
+            .u32(StatusType::OutputChannels, ch.output_channels)
             .i32(StatusType::OutputEncoding, ch.encoding)
             .byte(StatusType::RtpPt, 111)
-            .i32(StatusType::OpusBitRate, ch.opus_bitrate);
+            .i32(StatusType::OpusBitRate, ch.opus_bitrate)
+            .f32(StatusType::BasebandPower, BASEBAND_POWER_DB)
+            .f32(StatusType::NoiseDensity, NOISE_DENSITY_DB)
+            .bool(StatusType::SnrSquelch, ch.snr_squelch)
+            .f32(StatusType::SquelchOpen, ch.squelch_open)
+            .f32(StatusType::SquelchClose, ch.squelch_close);
     }
     e.finish()
 }

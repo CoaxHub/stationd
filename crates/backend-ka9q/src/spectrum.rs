@@ -52,8 +52,6 @@
 //! into *our* wire format (a different, hub-chosen [`Quantization`]),
 //! optionally crop/decimate, and compress/decompress rows.
 
-use std::io::Read;
-
 /// Errors from spectrum row processing.
 #[derive(Debug, thiserror::Error)]
 pub enum SpectrumError {
@@ -351,35 +349,65 @@ pub fn compress_row(bins: &[u8], level: i32) -> Result<Vec<u8>, SpectrumError> {
 }
 
 /// Decompresses one zstd-compressed waterfall row, bounded to
-/// `expected_bins + 1` bytes of *output* regardless of what the compressed
-/// data claims or actually contains (station-protocol.md §5's zip-bomb
-/// guard: "decompression capped at `bins` + 1 bytes"). This bounds memory
-/// use even against an adversarial frame that would decompress to
-/// gigabytes: only `expected_bins + 1` bytes are ever pulled out of the
-/// decoder.
+/// `expected_bins + 1` bytes of output whatever the compressed data claims
+/// or contains (station-protocol.md §5's zip-bomb guard: "decompression
+/// capped at `bins` + 1 bytes").
+///
+/// The row is decoded in **one pass** (`ZSTD_decompressDCtx`) straight into
+/// a buffer of exactly `expected_bins + 1` bytes, the same way as
+/// `station_proto::validate::WaterfallDecoder`: the decoder can never write
+/// more than that, and single-pass decoding allocates no window buffer, so
+/// neither the output size nor the window size a frame header declares can
+/// make this allocate more than `expected_bins + 1` bytes plus one decoder
+/// context. (A streaming decoder bounded with `take()` caps the output too,
+/// but allocates whatever window the frame header asks for, up to 128 MiB.)
 ///
 /// # Errors
 /// Returns [`SpectrumError::RowLengthMismatch`] unless decompression
-/// produces **exactly** `expected_bins` bytes (too few: truncated/invalid
-/// row; `expected_bins + 1`: more data was available than declared, i.e.
-/// the guard tripped). Returns [`SpectrumError::Zstd`] on a malformed zstd
-/// stream.
+/// produces **exactly** `expected_bins` bytes (too few: a truncated row;
+/// `expected_bins + 1`: the guard tripped, more data was there). Returns
+/// [`SpectrumError::Zstd`] on a malformed zstd stream.
 pub fn decompress_row_bounded(
     compressed: &[u8],
     expected_bins: usize,
 ) -> Result<Vec<u8>, SpectrumError> {
-    let decoder = zstd::stream::read::Decoder::new(compressed).map_err(SpectrumError::Zstd)?;
-    let cap = expected_bins as u64 + 1;
-    let mut limited = decoder.take(cap);
-    let mut out = Vec::new();
-    limited.read_to_end(&mut out).map_err(SpectrumError::Zstd)?;
-    if out.len() != expected_bins {
-        return Err(SpectrumError::RowLengthMismatch {
-            got: out.len(),
-            expected: expected_bins,
-        });
+    use zstd::zstd_safe;
+
+    let cap = expected_bins.saturating_add(1);
+    // Cheap early exit when the frame header declares a size.
+    if let Ok(Some(declared)) = zstd_safe::get_frame_content_size(compressed) {
+        if usize::try_from(declared).ok() != Some(expected_bins) {
+            return Err(SpectrumError::RowLengthMismatch {
+                got: usize::try_from(declared).map_or(cap, |d| d.min(cap)),
+                expected: expected_bins,
+            });
+        }
     }
-    Ok(out)
+    let mut dctx = zstd_safe::DCtx::try_create().ok_or_else(|| {
+        SpectrumError::Zstd(std::io::Error::other("cannot allocate a zstd context"))
+    })?;
+    let mut out = vec![0u8; cap];
+    match dctx.decompress(&mut out[..], compressed) {
+        Ok(n) if n == expected_bins => {
+            out.truncate(n);
+            Ok(out)
+        }
+        Ok(n) => Err(SpectrumError::RowLengthMismatch {
+            got: n.min(cap),
+            expected: expected_bins,
+        }),
+        Err(code) => {
+            let name = zstd_safe::get_error_name(code);
+            if name == "Destination buffer is too small" {
+                Err(SpectrumError::RowLengthMismatch {
+                    got: cap,
+                    expected: expected_bins,
+                })
+            } else {
+                Err(SpectrumError::Zstd(std::io::Error::other(name)))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -723,6 +751,55 @@ mod tests {
             }
             other => panic!("expected RowLengthMismatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn decompress_uses_the_declared_size_first() {
+        // zstd::bulk writes the content size into the frame header.
+        let row = vec![3u8; 100];
+        let c = zstd::bulk::compress(&row, 3).unwrap();
+        assert_eq!(decompress_row_bounded(&c, 100).unwrap(), row);
+        assert!(matches!(
+            decompress_row_bounded(&c, 101),
+            Err(SpectrumError::RowLengthMismatch {
+                got: 100,
+                expected: 101
+            })
+        ));
+        // A declared 64 MiB bomb is refused from the header alone.
+        let bomb = zstd::bulk::compress(&vec![0u8; 64 << 20], 19).unwrap();
+        assert!(matches!(
+            decompress_row_bounded(&bomb, 1024),
+            Err(SpectrumError::RowLengthMismatch {
+                got: 1025,
+                expected: 1024
+            })
+        ));
+        // Without a declared size, decoding stops at expected + 1 bytes.
+        let stream_bomb = zstd::stream::encode_all(&vec![0u8; 64 << 20][..], 19).unwrap();
+        assert!(matches!(
+            decompress_row_bounded(&stream_bomb, 1024),
+            Err(SpectrumError::RowLengthMismatch {
+                got: 1025,
+                expected: 1024
+            })
+        ));
+        // Too short, and empty input (zero frames = zero bytes).
+        assert!(matches!(
+            decompress_row_bounded(&compress_row(&[1, 2, 3], 1).unwrap(), 4),
+            Err(SpectrumError::RowLengthMismatch {
+                got: 3,
+                expected: 4
+            })
+        ));
+        assert!(matches!(
+            decompress_row_bounded(&[], 4),
+            Err(SpectrumError::RowLengthMismatch {
+                got: 0,
+                expected: 4
+            })
+        ));
+        assert_eq!(decompress_row_bounded(&[], 0).unwrap(), Vec::<u8>::new());
     }
 
     #[test]

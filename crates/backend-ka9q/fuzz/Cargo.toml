@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# cargo-fuzz targets for backend-ka9q (station-protocol §10: the TLV decoder
+# in stationd). Nightly only: run with `scripts/fuzz.sh [seconds]`.
+# Its own workspace, so the stable station workspace never builds it.
+[package]
+name = "backend-ka9q-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-only"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+backend-ka9q = { path = ".." }
+libfuzzer-sys = "0.4.13"
+
+[[bin]]
+name = "tlv_status"
+path = "fuzz_targets/tlv_status.rs"
+test = false
+doc = false
+bench = false
