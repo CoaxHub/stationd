@@ -15,7 +15,7 @@
 //! The default config is `/etc/coaxhub/stationd.toml`. Exit codes:
 //! [`EXIT_OK`], [`EXIT_FAILURE`], [`EXIT_CONFIG`] (also clap usage errors),
 //! [`EXIT_REVOKED`] / [`EXIT_NOT_ENROLLED`] (both mean: enroll this
-//! station).
+//! station), [`EXIT_TOKEN`] (`enroll`: get a new token and try again).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -50,6 +50,10 @@ pub const EXIT_REVOKED: u8 = 3;
 /// The station is not enrolled: enroll it (the same code as
 /// [`EXIT_REVOKED`]).
 pub const EXIT_NOT_ENROLLED: u8 = 3;
+/// `enroll`: the token was refused (invalid, expired or already used),
+/// malformed or empty. Another token may succeed; the installer asks for
+/// one again on this code.
+pub const EXIT_TOKEN: u8 = 4;
 
 /// The `CoaxHub` station daemon.
 #[derive(Debug, Parser)]
@@ -188,6 +192,9 @@ impl CommandError {
                 | EnrollError::NoEndpoints
                 | EnrollError::AlreadyEnrolled { .. },
             ) => EXIT_CONFIG,
+            Self::Enroll(
+                EnrollError::Token(_) | EnrollError::MalformedToken | EnrollError::NoToken,
+            ) => EXIT_TOKEN,
             Self::Run(_)
             | Self::Signals(_)
             | Self::Backend(_)
@@ -586,8 +593,18 @@ mod tests {
             CommandError::Enroll(EnrollError::NoEndpoints).exit_code(),
             EXIT_CONFIG
         );
+        for token in [
+            EnrollError::MalformedToken,
+            EnrollError::NoToken,
+            EnrollError::Token(enroll::TokenProblem::Expired),
+        ] {
+            assert_eq!(CommandError::Enroll(token).exit_code(), EXIT_TOKEN);
+        }
         assert_eq!(
-            CommandError::Enroll(EnrollError::MalformedToken).exit_code(),
+            CommandError::Enroll(EnrollError::Timeout {
+                endpoint: "x".into()
+            })
+            .exit_code(),
             EXIT_FAILURE
         );
         assert_eq!(

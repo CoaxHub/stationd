@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# stationd: the CoaxHub station daemon. It holds the
+# station key, dials out to the home hub and drives the bundled radiod. It
+# has no device access and no capabilities.
+
+[Unit]
+Description=CoaxHub station daemon
+Documentation=https://github.com/CoaxHub/stationd/blob/main/docs/packaging.md
+# A Pi has no clock battery: TLS and enrollment need NTP time first.
+# The package enables systemd-time-wait-sync.
+Wants=coaxhub-radiod.service network-online.target time-sync.target systemd-time-wait-sync.service
+After=coaxhub-radiod.service network-online.target time-sync.target systemd-time-wait-sync.service
+
+[Service]
+Type=simple
+User=coaxhub
+Group=coaxhub
+ExecStart=/usr/bin/stationd run
+# status.json for `stationd status`.
+RuntimeDirectory=coaxhub/stationd
+RuntimeDirectoryMode=0755
+Restart=on-failure
+RestartSec=5
+# Exit 3: not enrolled, or the certificate was revoked. Restarting cannot
+# help; `stationd enroll` can (station protocol §2.2).
+RestartPreventExitStatus=3
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ReadWritePaths=/var/lib/coaxhub
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+UMask=0022
+
+[Install]
+WantedBy=multi-user.target

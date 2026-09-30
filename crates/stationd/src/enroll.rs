@@ -272,15 +272,17 @@ pub fn read_token(arg: Option<String>) -> Result<Token, EnrollError> {
 /// Prompts on stderr and reads a line from the terminal without echo.
 fn prompt_hidden(stdin: &std::io::Stdin) -> std::io::Result<Zeroizing<String>> {
     use rustix::termios::{self, LocalModes, OptionalActions};
-    let mut stderr = std::io::stderr();
-    write!(stderr, "Enrollment token (input hidden): ")?;
-    stderr.flush()?;
     let saved = termios::tcgetattr(stdin)?;
     let mut quiet = saved.clone();
     quiet.local_modes.remove(LocalModes::ECHO);
+    // Echo goes off before the prompt appears, so nothing typed after it
+    // is ever shown.
     termios::tcsetattr(stdin, OptionalActions::Now, &quiet)?;
+    let mut stderr = std::io::stderr();
     let mut line = Zeroizing::new(String::new());
-    let read = stdin.lock().take(1024).read_line(&mut line);
+    let read = write!(stderr, "Enrollment token (input hidden): ")
+        .and_then(|()| stderr.flush())
+        .and_then(|()| stdin.lock().take(1024).read_line(&mut line));
     let restored = termios::tcsetattr(stdin, OptionalActions::Now, &saved);
     writeln!(stderr)?;
     read?;

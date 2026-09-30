@@ -1,0 +1,82 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# coaxhub-stationd postinst.
+# - Creates the system users coaxhub (stationd) and coaxhub-radiod (radiod)
+#   and their state directories.
+# - Enables systemd-time-wait-sync.service, which stationd.service waits for.
+# - Applies the udev rule to RTL-SDR dongles already plugged in.
+# - On upgrade, restarts the units that were running. On a fresh install it
+#   starts nothing: the station is not enrolled yet, and stationd would exit
+#   3. The installer (or the owner) enrolls it and starts the services.
+set -e
+
+UNITS="coaxhub-radiod.service stationd.service"
+TIME_WAIT_MARKER=/var/lib/coaxhub/.enabled-time-wait-sync
+
+systemd_running() { [ -d /run/systemd/system ]; }
+
+add_system_user() {
+	# $1 user, $2 home
+	if ! getent group "$1" >/dev/null; then
+		addgroup --system --quiet "$1"
+	fi
+	if ! getent passwd "$1" >/dev/null; then
+		adduser --system --quiet --ingroup "$1" --home "$2" --no-create-home \
+			--shell /usr/sbin/nologin "$1"
+	fi
+}
+
+make_dir() {
+	# $1 path, $2 mode, $3 owner:group
+	mkdir -p "$1"
+	chown "$3" "$1"
+	chmod "$2" "$1"
+}
+
+case "$1" in
+configure)
+	add_system_user coaxhub /var/lib/coaxhub
+	add_system_user coaxhub-radiod /var/lib/coaxhub-radiod
+
+	make_dir /var/lib/coaxhub 0755 root:root
+	make_dir /var/lib/coaxhub/stationd 0700 coaxhub:coaxhub
+	make_dir /var/lib/coaxhub-radiod 0755 coaxhub-radiod:coaxhub-radiod
+
+	# Remember whether we enabled systemd-time-wait-sync, so purge only
+	# undoes our own change.
+	if command -v systemctl >/dev/null 2>&1 &&
+		! systemctl is-enabled --quiet systemd-time-wait-sync.service 2>/dev/null; then
+		if systemctl enable --quiet systemd-time-wait-sync.service 2>/dev/null; then
+			: >"$TIME_WAIT_MARKER"
+		fi
+	fi
+
+	if command -v udevadm >/dev/null 2>&1 && [ -d /run/udev ]; then
+		udevadm control --reload-rules 2>/dev/null || true
+		udevadm trigger --action=add --subsystem-match=usb --attr-match=idVendor=0bda \
+			2>/dev/null || true
+	fi
+
+	if [ -d /sys/module/dvb_usb_rtl28xxu ]; then
+		echo "coaxhub-stationd: the kernel's DVB driver (dvb_usb_rtl28xxu) holds the RTL-SDR." >&2
+		echo "coaxhub-stationd: it is now blacklisted; run 'sudo rmmod dvb_usb_rtl28xxu' or reboot." >&2
+	fi
+
+	if systemd_running; then
+		systemctl daemon-reload || true
+		if [ -n "$2" ]; then
+			# Upgrade: restart what was running, nothing else.
+			# shellcheck disable=SC2086 # UNITS is a list
+			systemctl try-restart $UNITS || true
+		fi
+	fi
+	;;
+abort-upgrade | abort-remove | abort-deconfigure) ;;
+*)
+	echo "postinst called with unknown argument '$1'" >&2
+	exit 1
+	;;
+esac
+
+exit 0
