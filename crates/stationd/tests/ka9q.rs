@@ -8,6 +8,8 @@
 //!   across a retune, waterfall rows, S-meter readings);
 //! - `stationd check-config` on a `[backend] kind = "ka9q"` config.
 
+// Static [credentials] and [backend] are development-only settings.
+#![cfg(not(feature = "packaged"))]
 #![allow(
     clippy::too_many_lines,
     reason = "end-to-end scripts read top to bottom"
@@ -251,4 +253,75 @@ async fn check_config_accepts_a_ka9q_backend() {
         stdout.contains("backend ka9q, status 239.77.0.6:5006, data from radiod"),
         "{stdout}"
     );
+}
+
+/// `stationd doctor`: radiod answers on its status group; the SDR check
+/// reads USB IDs; every check line for a ka9q config.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn doctor_checks_radiod_and_the_sdr() {
+    use stationd::doctor::{self, Environment, Level};
+    let fake = FakeRadiod::start().await;
+    let detail = doctor::probe_radiod(fake.addr, Duration::from_secs(3))
+        .await
+        .expect("radiod answers");
+    assert!(detail.contains("answered on"), "{detail}");
+    // Nothing answers on another port.
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let e = doctor::probe_radiod(
+        silent.local_addr().expect("addr"),
+        Duration::from_millis(300),
+    )
+    .await
+    .expect_err("silent");
+    assert!(e.contains("radiod") || e.contains("no answer"), "{e}");
+
+    let dir = tempfile::tempdir().expect("tmp");
+    let config = dir.path().join("stationd.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "state_dir = {:?}\n[sdr]\nprofile = \"rtlsdr\"\n[backend]\nkind = \"ka9q\"\n\
+             [backend.ka9q]\nstatus_group = \"{}\"\ndata_group = \"127.0.0.1:5004\"\n",
+            dir.path().join("state").display().to_string(),
+            fake.addr
+        ),
+    )
+    .expect("write");
+    let usb = dir.path().join("usb");
+    let env = |timeout| Environment {
+        usb_devices: usb.clone(),
+        now_unix_s: 0,
+        timeout,
+    };
+    let level = |checks: &[doctor::Check], name: &str| {
+        checks
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("{name} missing: {checks:?}"))
+            .level
+    };
+    let checks = doctor::run(&config, &env(Duration::from_secs(3))).await;
+    assert_eq!(level(&checks, "config"), Level::Pass, "{checks:?}");
+    assert_eq!(level(&checks, "enrollment"), Level::Fail);
+    assert_eq!(level(&checks, "sdr"), Level::Fail, "{checks:?}");
+    assert_eq!(level(&checks, "radiod"), Level::Pass, "{checks:#?}");
+    assert_eq!(level(&checks, "enroll"), Level::Skip);
+    assert_eq!(level(&checks, "gateway"), Level::Skip);
+    assert_eq!(level(&checks, "clock"), Level::Skip);
+    assert!(doctor::failed(&checks));
+    // Plug in an RTL-SDR.
+    let port = usb.join("1-1.3");
+    std::fs::create_dir_all(&port).expect("mkdir");
+    std::fs::write(port.join("idVendor"), "0bda\n").expect("write");
+    std::fs::write(port.join("idProduct"), "2838\n").expect("write");
+    let checks = doctor::run(&config, &env(Duration::from_secs(3))).await;
+    let sdr = checks.iter().find(|c| c.name == "sdr").expect("sdr");
+    assert_eq!(sdr.level, Level::Pass, "{sdr}");
+    assert!(sdr.detail.contains("0bda:2838 at 1-1.3"), "{sdr}");
+    // A broken config: one failing line.
+    std::fs::write(&config, "nope").expect("write");
+    let checks = doctor::run(&config, &env(Duration::from_secs(1))).await;
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks[0].level, Level::Fail);
+    fake.assert_client_contract();
 }

@@ -3,6 +3,9 @@
 //! Goodbye reasons and backoff delays, Welcome edge cases, backend events,
 //! TLS failure details, and the library/CLI entry points.
 
+// Static [credentials] and [backend] are development-only settings.
+#![cfg(not(feature = "packaged"))]
+
 mod common;
 
 use std::sync::Arc;
@@ -13,7 +16,7 @@ use station_conformance::scenarios::{Harness, ScenarioConfig};
 use station_conformance::{HubTls, LocalPolicy, StationConn, TestPki, TlsVersions};
 use station_proto::v1;
 use stationd::daemon::{ConnectionState, StopReason};
-use stationd::tls::{self, Connector};
+use stationd::tls::Connector;
 use stationd::{DaemonHandle, RunError, RunOptions};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -463,8 +466,8 @@ async fn connector_error(hub_tls: impl FnOnce(&TestPki) -> HubTls) -> String {
         .await
         .expect("harness");
     let config = common::load(&common::write_config(&h.target));
-    let client = tls::load(&config).expect("credentials");
-    let connector = Connector::new(client.config, &config.gateway).expect("connector");
+    let creds = stationd::credentials::load(&config).expect("credentials");
+    let connector = Connector::new(creds.tls.config, &creds.gateway).expect("connector");
     connector
         .connect()
         .await
@@ -522,8 +525,8 @@ async fn nothing_listening_is_a_tcp_error() {
     let mut h = harness().await;
     h.hub.stop().await;
     let config = common::load(&common::write_config(&h.target));
-    let client = tls::load(&config).expect("credentials");
-    let connector = Connector::new(client.config, &config.gateway).expect("connector");
+    let creds = stationd::credentials::load(&config).expect("credentials");
+    let connector = Connector::new(creds.tls.config, &creds.gateway).expect("connector");
     let e = connector.connect().await.expect_err("refused").to_string();
     assert!(e.contains("TCP connect"), "{e}");
 }

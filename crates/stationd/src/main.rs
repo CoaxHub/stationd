@@ -4,7 +4,7 @@
 use std::process::ExitCode;
 
 use clap::Parser as _;
-use stationd::cli::{self, Cli, Command, EXIT_FAILURE};
+use stationd::cli::{self, Cli, EXIT_FAILURE};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -19,20 +19,5 @@ fn main() -> ExitCode {
             return ExitCode::from(EXIT_FAILURE);
         }
     };
-    match cli.command {
-        Command::CheckConfig { config } => match cli::check_config(&config) {
-            Ok(summary) => {
-                println!("{summary}");
-                ExitCode::SUCCESS
-            }
-            Err(e) => cli::exit_code(Err(e)),
-        },
-        Command::Run { config } => runtime.block_on(async {
-            let stop = match cli::termination_signal() {
-                Ok(stop) => stop,
-                Err(e) => return cli::exit_code(Err(e)),
-            };
-            cli::exit_code(cli::run(&config, stop).await)
-        }),
-    }
+    cli::main(cli.command, &runtime)
 }

@@ -1,19 +1,33 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! `stationd.toml`: the owner's local configuration (station-protocol §7).
 //!
-//! The hub can never change this file. It holds the gateway to
-//! dial, the mTLS credentials, and the hard local caps the hub may ask less
-//! than, never more:
+//! The hub can never change this file. An installed station's
+//! file holds only the owner's policy and the SDR profile:
 //!
 //! ```toml
-//! gateway_url = "https://localhost:7443"   # static mode; otherwise StationControl.GetAssignment
-//! cert = "/path/station.pem"               # client certificate chain (PEM, leaf first)
-//! key = "/path/station.key"                # private key (PEM)
-//! gateway_ca = "/path/ca.pem"              # the ONLY roots trusted for the gateway
 //! allow_frontend_control = true            # default true
 //! allowed_admin_ops = []                   # restart_stationd, restart_backend, update, reboot_host
 //! max_channels = 16                        # default 16, at most 64
 //! max_waterfall_subscriptions = 4          # default 4, at most 16
+//! [sdr]
+//! profile = "rtlsdr"                       # rtlsdr | rtlsdr-hf (development builds also: siggen)
+//! # center_frequency_hz = 98000000         # optional; default from the profile
+//! ```
+//!
+//! Development builds ([`crate::flavour`]) also accept test-only settings,
+//! which packaged builds reject:
+//!
+//! ```toml
+//! state_dir = "/tmp/stationd-state"        # default /var/lib/coaxhub/stationd
+//! [endpoints]                              # enrollment against a dev control plane
+//! enroll_url = "https://localhost:7501"
+//! station_api_url = "https://localhost:7502"
+//! root_ca = "dev-root.pem"             # the ONLY root trusted for enrollment
+//! [credentials]                            # static mode: no enrollment, no state dir
+//! gateway_url = "https://localhost:7443"
+//! cert = "station.pem"                     # client certificate chain (PEM, leaf first)
+//! key = "station.key"                      # private key (PEM)
+//! gateway_ca = "ca.pem"                    # the ONLY roots trusted for the gateway
 //! [backend]
 //! kind = "ka9q"                            # or "fake"
 //! [backend.ka9q]                           # required with kind = "ka9q", refused otherwise
@@ -21,15 +35,14 @@
 //! data_group = "239.77.0.4:5004"           # optional; default: asked from radiod
 //! ```
 //!
-//! `status_group` and `data_group` take an IP address with an optional port
-//! (5006 and 5004 by default) or a radiod name such as
-//! `coaxhub-status.local`, which is hashed into a `239.x.y.z` group exactly
-//! as radiod does with its default `dns = no`
-//! (`backend_ka9q::backend::group`).
-//!
-//! Relative paths are resolved against the directory of the config file.
-//! Unknown keys are errors, so a typo never silently falls back to a
-//! default.
+//! - `[sdr]` is required unless a `[backend]` section chooses the backend.
+//!   Without `[backend]`, stationd drives the bundled radiod on the fixed
+//!   groups of [`crate::profile`].
+//! - Without `[credentials]`, stationd runs on the credentials `stationd
+//!   enroll` wrote to the state directory.
+//! - Relative paths are resolved against the directory of the config file.
+//!   Unknown keys are errors, so a typo never silently falls back to a
+//!   default.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -38,6 +51,9 @@ use backend_ka9q::backend::group::{self, DEFAULT_DATA_PORT, DEFAULT_STATUS_PORT}
 use serde::Deserialize;
 use station_proto::{limits, v1};
 use tonic::transport::Uri;
+
+use crate::flavour::{self, Flavour};
+use crate::profile::{self, SdrProfile};
 
 /// Where `stationd` looks for its config by default (§7).
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/coaxhub/stationd.toml";
@@ -86,6 +102,15 @@ pub enum ConfigError {
         /// What is wrong.
         problem: String,
     },
+    /// A test-only setting in a packaged build.
+    #[error(
+        "`{field}` is a development setting; packaged builds of stationd do not accept it \
+         (remove it from stationd.toml)"
+    )]
+    DevelopmentOnly {
+        /// The TOML key or section.
+        field: &'static str,
+    },
 }
 
 /// Admin operation names accepted in `allowed_admin_ops` (§7).
@@ -129,7 +154,7 @@ impl fmt::Display for BackendKind {
     }
 }
 
-/// `[backend.ka9q]`: how to reach radiod (station-protocol §7, §9).
+/// How to reach radiod (station-protocol §9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ka9qSettings {
     /// radiod's status and command group.
@@ -138,13 +163,23 @@ pub struct Ka9qSettings {
     pub data_group: Option<std::net::SocketAddr>,
 }
 
+impl Ka9qSettings {
+    /// The bundled radiod on the package's fixed groups.
+    pub fn bundled() -> Self {
+        Self {
+            status_group: profile::radiod_status_group(),
+            data_group: Some(profile::radiod_data_group()),
+        }
+    }
+}
+
 /// The configured backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BackendConfig {
     /// `kind = "fake"`.
     Fake,
-    /// `kind = "ka9q"` with its `[backend.ka9q]` settings.
+    /// radiod: the bundled one, or `[backend.ka9q]` in development builds.
     Ka9q(Ka9qSettings),
 }
 
@@ -223,6 +258,30 @@ impl RawBackend {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSdr {
+    profile: String,
+    center_frequency_hz: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawEndpoints {
+    enroll_url: String,
+    station_api_url: String,
+    root_ca: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCredentials {
+    gateway_url: String,
+    cert: PathBuf,
+    key: PathBuf,
+    gateway_ca: PathBuf,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -238,10 +297,6 @@ fn default_max_waterfall_subscriptions() -> u32 {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
-    gateway_url: String,
-    cert: PathBuf,
-    key: PathBuf,
-    gateway_ca: PathBuf,
     #[serde(default = "default_true")]
     allow_frontend_control: bool,
     #[serde(default)]
@@ -250,7 +305,11 @@ struct RawConfig {
     max_channels: u32,
     #[serde(default = "default_max_waterfall_subscriptions")]
     max_waterfall_subscriptions: u32,
-    backend: RawBackend,
+    sdr: Option<RawSdr>,
+    state_dir: Option<PathBuf>,
+    endpoints: Option<RawEndpoints>,
+    credentials: Option<RawCredentials>,
+    backend: Option<RawBackend>,
 }
 
 /// What the owner lets the hub do (§4, §7). The hub may ask for less, never
@@ -286,10 +345,11 @@ impl LocalPolicy {
     }
 }
 
-/// The hub gateway to dial, from `gateway_url`.
+/// An `https://host[:port]` service endpoint: the hub gateway, enrollment
+/// or `StationControl`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Gateway {
-    /// The URL as configured.
+pub struct Endpoint {
+    /// The URL as given.
     pub url: String,
     /// Host name or IP address (IPv6 without brackets): the TLS server name.
     pub host: String,
@@ -297,20 +357,17 @@ pub struct Gateway {
     pub port: u16,
 }
 
-impl Gateway {
-    /// Parses and checks `gateway_url`: `https`, a host, an optional port,
-    /// no user info, path, query or fragment.
-    pub fn parse(url: &str) -> Result<Self, ConfigError> {
-        let invalid = |message: String| ConfigError::Invalid {
-            field: "gateway_url",
-            message,
-        };
+impl Endpoint {
+    /// Parses and checks `url` (the value of `field`): `https`, a host, an
+    /// optional port, no user info, path, query or fragment.
+    pub fn parse(field: &'static str, url: &str) -> Result<Self, ConfigError> {
+        let invalid = |message: String| ConfigError::Invalid { field, message };
         let uri: Uri = url
             .parse()
             .map_err(|e| invalid(format!("{url:?} is not a valid URL: {e}")))?;
         if uri.scheme_str() != Some("https") {
             return Err(invalid(format!(
-                "{url:?} must use https:// (the tunnel is always TLS)"
+                "{url:?} must use https:// (stationd only speaks TLS)"
             )));
         }
         let authority = uri
@@ -353,32 +410,122 @@ impl Gateway {
     }
 }
 
-/// A validated `stationd.toml`.
+impl fmt::Display for Endpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.url)
+    }
+}
+
+/// The only root(s) enrollment trusts.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Config {
+pub enum TrustAnchor {
+    /// Compiled into a packaged build.
+    BuiltIn(&'static str),
+    /// `[endpoints] root_ca` (development builds), resolved path.
+    File(PathBuf),
+}
+
+impl fmt::Display for TrustAnchor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BuiltIn(_) => f.write_str("the built-in CoaxHub root"),
+            Self::File(p) => write!(f, "{}", p.display()),
+        }
+    }
+}
+
+/// The control-plane endpoints (station-protocol §1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Endpoints {
+    /// `Enrollment` (`https://enroll.<domain>`).
+    pub enroll: Endpoint,
+    /// `StationControl` (`https://station-api.<domain>`).
+    pub station_api: Endpoint,
+    /// The root enrollment is verified against.
+    pub root: TrustAnchor,
+}
+
+/// `[credentials]`: fixed gateway and certificate files, no enrollment
+/// (development builds only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticCredentials {
     /// The hub gateway.
-    pub gateway: Gateway,
+    pub gateway: Endpoint,
     /// Client certificate chain (PEM), resolved path.
     pub cert: PathBuf,
     /// Client private key (PEM), resolved path.
     pub key: PathBuf,
     /// Gateway trust bundle (PEM), resolved path.
     pub gateway_ca: PathBuf,
+}
+
+/// Where the tunnel credentials come from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialsMode {
+    /// `[credentials]` (development builds).
+    Static(StaticCredentials),
+    /// The state directory written by `stationd enroll`.
+    Enrolled,
+}
+
+/// `[sdr]`: the receiver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SdrSettings {
+    /// The profile.
+    pub profile: &'static SdrProfile,
+    /// `center_frequency_hz` as configured.
+    pub center_frequency_hz: Option<u64>,
+}
+
+impl SdrSettings {
+    /// The configured centre frequency, else the profile's default; `None`
+    /// for a front end without one.
+    pub fn center_hz(&self) -> Option<u64> {
+        self.profile
+            .center
+            .map(|c| self.center_frequency_hz.unwrap_or(c.default_hz))
+    }
+}
+
+/// A validated `stationd.toml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Config {
+    /// The build flavour the file was checked against.
+    pub flavour: Flavour,
     /// The owner's local policy.
     pub policy: LocalPolicy,
+    /// `[sdr]`, if present.
+    pub sdr: Option<SdrSettings>,
     /// The backend to drive.
     pub backend: BackendConfig,
+    /// Whether `[backend]` chose the backend (development) rather than the
+    /// profile.
+    pub backend_explicit: bool,
+    /// The state directory (credentials, assignment).
+    pub state_dir: PathBuf,
+    /// Where the daemon writes `status.json`.
+    pub runtime_dir: PathBuf,
+    /// The control-plane endpoints; `None` in a development build without
+    /// `[endpoints]`.
+    pub endpoints: Option<Endpoints>,
+    /// Where the tunnel credentials come from.
+    pub credentials: CredentialsMode,
 }
 
 impl Config {
-    /// Reads and validates the config file at `path`.
+    /// Reads and validates the config file at `path` for this build.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        Self::load_as(path, Flavour::current())
+    }
+
+    /// Reads and validates the config file at `path` for `flavour`.
+    pub fn load_as(path: &Path, flavour: Flavour) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
             path: path.to_owned(),
             source,
         })?;
         let base = path.parent().unwrap_or_else(|| Path::new("."));
-        Self::parse(&text, base).map_err(|e| match e {
+        Self::parse_as(&text, base, flavour).map_err(|e| match e {
             ConfigError::Parse { message, .. } => ConfigError::Parse {
                 path: path.to_owned(),
                 message,
@@ -387,62 +534,178 @@ impl Config {
         })
     }
 
-    /// Parses and validates config `text`; relative paths are resolved
-    /// against `base_dir`, and the files must exist.
+    /// Parses and validates config `text` for this build; relative paths
+    /// are resolved against `base_dir`, and named files must exist.
     pub fn parse(text: &str, base_dir: &Path) -> Result<Self, ConfigError> {
+        Self::parse_as(text, base_dir, Flavour::current())
+    }
+
+    /// Parses and validates config `text` for `flavour`.
+    pub fn parse_as(text: &str, base_dir: &Path, flavour: Flavour) -> Result<Self, ConfigError> {
         let raw: RawConfig = toml::from_str(text).map_err(|e| ConfigError::Parse {
             path: PathBuf::new(),
             message: e.to_string(),
         })?;
-        let gateway = Gateway::parse(&raw.gateway_url)?;
-        if raw.max_channels > limits::MAX_CHANNELS {
-            return Err(ConfigError::Invalid {
-                field: "max_channels",
-                message: format!(
-                    "{} exceeds the protocol cap of {}",
-                    raw.max_channels,
-                    limits::MAX_CHANNELS
-                ),
-            });
+        if flavour.packaged {
+            for (present, field) in [
+                (raw.state_dir.is_some(), "state_dir"),
+                (raw.endpoints.is_some(), "endpoints"),
+                (raw.credentials.is_some(), "credentials"),
+                (raw.backend.is_some(), "backend"),
+            ] {
+                if present {
+                    return Err(ConfigError::DevelopmentOnly { field });
+                }
+            }
         }
-        if raw.max_waterfall_subscriptions > limits::MAX_WATERFALL_SUBSCRIPTIONS {
-            return Err(ConfigError::Invalid {
-                field: "max_waterfall_subscriptions",
-                message: format!(
-                    "{} exceeds the protocol cap of {}",
-                    raw.max_waterfall_subscriptions,
-                    limits::MAX_WATERFALL_SUBSCRIPTIONS
-                ),
-            });
-        }
-        let mut allowed_admin_ops: Vec<v1::AdminOpKind> = raw
-            .allowed_admin_ops
-            .into_iter()
-            .map(v1::AdminOpKind::from)
-            .collect();
-        allowed_admin_ops.sort_unstable();
-        allowed_admin_ops.dedup();
-        let backend = raw.backend.validate()?;
+        let policy = policy(
+            raw.allow_frontend_control,
+            raw.allowed_admin_ops,
+            raw.max_channels,
+            raw.max_waterfall_subscriptions,
+        )?;
+        let sdr = raw.sdr.as_ref().map(|s| sdr(s, flavour)).transpose()?;
+        let (backend, backend_explicit) = match (raw.backend, sdr) {
+            (Some(b), _) => (b.validate()?, true),
+            (None, Some(_)) => (BackendConfig::Ka9q(Ka9qSettings::bundled()), false),
+            (None, None) => {
+                return Err(ConfigError::Invalid {
+                    field: "sdr",
+                    message: "an [sdr] section with the receiver's `profile` is required"
+                        .to_owned(),
+                });
+            }
+        };
+        let state_dir = match raw.state_dir {
+            Some(p) => resolve("state_dir", base_dir, &p)?,
+            None => PathBuf::from(flavour::DEFAULT_STATE_DIR),
+        };
+        let runtime_dir = if flavour.packaged {
+            PathBuf::from(flavour::PACKAGED_RUNTIME_DIR)
+        } else {
+            state_dir.clone()
+        };
+        let endpoints = match (raw.endpoints, flavour.built_in) {
+            (Some(e), _) => Some(Endpoints {
+                enroll: Endpoint::parse("endpoints.enroll_url", &e.enroll_url)?,
+                station_api: Endpoint::parse("endpoints.station_api_url", &e.station_api_url)?,
+                root: TrustAnchor::File(existing_file("endpoints.root_ca", base_dir, &e.root_ca)?),
+            }),
+            (None, Some(b)) => Some(Endpoints {
+                enroll: Endpoint::parse("built-in domain", &b.enroll_url())?,
+                station_api: Endpoint::parse("built-in domain", &b.station_api_url())?,
+                root: TrustAnchor::BuiltIn(b.root_ca_pem),
+            }),
+            (None, None) => None,
+        };
+        let credentials = match raw.credentials {
+            Some(c) => CredentialsMode::Static(StaticCredentials {
+                gateway: Endpoint::parse("credentials.gateway_url", &c.gateway_url)?,
+                cert: existing_file("credentials.cert", base_dir, &c.cert)?,
+                key: existing_file("credentials.key", base_dir, &c.key)?,
+                gateway_ca: existing_file("credentials.gateway_ca", base_dir, &c.gateway_ca)?,
+            }),
+            None => CredentialsMode::Enrolled,
+        };
         Ok(Self {
-            gateway,
-            cert: existing_file("cert", base_dir, &raw.cert)?,
-            key: existing_file("key", base_dir, &raw.key)?,
-            gateway_ca: existing_file("gateway_ca", base_dir, &raw.gateway_ca)?,
-            policy: LocalPolicy {
-                allow_frontend_control: raw.allow_frontend_control,
-                allowed_admin_ops,
-                max_channels: raw.max_channels,
-                max_waterfall_subscriptions: raw.max_waterfall_subscriptions,
-            },
+            flavour,
+            policy,
+            sdr,
             backend,
+            backend_explicit,
+            state_dir,
+            runtime_dir,
+            endpoints,
+            credentials,
         })
+    }
+
+    /// The private key file the tunnel uses.
+    pub fn key_path(&self) -> PathBuf {
+        match &self.credentials {
+            CredentialsMode::Static(s) => s.key.clone(),
+            CredentialsMode::Enrolled => self.state_dir.join(crate::state::KEY_FILE),
+        }
     }
 
     /// A warning if the private key file is readable by group or others
     /// (Unix; `None` elsewhere or when it cannot be checked).
     pub fn key_permission_warning(&self) -> Option<String> {
-        key_permission_warning(&self.key)
+        key_permission_warning(&self.key_path())
     }
+
+    /// The runtime status file (`status.json`).
+    pub fn status_path(&self) -> PathBuf {
+        self.runtime_dir.join(crate::state::STATUS_FILE)
+    }
+}
+
+fn policy(
+    allow_frontend_control: bool,
+    ops: Vec<AdminOpName>,
+    max_channels: u32,
+    max_waterfall_subscriptions: u32,
+) -> Result<LocalPolicy, ConfigError> {
+    if max_channels > limits::MAX_CHANNELS {
+        return Err(ConfigError::Invalid {
+            field: "max_channels",
+            message: format!(
+                "{max_channels} exceeds the protocol cap of {}",
+                limits::MAX_CHANNELS
+            ),
+        });
+    }
+    if max_waterfall_subscriptions > limits::MAX_WATERFALL_SUBSCRIPTIONS {
+        return Err(ConfigError::Invalid {
+            field: "max_waterfall_subscriptions",
+            message: format!(
+                "{max_waterfall_subscriptions} exceeds the protocol cap of {}",
+                limits::MAX_WATERFALL_SUBSCRIPTIONS
+            ),
+        });
+    }
+    let mut allowed_admin_ops: Vec<v1::AdminOpKind> =
+        ops.into_iter().map(v1::AdminOpKind::from).collect();
+    allowed_admin_ops.sort_unstable();
+    allowed_admin_ops.dedup();
+    Ok(LocalPolicy {
+        allow_frontend_control,
+        allowed_admin_ops,
+        max_channels,
+        max_waterfall_subscriptions,
+    })
+}
+
+fn sdr(raw: &RawSdr, flavour: Flavour) -> Result<SdrSettings, ConfigError> {
+    let profile =
+        profile::by_name(&raw.profile, flavour.packaged).map_err(|e| ConfigError::Invalid {
+            field: "sdr.profile",
+            message: e.to_string(),
+        })?;
+    if let Some(hz) = raw.center_frequency_hz {
+        let Some(range) = profile.center else {
+            return Err(ConfigError::Invalid {
+                field: "sdr.center_frequency_hz",
+                message: format!(
+                    "profile {:?} has no settable centre frequency",
+                    profile.name
+                ),
+            });
+        };
+        if !(range.min_hz..=range.max_hz).contains(&hz) {
+            return Err(ConfigError::Invalid {
+                field: "sdr.center_frequency_hz",
+                message: format!(
+                    "{hz} Hz is outside {}..={} Hz for profile {:?}",
+                    range.min_hz, range.max_hz, profile.name
+                ),
+            });
+        }
+    }
+    Ok(SdrSettings {
+        profile,
+        center_frequency_hz: raw.center_frequency_hz,
+    })
 }
 
 #[cfg(unix)]
@@ -463,18 +726,22 @@ fn key_permission_warning(_path: &Path) -> Option<String> {
     None
 }
 
-fn existing_file(field: &'static str, base: &Path, path: &Path) -> Result<PathBuf, ConfigError> {
+fn resolve(field: &'static str, base: &Path, path: &Path) -> Result<PathBuf, ConfigError> {
     if path.as_os_str().is_empty() {
         return Err(ConfigError::Invalid {
             field,
             message: "must not be empty".to_owned(),
         });
     }
-    let resolved = if path.is_absolute() {
+    Ok(if path.is_absolute() {
         path.to_owned()
     } else {
         base.join(path)
-    };
+    })
+}
+
+fn existing_file(field: &'static str, base: &Path, path: &Path) -> Result<PathBuf, ConfigError> {
+    let resolved = resolve(field, base, path)?;
     match std::fs::metadata(&resolved) {
         Ok(m) if m.is_file() => Ok(resolved),
         Ok(_) => Err(ConfigError::File {
@@ -493,6 +760,14 @@ fn existing_file(field: &'static str, base: &Path, path: &Path) -> Result<PathBu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::flavour::BuiltIn;
+
+    const BUILT_IN: BuiltIn = BuiltIn {
+        domain: "coaxhub.example",
+        root_ca_pem: "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n",
+    };
+    const DEV: Flavour = Flavour::development();
+    const PKG: Flavour = Flavour::packaged_with(BUILT_IN);
 
     struct Dir {
         dir: tempfile::TempDir,
@@ -501,7 +776,7 @@ mod tests {
     impl Dir {
         fn new() -> Self {
             let dir = tempfile::tempdir().expect("tempdir");
-            for f in ["station.pem", "station.key", "ca.pem"] {
+            for f in ["station.pem", "station.key", "ca.pem", "root.pem"] {
                 std::fs::write(dir.path().join(f), "x").expect("write");
             }
             Self { dir }
@@ -512,7 +787,9 @@ mod tests {
         }
     }
 
-    const MINIMAL: &str = r#"
+    /// The earlier flat layout, as tests and scripts now write it.
+    const STATIC: &str = r#"
+        [credentials]
         gateway_url = "https://localhost:7443"
         cert = "station.pem"
         key = "station.key"
@@ -521,64 +798,241 @@ mod tests {
         kind = "fake"
     "#;
 
+    /// An installed station.
+    const OWNER: &str = r#"
+        [sdr]
+        profile = "rtlsdr"
+    "#;
+
     fn parse(dir: &Dir, text: &str) -> Result<Config, ConfigError> {
-        Config::parse(text, dir.path())
+        Config::parse_as(text, dir.path(), DEV)
     }
 
     fn with(extra: &str) -> String {
-        MINIMAL.replace("[backend]", &format!("{extra}\n[backend]"))
+        format!("{extra}\n{STATIC}")
     }
 
     fn invalid_field(r: Result<Config, ConfigError>) -> &'static str {
         match r {
-            Err(ConfigError::Invalid { field, .. } | ConfigError::File { field, .. }) => field,
+            Err(
+                ConfigError::Invalid { field, .. }
+                | ConfigError::File { field, .. }
+                | ConfigError::DevelopmentOnly { field },
+            ) => field,
             other => panic!("expected an invalid field, got {other:?}"),
         }
     }
 
     #[test]
-    fn minimal_config_gets_section_7_defaults() {
+    fn static_config_gets_section_7_defaults() {
         let dir = Dir::new();
-        let c = parse(&dir, MINIMAL).expect("valid");
+        let c = parse(&dir, STATIC).expect("valid");
+        let CredentialsMode::Static(s) = &c.credentials else {
+            panic!("static expected");
+        };
         assert_eq!(
-            c.gateway,
-            Gateway {
+            s.gateway,
+            Endpoint {
                 url: "https://localhost:7443".into(),
                 host: "localhost".into(),
                 port: 7443
             }
         );
-        assert_eq!(c.cert, dir.path().join("station.pem"));
-        assert_eq!(c.key, dir.path().join("station.key"));
-        assert_eq!(c.gateway_ca, dir.path().join("ca.pem"));
+        assert_eq!(s.cert, dir.path().join("station.pem"));
+        assert_eq!(s.key, dir.path().join("station.key"));
+        assert_eq!(c.key_path(), dir.path().join("station.key"));
+        assert_eq!(s.gateway_ca, dir.path().join("ca.pem"));
         assert_eq!(c.policy, LocalPolicy::default());
         assert_eq!(c.backend, BackendConfig::Fake);
+        assert!(c.backend_explicit);
+        assert_eq!(c.sdr, None);
+        assert_eq!(c.endpoints, None);
+        assert_eq!(c.state_dir, PathBuf::from(flavour::DEFAULT_STATE_DIR));
+        assert_eq!(c.runtime_dir, c.state_dir);
+        assert_eq!(c.status_path(), c.state_dir.join("status.json"));
         assert_eq!(c.backend.kind(), BackendKind::Fake);
         assert_eq!(c.backend.to_string(), "fake");
         assert_eq!(BackendKind::Ka9q.to_string(), "ka9q");
     }
 
     #[test]
-    fn full_config_from_the_brief() {
+    fn owner_config_uses_the_bundled_radiod() {
+        for flavour in [DEV, PKG] {
+            let dir = Dir::new();
+            let c = Config::parse_as(OWNER, dir.path(), flavour).expect("valid");
+            assert_eq!(c.flavour, flavour);
+            assert_eq!(c.backend, BackendConfig::Ka9q(Ka9qSettings::bundled()));
+            assert!(!c.backend_explicit);
+            assert_eq!(
+                c.backend.to_string(),
+                "ka9q, status 239.77.0.6:5006, data 239.77.0.4:5004"
+            );
+            let sdr = c.sdr.expect("sdr");
+            assert_eq!(sdr.profile.name, "rtlsdr");
+            assert_eq!(sdr.center_hz(), Some(98_000_000));
+            assert_eq!(c.credentials, CredentialsMode::Enrolled);
+            assert_eq!(
+                c.key_path(),
+                PathBuf::from("/var/lib/coaxhub/stationd/key.pem")
+            );
+        }
+        // Packaged: built-in endpoints and runtime dir.
+        let dir = Dir::new();
+        let c = Config::parse_as(OWNER, dir.path(), PKG).expect("valid");
+        let e = c.endpoints.clone().expect("built-in endpoints");
+        assert_eq!(e.enroll.url, "https://enroll.coaxhub.example");
+        assert_eq!(e.enroll.port, 443);
+        assert_eq!(e.station_api.host, "station-api.coaxhub.example");
+        assert_eq!(e.root, TrustAnchor::BuiltIn(BUILT_IN.root_ca_pem));
+        assert_eq!(e.root.to_string(), "the built-in CoaxHub root");
+        assert_eq!(
+            c.status_path(),
+            PathBuf::from("/run/coaxhub/stationd/status.json")
+        );
+        // Development: no endpoints unless configured.
+        let c = Config::parse_as(OWNER, dir.path(), DEV).expect("valid");
+        assert_eq!(c.endpoints, None);
+    }
+
+    #[test]
+    fn packaged_builds_reject_test_only_settings() {
+        let dir = Dir::new();
+        let endpoints = "[endpoints]\nenroll_url = \"https://localhost:7501\"\n\
+                         station_api_url = \"https://localhost:7502\"\nroot_ca = \"root.pem\"\n";
+        let cases = [
+            (format!("state_dir = \"/tmp/s\"\n{OWNER}"), "state_dir"),
+            (format!("{OWNER}\n{endpoints}"), "endpoints"),
+            (
+                STATIC.replace("[backend]\n        kind = \"fake\"", OWNER),
+                "credentials",
+            ),
+            (STATIC.to_owned(), "credentials"),
+            (format!("{OWNER}\n[backend]\nkind = \"fake\"\n"), "backend"),
+        ];
+        for (text, field) in cases {
+            // Accepted by development builds...
+            parse(&dir, &text).unwrap_or_else(|e| panic!("dev must accept {field}: {e}"));
+            // ...rejected by packaged ones, with a clear message.
+            let e = Config::parse_as(&text, dir.path(), PKG);
+            let msg = format!("{e:?}");
+            assert_eq!(invalid_field(e), field, "{msg}");
+        }
+        let e = Config::parse_as("[sdr]\nprofile = \"siggen\"\n", dir.path(), PKG)
+            .expect_err("siggen is dev only");
+        assert_eq!(
+            e.to_string(),
+            "invalid config value `sdr.profile`: unknown SDR profile \"siggen\"; supported: rtlsdr, rtlsdr-hf"
+        );
+        assert!(
+            ConfigError::DevelopmentOnly { field: "backend" }
+                .to_string()
+                .contains("packaged builds")
+        );
+        // An empty file needs [sdr] in both flavours.
+        for flavour in [DEV, PKG] {
+            assert_eq!(
+                invalid_field(Config::parse_as("", dir.path(), flavour)),
+                "sdr"
+            );
+        }
+    }
+
+    #[test]
+    fn development_settings() {
         let dir = Dir::new();
         let text = format!(
+            "state_dir = \"state\"\n{OWNER}\n[endpoints]\nenroll_url = \"https://localhost:7501\"\n\
+             station_api_url = \"https://127.0.0.1:7502\"\nroot_ca = \"root.pem\"\n"
+        );
+        let c = parse(&dir, &text).expect("valid");
+        assert_eq!(c.state_dir, dir.path().join("state"));
+        assert_eq!(c.runtime_dir, dir.path().join("state"));
+        let e = c.endpoints.expect("endpoints");
+        assert_eq!(e.enroll.authority(), "localhost:7501");
+        assert_eq!(e.station_api.host, "127.0.0.1");
+        assert_eq!(e.root, TrustAnchor::File(dir.path().join("root.pem")));
+        assert!(e.root.to_string().ends_with("root.pem"));
+        // Errors name the field.
+        assert_eq!(
+            invalid_field(parse(&dir, &text.replace("root.pem", "missing.pem"))),
+            "endpoints.root_ca"
+        );
+        assert_eq!(
+            invalid_field(parse(
+                &dir,
+                &text.replace("https://localhost:7501", "http://x")
+            )),
+            "endpoints.enroll_url"
+        );
+        assert_eq!(
+            invalid_field(parse(&dir, &text.replace("https://127.0.0.1:7502", "x"))),
+            "endpoints.station_api_url"
+        );
+        assert_eq!(
+            invalid_field(parse(&dir, &text.replace("\"state\"", "\"\""))),
+            "state_dir"
+        );
+        assert!(matches!(
+            parse(&dir, &format!("{text}\n[endpoints.extra]\n")),
+            Err(ConfigError::Parse { .. })
+        ));
+    }
+
+    #[test]
+    fn sdr_section() {
+        let dir = Dir::new();
+        let sdr = |body: &str| format!("[sdr]\n{body}\n");
+        let c = parse(
+            &dir,
+            &sdr("profile = \"rtlsdr-hf\"\ncenter_frequency_hz = 14200000"),
+        )
+        .expect("valid");
+        assert_eq!(c.sdr.expect("sdr").center_hz(), Some(14_200_000));
+        let c = parse(&dir, &sdr("profile = \"siggen\"")).expect("valid");
+        assert_eq!(c.sdr.expect("sdr").center_hz(), None);
+        for (body, field) in [
+            (
+                "profile = \"siggen\"\ncenter_frequency_hz = 10000000",
+                "sdr.center_frequency_hz",
+            ),
+            (
+                "profile = \"rtlsdr\"\ncenter_frequency_hz = 7000000",
+                "sdr.center_frequency_hz",
+            ),
+            (
+                "profile = \"rtlsdr-hf\"\ncenter_frequency_hz = 30000000",
+                "sdr.center_frequency_hz",
+            ),
+            ("profile = \"airspy\"", "sdr.profile"),
+        ] {
+            assert_eq!(invalid_field(parse(&dir, &sdr(body))), field, "{body}");
+        }
+        assert!(matches!(
+            parse(&dir, &sdr("profile = \"rtlsdr\"\ngain = 3")),
+            Err(ConfigError::Parse { .. })
+        ));
+        assert!(matches!(
+            parse(&dir, &sdr("center_frequency_hz = 1")),
+            Err(ConfigError::Parse { .. })
+        ));
+        // [sdr] with an explicit backend: the backend wins.
+        let c = parse(&dir, &format!("{STATIC}\n{}", sdr("profile = \"rtlsdr\""))).expect("ok");
+        assert_eq!(c.backend, BackendConfig::Fake);
+        assert!(c.sdr.is_some());
+    }
+
+    #[test]
+    fn full_policy() {
+        let dir = Dir::new();
+        let text = with(
             r#"
-            gateway_url = "https://gw.dev.localhost"
-            cert = "{0}/station.pem"
-            key = "{0}/station.key"
-            gateway_ca = "{0}/ca.pem"
             allow_frontend_control = false
             allowed_admin_ops = ["update", "restart_backend", "update"]
             max_channels = 64
             max_waterfall_subscriptions = 0
-            [backend]
-            kind = "fake"
             "#,
-            dir.path().display()
         );
         let c = parse(&dir, &text).expect("valid");
-        assert_eq!(c.gateway.port, 443);
-        assert_eq!(c.gateway.authority(), "gw.dev.localhost:443");
         assert_eq!(
             c.policy,
             LocalPolicy {
@@ -629,16 +1083,21 @@ mod tests {
         let dir = Dir::new();
         let e = parse(&dir, &with("max_chanels = 3")).expect_err("typo");
         assert!(e.to_string().contains("max_chanels"), "{e}");
-        let e = parse(&dir, &MINIMAL.replace("\"fake\"", "\"sdrplay\"")).expect_err("kind");
+        let e = parse(&dir, &STATIC.replace("\"fake\"", "\"sdrplay\"")).expect_err("kind");
         assert!(e.to_string().contains("sdrplay"), "{e}");
+        // The earlier top-level credentials are unknown keys now.
         let e = parse(
             &dir,
-            &MINIMAL.replace("[backend]\n        kind = \"fake\"", ""),
+            "gateway_url = \"https://localhost:7443\"\n[sdr]\nprofile = \"rtlsdr\"",
         )
-        .expect_err("backend section required");
-        assert!(e.to_string().contains("backend"), "{e}");
+        .expect_err("old layout");
+        assert!(e.to_string().contains("gateway_url"), "{e}");
         assert!(matches!(
             parse(&dir, "not toml ="),
+            Err(ConfigError::Parse { .. })
+        ));
+        assert!(matches!(
+            parse(&dir, &STATIC.replace("gateway_ca", "ca")),
             Err(ConfigError::Parse { .. })
         ));
     }
@@ -647,7 +1106,7 @@ mod tests {
     fn ka9q_backend_section() {
         let dir = Dir::new();
         let ka9q = |section: &str| {
-            MINIMAL.replace(
+            STATIC.replace(
                 "kind = \"fake\"",
                 &format!("kind = \"ka9q\"\n[backend.ka9q]\n{section}"),
             )
@@ -657,18 +1116,8 @@ mod tests {
             &ka9q("status_group = \"239.77.0.6:5006\"\ndata_group = \"239.77.0.4\""),
         )
         .expect("valid");
-        assert_eq!(
-            c.backend,
-            BackendConfig::Ka9q(Ka9qSettings {
-                status_group: "239.77.0.6:5006".parse().expect("addr"),
-                data_group: Some("239.77.0.4:5004".parse().expect("addr")),
-            })
-        );
+        assert_eq!(c.backend, BackendConfig::Ka9q(Ka9qSettings::bundled()));
         assert_eq!(c.backend.kind(), BackendKind::Ka9q);
-        assert_eq!(
-            c.backend.to_string(),
-            "ka9q, status 239.77.0.6:5006, data 239.77.0.4:5004"
-        );
         // A radiod status name, no data group.
         let c = parse(&dir, &ka9q("status_group = \"coaxhub-status.local\"")).expect("valid");
         let BackendConfig::Ka9q(k) = c.backend else {
@@ -691,13 +1140,13 @@ mod tests {
             "backend.ka9q.data_group"
         );
         assert_eq!(
-            invalid_field(parse(&dir, &MINIMAL.replace("\"fake\"", "\"ka9q\""))),
+            invalid_field(parse(&dir, &STATIC.replace("\"fake\"", "\"ka9q\""))),
             "backend.ka9q"
         );
         assert_eq!(
             invalid_field(parse(
                 &dir,
-                &format!("{MINIMAL}\n[backend.ka9q]\nstatus_group = \"239.77.0.6\"\n")
+                &format!("{STATIC}\n[backend.ka9q]\nstatus_group = \"239.77.0.6\"\n")
             )),
             "backend.ka9q"
         );
@@ -708,13 +1157,17 @@ mod tests {
     }
 
     #[test]
-    fn gateway_url_rules() {
-        let ok = |u: &str| Gateway::parse(u).expect(u);
+    fn endpoint_url_rules() {
+        let ok = |u: &str| Endpoint::parse("x", u).expect(u);
         assert_eq!(ok("https://127.0.0.1:7443").host, "127.0.0.1");
         let v6 = ok("https://[::1]:7443");
         assert_eq!(v6.host, "::1");
         assert_eq!(v6.authority(), "[::1]:7443");
         assert_eq!(ok("https://gw.sa1.example/").port, 443);
+        assert_eq!(
+            ok("https://gw.sa1.example").to_string(),
+            "https://gw.sa1.example"
+        );
         for bad in [
             "http://localhost:7443",
             "localhost:7443",
@@ -728,9 +1181,9 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    Gateway::parse(bad),
+                    Endpoint::parse("credentials.gateway_url", bad),
                     Err(ConfigError::Invalid {
-                        field: "gateway_url",
+                        field: "credentials.gateway_url",
                         ..
                     })
                 ),
@@ -742,27 +1195,30 @@ mod tests {
     #[test]
     fn files_must_exist_and_be_regular() {
         let dir = Dir::new();
-        let e = parse(&dir, &MINIMAL.replace("station.pem", "missing.pem"));
-        assert_eq!(invalid_field(e), "cert");
+        let e = parse(&dir, &STATIC.replace("station.pem", "missing.pem"));
+        assert_eq!(invalid_field(e), "credentials.cert");
         std::fs::create_dir(dir.path().join("sub")).expect("mkdir");
-        let e = parse(&dir, &MINIMAL.replace("ca.pem", "sub"));
+        let e = parse(&dir, &STATIC.replace("ca.pem", "sub"));
         assert!(
-            matches!(e, Err(ConfigError::File { field: "gateway_ca", ref problem, .. }) if problem.contains("regular"))
+            matches!(e, Err(ConfigError::File { field: "credentials.gateway_ca", ref problem, .. }) if problem.contains("regular"))
         );
-        let e = parse(&dir, &MINIMAL.replace("\"station.key\"", "\"\""));
-        assert_eq!(invalid_field(e), "key");
+        let e = parse(&dir, &STATIC.replace("\"station.key\"", "\"\""));
+        assert_eq!(invalid_field(e), "credentials.key");
     }
 
     #[test]
     fn load_reads_relative_to_the_config_file() {
         let dir = Dir::new();
         let path = dir.path().join("stationd.toml");
-        std::fs::write(&path, MINIMAL).expect("write");
-        let c = Config::load(&path).expect("load");
-        assert_eq!(c.gateway_ca, dir.path().join("ca.pem"));
+        std::fs::write(&path, STATIC).expect("write");
+        let c = Config::load_as(&path, DEV).expect("load");
+        let CredentialsMode::Static(s) = c.credentials else {
+            panic!("static expected");
+        };
+        assert_eq!(s.gateway_ca, dir.path().join("ca.pem"));
         let e = Config::load(&dir.path().join("nope.toml")).expect_err("missing");
         assert!(matches!(e, ConfigError::Read { .. }), "{e}");
-        std::fs::write(&path, "gateway_url = 3").expect("write");
+        std::fs::write(&path, "max_channels = \"x\"").expect("write");
         let e = Config::load(&path).expect_err("bad");
         assert!(
             matches!(&e, ConfigError::Parse { path: p, .. } if *p == path),
@@ -775,10 +1231,36 @@ mod tests {
     fn warns_about_readable_keys() {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = Dir::new();
-        let c = parse(&dir, MINIMAL).expect("valid");
-        std::fs::set_permissions(&c.key, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let c = parse(&dir, STATIC).expect("valid");
+        let key = c.key_path();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).expect("chmod");
         assert!(c.key_permission_warning().expect("warning").contains("644"));
-        std::fs::set_permissions(&c.key, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).expect("chmod");
         assert_eq!(c.key_permission_warning(), None);
+    }
+
+    mod prop {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// Arbitrary text never panics the parser, in either flavour.
+            #[test]
+            fn parse_never_panics(text in "\\PC{0,400}") {
+                let dir = std::env::temp_dir();
+                let _ = Config::parse_as(&text, &dir, DEV);
+                let _ = Config::parse_as(&text, &dir, PKG);
+            }
+
+            /// Arbitrary URLs never panic and accepted ones are https with a host.
+            #[test]
+            fn endpoint_parse_never_panics(url in "(https?://)?[a-z0-9.:@/?#\\[\\]-]{0,40}") {
+                if let Ok(e) = Endpoint::parse("x", &url) {
+                    prop_assert!(url.starts_with("https://"));
+                    prop_assert!(!e.host.is_empty());
+                    prop_assert!(e.port != 0);
+                }
+            }
+        }
     }
 }

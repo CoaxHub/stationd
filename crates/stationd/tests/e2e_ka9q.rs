@@ -17,6 +17,8 @@
 //! the right bin); broadcast FM reports radiod's 48 kHz; health in
 //! `StationStatus`. Timings are printed as `E2E key=value` lines.
 
+// Static [credentials] and [backend] are development-only settings.
+#![cfg(not(feature = "packaged"))]
 #![allow(
     clippy::too_many_lines,
     reason = "end-to-end scripts read top to bottom"

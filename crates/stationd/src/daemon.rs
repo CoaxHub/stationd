@@ -24,11 +24,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::config::{Config, Gateway, LocalPolicy};
+use crate::config::{Config, Endpoint, LocalPolicy};
+use crate::credentials::{self, CredentialSource, Credentials, CredentialsError};
 use crate::dispatch::truncate_utf8;
 use crate::outbound::{DropCounters, QueueLimits};
 use crate::session::{self, End};
-use crate::tls::{self, Connector, TlsError};
+use crate::tls::{Connector, TlsError};
 
 use v1::goodbye::Reason;
 
@@ -127,6 +128,10 @@ pub enum RunError {
     /// The TLS credentials could not be loaded.
     #[error(transparent)]
     Tls(#[from] TlsError),
+    /// The credentials could not be loaded (not enrolled, unreadable
+    /// state).
+    #[error(transparent)]
+    Credentials(CredentialsError),
     /// The hub revoked this station's credential (`Goodbye{REVOKED}`).
     #[error("the hub revoked this station's certificate; enroll the station again")]
     Revoked,
@@ -138,10 +143,34 @@ pub enum RunError {
     AlreadyJoined,
 }
 
+impl From<CredentialsError> for RunError {
+    fn from(e: CredentialsError) -> Self {
+        match e {
+            CredentialsError::Tls(t) => Self::Tls(t),
+            other => Self::Credentials(other),
+        }
+    }
+}
+
+/// Where and how one connection attempt dials.
+#[derive(Debug, Clone)]
+pub(crate) struct Link {
+    pub gateway: Endpoint,
+    pub connector: Connector,
+}
+
+impl Link {
+    fn new(credentials: &Credentials) -> Result<Self, TlsError> {
+        Ok(Self {
+            gateway: credentials.gateway.clone(),
+            connector: Connector::new(Arc::clone(&credentials.tls.config), &credentials.gateway)?,
+        })
+    }
+}
+
 /// Everything a session needs, shared across connections.
 pub(crate) struct Ctx {
-    pub gateway: Gateway,
-    pub connector: Connector,
+    pub credentials: Arc<dyn CredentialSource>,
     pub policy: Arc<LocalPolicy>,
     pub backend: Arc<dyn Backend>,
     pub boot_id: u64,
@@ -159,9 +188,11 @@ pub(crate) struct Ctx {
 #[derive(Debug)]
 pub struct DaemonHandle {
     state: watch::Receiver<ConnectionState>,
+    last_error: watch::Receiver<Option<String>>,
     shutdown: CancellationToken,
     task: Option<JoinHandle<Result<(), RunError>>>,
     station_id: Uuid,
+    gateway_url: String,
     boot_id: u64,
 }
 
@@ -176,9 +207,20 @@ impl DaemonHandle {
         self.state.borrow().clone()
     }
 
+    /// Why the last connection attempt or session failed (`None` after a
+    /// session was established and until the next failure).
+    pub fn last_error(&self) -> watch::Receiver<Option<String>> {
+        self.last_error.clone()
+    }
+
     /// The station ID from the client certificate.
     pub fn station_id(&self) -> Uuid {
         self.station_id
+    }
+
+    /// The gateway the daemon started with.
+    pub fn gateway_url(&self) -> &str {
+        &self.gateway_url
     }
 
     /// This daemon's `Hello.boot_id`.
@@ -215,35 +257,60 @@ impl Drop for DaemonHandle {
     }
 }
 
-/// Loads the TLS credentials and starts the daemon on the current runtime.
+/// Loads the credentials `config` names and starts the daemon on the
+/// current runtime.
 pub fn spawn(
     config: &Config,
     backend: Arc<dyn Backend>,
     options: RunOptions,
 ) -> Result<DaemonHandle, RunError> {
-    let tls = tls::load(config)?;
-    let station_id = tls.station_id;
+    spawn_with(credentials::source(config), config, backend, options)
+}
+
+/// Starts the daemon with credentials from `source` (re-read before every
+/// connect attempt). Fails if they cannot be loaded now.
+pub fn spawn_with(
+    source: Arc<dyn CredentialSource>,
+    config: &Config,
+    backend: Arc<dyn Backend>,
+    options: RunOptions,
+) -> Result<DaemonHandle, RunError> {
+    let first = source.load()?;
+    let link = Link::new(&first)?;
+    let station_id = first.tls.station_id;
     let shutdown = CancellationToken::new();
     let (state_tx, state) = watch::channel(ConnectionState::Connecting { attempt: 0 });
+    let (error_tx, last_error) = watch::channel(None);
     let boot_id = options.boot_id.unwrap_or_else(rand::random::<u64>);
     let options = RunOptions {
         boot_id: Some(boot_id),
         ..options
     };
-    let ctx = context(config, &tls, backend, &options)?;
     info!(
         station_id = %station_id,
-        gateway = %config.gateway.url,
-        trust_anchors = tls.trust_anchors,
+        gateway = %first.gateway.url,
+        hub = first.hub_id.as_deref().unwrap_or("-"),
+        credentials = source.kind(),
+        trust_anchors = first.tls.trust_anchors,
         boot_id,
         "stationd starting"
     );
-    let task = tokio::spawn(run_loop(ctx, options, shutdown.clone(), state_tx));
+    let ctx = context(source, config, backend, &options);
+    let task = tokio::spawn(run_loop(
+        ctx,
+        link,
+        options,
+        shutdown.clone(),
+        state_tx,
+        error_tx,
+    ));
     Ok(DaemonHandle {
         state,
+        last_error,
         shutdown,
         task: Some(task),
         station_id,
+        gateway_url: first.gateway.url,
         boot_id,
     })
 }
@@ -257,20 +324,21 @@ pub async fn run(
     shutdown: CancellationToken,
     state: watch::Sender<ConnectionState>,
 ) -> Result<(), RunError> {
-    let tls = tls::load(config)?;
-    let ctx = context(config, &tls, backend, &options)?;
-    run_loop(ctx, options, shutdown, state).await
+    let source = credentials::source(config);
+    let link = Link::new(&source.load()?)?;
+    let ctx = context(source, config, backend, &options);
+    let (error_tx, _) = watch::channel(None);
+    run_loop(ctx, link, options, shutdown, state, error_tx).await
 }
 
 fn context(
+    credentials: Arc<dyn CredentialSource>,
     config: &Config,
-    tls: &tls::ClientTls,
     backend: Arc<dyn Backend>,
     options: &RunOptions,
-) -> Result<Arc<Ctx>, RunError> {
-    Ok(Arc::new(Ctx {
-        gateway: config.gateway.clone(),
-        connector: Connector::new(Arc::clone(&tls.config), &config.gateway)?,
+) -> Arc<Ctx> {
+    Arc::new(Ctx {
+        credentials,
         policy: Arc::new(config.policy.clone()),
         backend,
         boot_id: options.boot_id.unwrap_or_else(rand::random::<u64>),
@@ -282,7 +350,28 @@ fn context(
         keepalive_timeout: options.keepalive_timeout,
         shutdown_grace: options.shutdown_grace,
         queue: options.queue,
-    }))
+    })
+}
+
+/// The link for the next attempt: fresh credentials when they load (a
+/// renewed certificate, a new assignment), else the last good ones.
+fn refresh(ctx: &Ctx, link: &mut Link) {
+    match ctx
+        .credentials
+        .load()
+        .map_err(RunError::from)
+        .and_then(|c| {
+            let next = Link::new(&c)?;
+            Ok((c, next))
+        }) {
+        Ok((c, next)) => {
+            if next.gateway != link.gateway {
+                info!(gateway = %c.gateway.url, hub = c.hub_id.as_deref().unwrap_or("-"), "gateway changed");
+            }
+            *link = next;
+        }
+        Err(e) => warn!(error = %e, "cannot reload the credentials; using the previous ones"),
+    }
 }
 
 fn std_now() -> std::time::Instant {
@@ -335,18 +424,24 @@ fn log_goodbye(g: &v1::Goodbye) {
 
 async fn run_loop(
     ctx: Arc<Ctx>,
+    mut link: Link,
     mut options: RunOptions,
     shutdown: CancellationToken,
     state: watch::Sender<ConnectionState>,
+    last_error: watch::Sender<Option<String>>,
 ) -> Result<(), RunError> {
     let mut backoff = Backoff::new(options.backoff);
     let mut attempt: u64 = 0;
     loop {
         attempt = attempt.saturating_add(1);
+        if attempt > 1 {
+            refresh(&ctx, &mut link);
+        }
         state.send_replace(ConnectionState::Connecting { attempt });
-        let outcome = session::run(&ctx, &shutdown, &state).await;
+        let outcome = session::run(&ctx, &link, &shutdown, &state).await;
         if let Some(at) = outcome.established_at {
             backoff.on_connected(at);
+            last_error.send_replace(None);
         }
         let goodbye = match outcome.end {
             End::Shutdown => {
@@ -356,10 +451,15 @@ async fn run_loop(
             }
             End::Goodbye(g) => {
                 log_goodbye(&g);
+                last_error.send_replace(Some(format!(
+                    "hub said goodbye: {}",
+                    g.reason().as_str_name()
+                )));
                 Some(g)
             }
             End::Lost(reason) => {
                 warn!(attempt, reason = %reason, "connection to the hub lost or failed");
+                last_error.send_replace(Some(reason));
                 None
             }
         };
@@ -375,7 +475,7 @@ async fn run_loop(
                 if refresh_assignment {
                     warn!(
                         "the hub asked to refresh the assignment; StationControl.GetAssignment \
-                         is not implemented yet, reconnecting to the configured gateway_url"
+                         is not implemented yet, reconnecting to the stored gateway"
                     );
                 }
                 info!(
