@@ -8,7 +8,7 @@
 //! Reconnection follows `station_proto::backoff` exactly: every session end
 //! (connect failure, lost stream, `Goodbye`) goes through
 //! [`Backoff::on_disconnected`], which also handles `retry_after_ms`,
-//! `DISABLED` (15 min) and `UNSUPPORTED_VERSION` (6 h).
+//! `DISABLED` (5 min) and `UNSUPPORTED_VERSION` (6 h).
 //!
 //! Enrolled stations with a `station-api` endpoint also talk to the control
 //! plane ([`crate::station_api`]):
@@ -627,7 +627,7 @@ fn log_goodbye(g: &v1::Goodbye) {
         ),
         Ok(Reason::Disabled) => warn!(
             hub_message = ?message,
-            "this station is disabled by its owner or a moderator; retrying every 15 minutes"
+            "this station is disabled by its owner or a moderator; retrying every 5 minutes"
         ),
         Ok(Reason::Revoked) => warn!(
             hub_message = ?message,
