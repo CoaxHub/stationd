@@ -12,7 +12,8 @@
 #   COAXHUB_ROOT_CA    required: PEM file with the CoaxHub root certificate
 #                      built into stationd
 #   PACKAGE_REVISION   Debian revision (default 1): version <crate>-<rev>~deb<N>
-#   RUST_VERSION       rustup toolchain for the build image (default stable)
+#   RUST_VERSION       rustup toolchain for the build image (default: the channel
+#                      in rust-toolchain.toml)
 #   RADIOD_ARCHOPTS    override radiod's ARCHOPTS (default: x86-64-v2 for amd64,
 #                      armv8-a tuned for Cortex-A53 for arm64; never -march=native)
 #   DOCKER_PROGRESS    docker build --progress (default auto)
@@ -139,7 +140,7 @@ main() {
         --build-arg "ARCH=${arch}"
         --build-arg "VERSION=${version}"
         --build-arg "COAXHUB_DOMAIN=${COAXHUB_DOMAIN}"
-        --build-arg "RUST_VERSION=${RUST_VERSION:-stable}"
+        --build-arg "RUST_VERSION=${RUST_VERSION:-$(sed -n 's/^channel = "\(.*\)"$/\1/p' "${station}/rust-toolchain.toml")}"
         --build-arg "RADIOD_ARCHOPTS=${RADIOD_ARCHOPTS:-}"
         --build-arg "KA9Q_COMMIT=${KA9Q_COMMIT}"
         --build-arg "KA9Q_COMMIT_TIME=${KA9Q_COMMIT_TIME}"

@@ -1,0 +1,7 @@
+# The Rust release the station workspace builds with, here, in CI and in the packages
+# (packaging/build-deb.sh reads it). A new stable can add lints that fail
+# `clippy -D warnings`, so moving to it is a commit of its own. Fuzzing uses nightly
+# explicitly (scripts/fuzz.sh).
+[toolchain]
+channel = "1.98"
+components = ["rustfmt", "clippy"]
