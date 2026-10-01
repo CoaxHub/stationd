@@ -49,6 +49,14 @@ is_radiod() {
   [[ "${stat}" == "$1 (radiod) "[^Z]* ]]
 }
 
+# Alive and not a zombie, whatever it is called yet: just after the fork the child is still
+# bash or setsid until it execs radiod, so is_radiod can't tell "starting" from "gone".
+is_alive() {
+  local stat
+  stat="$(cat "/proc/$1/stat" 2>/dev/null)" || return 1
+  [[ "${stat##*) }" != Z* ]]
+}
+
 running_pid() {
   local pid
   [[ -f "${pidfile}" ]] || return 1
@@ -83,7 +91,7 @@ do_start() {
 
   local deadline=$((SECONDS + RADIOD_TIMEOUT))
   until grep -q 'static demodulators started' "${logfile}"; do
-    if ! is_radiod "${pid}"; then
+    if ! is_alive "${pid}"; then
       log "ERROR: radiod exited during startup:"
       tail -n 20 "${logfile}" >&2
       rm -f "${pidfile}"
