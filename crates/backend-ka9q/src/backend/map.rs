@@ -251,6 +251,8 @@ pub fn capabilities(st: &ChannelStatus) -> Option<v1::Capabilities> {
         allowed_admin_ops: Vec::new(),
         frontend_control_allowed: false,
         sdr_model: sdr_model(st),
+        // stationd's own claim (station protocol 1.1).
+        measurements: None,
     })
 }
 

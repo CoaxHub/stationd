@@ -732,3 +732,77 @@ async fn new_needs_a_runtime_and_a_valid_config() {
             .unwrap();
     assert_eq!(err.code, v1::ResultCode::BackendError);
 }
+
+#[tokio::test(start_paused = true)]
+async fn measurement_channels_hop_poll_and_close() {
+    use station_backend::MeasurementChannel;
+    let (fake, backend) = setup().await;
+    assert!(backend.can_measure());
+    let caps = backend.capabilities().await.unwrap();
+    let tunable = caps.tunable_range.unwrap();
+    let mid = tunable.start_hz / 2 + tunable.end_hz / 2;
+    let ch = MeasurementChannel {
+        center_hz: mid,
+        bin_count: 1024,
+        resolution_bw_hz: 500.0,
+        poll_interval: Duration::from_millis(500),
+    };
+    backend.open_measurement(7, ch).await.unwrap();
+    assert_eq!(
+        code(backend.open_measurement(7, ch).await),
+        v1::ResultCode::AlreadyExists
+    );
+    assert_eq!(backend.measurement_ids(), vec![7]);
+    // Not listener capacity: no channel or subscription on the hub's side.
+    assert!(backend.channel_ids().is_empty() && backend.subscription_ids().is_empty());
+    let ssrc = *fake.state().created.last().unwrap();
+    let fc = fake.channel(ssrc).unwrap();
+    assert_eq!((fc.demod, fc.bin_count, fc.rbw), (4, 1024, 500.0));
+    // SPECTRUM_AVG is sent explicitly and fixed.
+    assert_eq!(fc.avg, backend_ka9q::backend::measure::SPECTRUM_AVG);
+    // The placement grid from the front end's status (L + M − 1 points).
+    let grid = backend.measurement_grid(500.0).await.expect("grid");
+    assert!(grid.grid_hz >= 500 && grid.grid_hz % 500 == 0, "{grid:?}");
+    // Narrowband bins are refused.
+    let narrow = MeasurementChannel {
+        resolution_bw_hz: 200.0,
+        ..ch
+    };
+    assert_eq!(
+        code(backend.open_measurement(8, narrow).await),
+        v1::ResultCode::InvalidArgument
+    );
+    let s = backend.poll_measurement(7).await.unwrap();
+    assert_eq!(s.power_db.len(), 1024);
+    assert_eq!((s.center_hz, s.bin_hz), (mid, 500.0));
+    assert!(s.power_db.iter().all(|p| p.is_finite()));
+    // A hop changes RADIO_FREQUENCY on the same SSRC; BIN_COUNT stays.
+    let hop = mid + 512_000;
+    let created = fake.state().created.len();
+    // The hop's own reply carries the new window.
+    let reply = backend.retune_measurement(7, hop).await.unwrap();
+    assert_eq!(reply.map(|s| s.center_hz), Some(hop));
+    let s = backend.poll_measurement(7).await.unwrap();
+    assert_eq!(s.center_hz, hop);
+    let fc = fake.channel(ssrc).unwrap();
+    #[allow(clippy::cast_precision_loss, reason = "a frequency below 2^53 Hz")]
+    let hop_f = hop as f64;
+    assert_eq!((fc.frequency, fc.bin_count), (hop_f, 1024));
+    assert_eq!(fake.state().created.len(), created, "no new SSRC for a hop");
+    backend.close_measurement(7).await.unwrap();
+    assert!(
+        fake.wait_until(Duration::from_millis(200), |s| !s
+            .channels
+            .contains_key(&ssrc))
+            .await
+    );
+    assert_eq!(
+        code(backend.poll_measurement(7).await),
+        v1::ResultCode::NotFound
+    );
+    assert_eq!(
+        code(backend.close_measurement(7).await),
+        v1::ResultCode::NotFound
+    );
+    fake.assert_client_contract();
+}

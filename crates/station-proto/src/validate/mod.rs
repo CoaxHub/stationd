@@ -17,6 +17,7 @@
 
 mod capabilities;
 mod fields;
+mod measure;
 mod negotiate;
 mod quota;
 mod rate;
@@ -31,6 +32,7 @@ use crate::v1;
 
 pub use capabilities::{SanitizedCapabilities, sanitize_capabilities};
 pub use fields::{check_message, decode_station_message};
+pub use measure::{duty_of, is_band_key, is_measuring_minute};
 pub use negotiate::{
     Unsupported, negotiate, negotiate_against, negotiate_welcome, negotiate_welcome_against,
 };
@@ -83,6 +85,22 @@ pub enum DropReason {
     /// An `Event` naming a channel or subscription that is neither open nor
     /// just closed (§5 `Event`).
     UnknownEventTarget,
+    /// A noise report for a plan whose `MeasurementsStarted` has not arrived
+    /// yet (§5.2).
+    AwaitingMeasurements {
+        /// The measurement id.
+        measurement_id: u32,
+    },
+    /// §5.2: a measurement report or duty change whose time is implausible
+    /// against the hub's clock (not a whole minute, too old or ahead). An
+    /// honest station with a drifting clock or a stalled queue can send it.
+    MeasurementTime {
+        /// The kind of message.
+        kind: MessageKind,
+    },
+    /// §5.2: under idle duty, a noise report for a minute that is not a
+    /// measuring minute.
+    NotScheduled,
 }
 
 /// A protocol violation (station-protocol §5): ends the session, and in most
@@ -267,6 +285,32 @@ pub enum ViolationKind {
         /// How many in a row.
         consecutive: u32,
     },
+    /// §3: a message type the negotiated minor does not have (a noise report
+    /// on a 1.0 session).
+    #[error("{kind} is not part of minor {minor}")]
+    MessageNotInMinor {
+        /// The kind of message.
+        kind: MessageKind,
+        /// The negotiated minor.
+        minor: u32,
+    },
+    /// §5.2: a noise report or measurement event for a plan the hub never
+    /// started on this connection, or stopped more than the grace period ago.
+    #[error("{kind} for measurement {measurement_id}, which is not open")]
+    UnknownMeasurement {
+        /// The kind of message.
+        kind: MessageKind,
+        /// The measurement id.
+        measurement_id: u32,
+    },
+    /// §5.2: noise reports or duty changes over the rate limit for too long.
+    #[error("{kind} for measurement {measurement_id} over the rate limit")]
+    MeasurementRate {
+        /// The kind of message.
+        kind: MessageKind,
+        /// The measurement id.
+        measurement_id: u32,
+    },
     /// §3: the station's protocol major is not supported. Not a strike: the
     /// hub answers `Goodbye{UNSUPPORTED_VERSION}`.
     #[error("unsupported protocol version {major}.{minor}")]
@@ -309,6 +353,9 @@ impl ViolationKind {
             Self::WaterfallLength { .. } => "waterfall_length",
             Self::WaterfallRate { .. } => "waterfall_rate",
             Self::ResponseTimeouts { .. } => "response_timeouts",
+            Self::MessageNotInMinor { .. } => "message_not_in_minor",
+            Self::UnknownMeasurement { .. } => "unknown_measurement",
+            Self::MeasurementRate { .. } => "measurement_rate",
             Self::UnsupportedVersion { .. } => "unsupported_version",
         }
     }
@@ -345,6 +392,8 @@ pub enum MessageKind {
     Status,
     /// `Event`.
     Event,
+    /// `NoiseFloorReport` (1.1).
+    Noise,
 }
 
 impl MessageKind {
@@ -359,6 +408,7 @@ impl MessageKind {
             Body::Signal(_) => Self::Signal,
             Body::Status(_) => Self::Status,
             Body::Event(_) => Self::Event,
+            Body::Noise(_) => Self::Noise,
         }
     }
 
@@ -372,6 +422,7 @@ impl MessageKind {
             Self::Signal => "signal",
             Self::Status => "status",
             Self::Event => "event",
+            Self::Noise => "noise",
         }
     }
 }
@@ -403,11 +454,15 @@ pub enum CommandKind {
     Ping,
     /// `AdminOp`.
     AdminOp,
+    /// `StartMeasurements` (1.1).
+    StartMeasurements,
+    /// `StopMeasurements` (1.1).
+    StopMeasurements,
 }
 
 impl CommandKind {
     /// Every command, in proto field order.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 11] = [
         Self::GetCapabilities,
         Self::OpenChannel,
         Self::UpdateChannel,
@@ -417,6 +472,8 @@ impl CommandKind {
         Self::UnsubscribeWaterfall,
         Self::Ping,
         Self::AdminOp,
+        Self::StartMeasurements,
+        Self::StopMeasurements,
     ];
 
     /// The kind of a request command.
@@ -432,6 +489,8 @@ impl CommandKind {
             Command::UnsubscribeWaterfall(_) => Self::UnsubscribeWaterfall,
             Command::Ping(_) => Self::Ping,
             Command::AdminOp(_) => Self::AdminOp,
+            Command::StartMeasurements(_) => Self::StartMeasurements,
+            Command::StopMeasurements(_) => Self::StopMeasurements,
         }
     }
 
@@ -445,7 +504,11 @@ impl CommandKind {
             Self::SetFrontend => Some(PayloadKind::FrontendState),
             Self::SubscribeWaterfall => Some(PayloadKind::WaterfallSubscribed),
             Self::Ping => Some(PayloadKind::Pong),
-            Self::CloseChannel | Self::UnsubscribeWaterfall | Self::AdminOp => None,
+            Self::StartMeasurements => Some(PayloadKind::MeasurementsStarted),
+            Self::CloseChannel
+            | Self::UnsubscribeWaterfall
+            | Self::AdminOp
+            | Self::StopMeasurements => None,
         }
     }
 
@@ -469,6 +532,8 @@ impl CommandKind {
             Self::UnsubscribeWaterfall => "unsubscribe_waterfall",
             Self::Ping => "ping",
             Self::AdminOp => "admin_op",
+            Self::StartMeasurements => "start_measurements",
+            Self::StopMeasurements => "stop_measurements",
         }
     }
 }
@@ -494,17 +559,20 @@ pub enum PayloadKind {
     WaterfallSubscribed,
     /// `Pong`.
     Pong,
+    /// `MeasurementsStarted` (1.1).
+    MeasurementsStarted,
 }
 
 impl PayloadKind {
     /// Every payload type, in proto field order.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Capabilities,
         Self::ChannelOpened,
         Self::ChannelUpdated,
         Self::FrontendState,
         Self::WaterfallSubscribed,
         Self::Pong,
+        Self::MeasurementsStarted,
     ];
 
     /// The kind of a response payload.
@@ -517,6 +585,7 @@ impl PayloadKind {
             Payload::FrontendState(_) => Self::FrontendState,
             Payload::WaterfallSubscribed(_) => Self::WaterfallSubscribed,
             Payload::Pong(_) => Self::Pong,
+            Payload::MeasurementsStarted(_) => Self::MeasurementsStarted,
         }
     }
 }

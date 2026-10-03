@@ -15,6 +15,8 @@ mod cpu;
 #[cfg(test)]
 #[path = "../../backend-ka9q/tests/support/mod.rs"]
 mod fake_radiod;
+mod measure;
+mod measure_run;
 mod ogg;
 mod wfstream;
 
@@ -91,6 +93,9 @@ enum Cmd {
     Status(StatusArgs),
     /// Summarise a row stream written by `waterfall --out` (no radiod needed).
     Inspect(InspectArgs),
+    /// The noise-floor measurement spike.
+    #[command(subcommand)]
+    Measure(measure_run::MeasureCmd),
 }
 
 #[derive(Debug, Args)]
@@ -677,6 +682,16 @@ async fn run(cli: Cli) -> Result<()> {
         (Cmd::Audio(a), Some(c)) => run_audio(c, a).await?,
         (Cmd::Waterfall(w), Some(c)) => run_waterfall(c, w).await?,
         (Cmd::Status(s), Some(c)) => run_status(c, s).await?,
+        (Cmd::Measure(m), Some(c)) => match m {
+            measure_run::MeasureCmd::Hop(a) => {
+                measure_run::run_hop(c, a, radiod_pid.or(cli.radiod_pid)).await?
+            }
+            measure_run::MeasureCmd::Idle(a) => {
+                measure_run::run_idle(c, a, radiod_pid.or(cli.radiod_pid)).await?
+            }
+            measure_run::MeasureCmd::Rbw(a) => measure_run::run_rbw(c, a).await?,
+            measure_run::MeasureCmd::Hold(a) => measure_run::run_hold(c, a).await?,
+        },
         (_, None) => bail!("no radiod client"),
     };
     if let Some(c) = &client {
@@ -706,7 +721,7 @@ fn validate(cli: &Cli) -> Result<()> {
     match &cli.cmd {
         Cmd::Audio(a) => a.params().validate()?,
         Cmd::Waterfall(w) => w.params().validate(&cli.client_config())?,
-        Cmd::Status(_) | Cmd::Inspect(_) => {}
+        Cmd::Status(_) | Cmd::Inspect(_) | Cmd::Measure(_) => {}
     }
     cli.client_config().validate()?;
     if cli.status_addr.port() == 0 {

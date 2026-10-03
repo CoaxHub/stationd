@@ -16,6 +16,13 @@
 //! the requested rate (and, with the signal generator, the carrier is in
 //! the right bin); broadcast FM reports radiod's 48 kHz; health in
 //! `StationStatus`. Timings are printed as `E2E key=value` lines.
+//!
+//! With the signal generator, the station-conformance measurement scenarios
+//! also run against it (station protocol 1.1), on a measuring
+//! clock 10 times as fast (a minute in 6 s).
+//!
+//! `COAXHUB_E2E_STATUS_GROUP` overrides radiod's status group (default
+//! `239.77.0.6:5006`), for a radiod on groups of its own.
 
 // Static [credentials] and [backend] are development-only settings.
 #![cfg(not(feature = "packaged"))]
@@ -40,6 +47,13 @@ use station_proto::v1::station_message::Body;
 use station_proto::validate::WaterfallDecoder;
 
 const STATUS_GROUP: &str = "239.77.0.6:5006";
+
+fn status_group() -> std::net::SocketAddr {
+    std::env::var("COAXHUB_E2E_STATUS_GROUP")
+        .unwrap_or_else(|_| STATUS_GROUP.to_owned())
+        .parse()
+        .expect("COAXHUB_E2E_STATUS_GROUP is ip:port")
+}
 const SECS: u64 = 3;
 
 fn enabled() -> bool {
@@ -115,7 +129,7 @@ async fn stationd_with_a_real_radiod() {
         return;
     }
     let which = radiod();
-    let config = Ka9qConfig::new(STATUS_GROUP.parse().expect("addr"), None);
+    let config = Ka9qConfig::new(status_group(), None);
     let backend = Arc::new(Ka9qBackend::new(config).expect("backend"));
     let mut station = common::InProcess::with_backend(backend);
     let cfg = ScenarioConfig::fast();
@@ -347,5 +361,43 @@ async fn stationd_with_a_real_radiod() {
     .await;
     if let Err(e) = result {
         panic!("e2e against radiod ({which:?}): {e}");
+    }
+}
+
+/// The measurement scenarios of station-conformance against radiod on the
+/// signal generator: a plan, idle-duty reports for measuring minutes only, the
+/// duty following a listener, the stop on `SetFrontend`, one plan per
+/// connection, the local switch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn measurement_scenarios_with_a_real_radiod() {
+    if !enabled() || radiod() != Radiod::SigGen {
+        eprintln!("skipped: set COAXHUB_E2E=1 and run radiod on the signal generator");
+        return;
+    }
+    let cfg = ScenarioConfig {
+        measure_minute: Some(Duration::from_secs(6)),
+        ..ScenarioConfig::fast()
+    };
+    for name in [
+        "measures_when_asked",
+        "duty_follows_listeners",
+        "stops_measuring_on_frontend_change",
+        "one_plan_per_connection",
+        "refuses_measurements_when_disabled",
+    ] {
+        let scenario = station_conformance::scenarios::by_name(name).expect("scenario");
+        let config = Ka9qConfig::new(status_group(), None);
+        let backend = Arc::new(Ka9qBackend::new(config).expect("backend"));
+        let mut station = common::InProcess::with_backend(Arc::clone(&backend) as _);
+        station.measure_scale = 10;
+        let t = Instant::now();
+        if let Err(e) = (scenario.run)(&mut station, &cfg).await {
+            panic!("{name} against radiod: {e}");
+        }
+        println!("E2E measurement_{name}_s={:.1}", t.elapsed().as_secs_f64());
+        assert!(
+            backend.measurement_ids().is_empty(),
+            "{name}: a measurement channel was left open"
+        );
     }
 }

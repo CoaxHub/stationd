@@ -12,6 +12,12 @@
 //! | `SetFrontend` | `PERMISSION_DENIED` if `allow_frontend_control = false`, else the backend |
 //! | `OpenChannel` / `SubscribeWaterfall` | `ALREADY_EXISTS` / `RESOURCE_EXHAUSTED` (local caps) checked here, then the backend |
 //! | `UpdateChannel` / `CloseChannel` / `UnsubscribeWaterfall` | `NOT_FOUND` unless open on this connection, then the backend |
+//! | `StartMeasurements` (1.1) | `PERMISSION_DENIED` if `[measurements] enabled = false`, `UNSUPPORTED` without measuring, `ALREADY_EXISTS` while a plan runs, else the plan as it will run ([`crate::measure`]) |
+//! | `StopMeasurements` (1.1) | `OK`, or `NOT_FOUND` for a plan that isn't running |
+//!
+//! An accepted `SetFrontend` stops the running plan first
+//! (`Event{MEASUREMENT_STOPPED}`): a measurement never straddles a change of
+//! settings.
 //!
 //! Channels and subscriptions belong to one connection ([`Tables`], §2.3).
 
@@ -25,6 +31,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::config::LocalPolicy;
+use crate::measure::{self, Measurer, StopReason};
 
 use v1::request::Command;
 use v1::response::Payload;
@@ -112,6 +119,9 @@ pub struct RequestContext {
     pub minor: u32,
     /// The connection's channel and subscription tables.
     pub tables: Arc<Mutex<Tables>>,
+    /// The connection's measurement plan (1.1); `None`: the station doesn't
+    /// measure on this connection.
+    pub measurer: Option<Arc<Measurer>>,
 }
 
 impl std::fmt::Debug for RequestContext {
@@ -225,6 +235,8 @@ pub fn effective_capabilities(
     }
     caps.allowed_admin_ops = policy.allowed_admin_ops.iter().map(|k| *k as i32).collect();
     caps.frontend_control_allowed = policy.allow_frontend_control;
+    // The station's own claim, never the backend's (see `get_capabilities`).
+    caps.measurements = None;
     caps.sdr_model = truncate_utf8(&caps.sdr_model, limits::MAX_SDR_MODEL_BYTES);
     if let Some(f) = caps.frontend.as_mut() {
         f.antenna_ports.truncate(limits::MAX_ANTENNA_PORTS);
@@ -283,18 +295,58 @@ async fn answer(ctx: &RequestContext, req: v1::Request) -> (v1::Response, Option
         Command::CloseChannel(c) => (close_channel(ctx, id, c.channel_id).await, None),
         Command::SubscribeWaterfall(s) => subscribe(ctx, id, s).await,
         Command::UnsubscribeWaterfall(u) => (unsubscribe(ctx, id, u.subscription_id).await, None),
+        Command::StartMeasurements(m) => (start_measurements(ctx, id, m).await, None),
+        Command::StopMeasurements(m) => (stop_measurements(ctx, id, m.measurement_id), None),
+    }
+}
+
+async fn start_measurements(
+    ctx: &RequestContext,
+    id: u64,
+    req: v1::StartMeasurements,
+) -> v1::Response {
+    let Some(measurer) = &ctx.measurer else {
+        return error(
+            id,
+            v1::ResultCode::Unsupported,
+            "this station does not measure",
+        );
+    };
+    match measurer.start(req).await {
+        Ok(started) => ok(id, Some(Payload::MeasurementsStarted(started))),
+        Err(refusal) => error(id, refusal.code, &refusal.message),
+    }
+}
+
+fn stop_measurements(ctx: &RequestContext, id: u64, measurement_id: u32) -> v1::Response {
+    if ctx
+        .measurer
+        .as_ref()
+        .is_some_and(|m| m.stop(measurement_id))
+    {
+        ok(id, None)
+    } else {
+        error(
+            id,
+            v1::ResultCode::NotFound,
+            &format!("measurement {measurement_id} is not running"),
+        )
     }
 }
 
 async fn get_capabilities(ctx: &RequestContext, id: u64) -> v1::Response {
     match ctx.backend.capabilities().await {
-        Ok(caps) => ok(
-            id,
-            Some(Payload::Capabilities(effective_capabilities(
-                &caps,
-                &ctx.policy,
-            ))),
-        ),
+        Ok(caps) => {
+            let mut caps = effective_capabilities(&caps, &ctx.policy);
+            // 1.1: what the station's measuring accepts.
+            if ctx.minor >= limits::MEASUREMENTS_MINOR {
+                caps.measurements = measure::limits_for(
+                    ctx.measurer.is_some() && ctx.backend.can_measure(),
+                    ctx.policy.measurements,
+                );
+            }
+            ok(id, Some(Payload::Capabilities(caps)))
+        }
         Err(e) => backend_error(id, &e),
     }
 }
@@ -332,7 +384,12 @@ async fn set_frontend(ctx: &RequestContext, id: u64, req: v1::SetFrontend) -> v1
         );
     }
     match ctx.backend.set_frontend(req).await {
-        Ok(state) => ok(id, Some(Payload::FrontendState(state))),
+        Ok(state) => {
+            if let Some(m) = &ctx.measurer {
+                m.stop_for(StopReason::FrontendChanged);
+            }
+            ok(id, Some(Payload::FrontendState(state)))
+        }
         Err(e) => backend_error(id, &e),
     }
 }
@@ -572,6 +629,7 @@ mod tests {
             policy: Arc::new(policy),
             minor: 0,
             tables: Arc::default(),
+            measurer: None,
         }
     }
 
@@ -632,6 +690,7 @@ mod tests {
             allowed_admin_ops: vec![v1::AdminOpKind::Update],
             max_channels: 4,
             max_waterfall_subscriptions: 1,
+            measurements: true,
         };
         let caps = effective_capabilities(&backend, &policy);
         assert_eq!(caps.max_channels, 4);
@@ -938,6 +997,7 @@ mod tests {
             policy: Arc::new(LocalPolicy::default()),
             minor: 0,
             tables: Arc::default(),
+            measurer: None,
         };
         assert_eq!(c.backend.info(), inner.info());
         let opening = tokio::spawn({

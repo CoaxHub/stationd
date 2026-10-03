@@ -4,7 +4,8 @@
 //! One bounded queue, two priority classes:
 //!
 //! - **high:** `Hello`, responses, events, audio frames;
-//! - **low:** waterfall rows, `ChannelSignal`, `StationStatus`.
+//! - **low:** waterfall rows, `ChannelSignal`, `StationStatus`, and
+//!   measurement reports (`NoiseFloorReport`, protocol 1.1).
 //!
 //! High is always sent first; within a class, oldest first. "The queue
 //! exceeds 250 ms of data" is measured as queueing delay (how long an item
@@ -15,7 +16,10 @@
 //! 2. audio frames are dropped only after waiting more than 1 s;
 //! 3. only the latest `StationStatus` is kept (a newer one replaces a queued
 //!    one: it supersedes it);
-//! 4. responses, `Hello` and events are never dropped by age. Responses are
+//! 4. measurement reports are dropped once they waited more than 10 s
+//!    (the measurement design §4), counted in `measurement_reports_dropped_total`;
+//!    measurement events (duty, stopped) are events, never dropped for age;
+//! 5. responses, `Hello` and events are never dropped by age. Responses are
 //!    bounded by the protocol (≤ 32 outstanding requests, §4); events are
 //!    capped at [`QueueLimits::max_events`] (new events beyond that are
 //!    dropped and counted).
@@ -54,6 +58,10 @@ pub struct QueueLimits {
     pub max_signals: usize,
     /// Most events queued (newer events dropped beyond).
     pub max_events: usize,
+    /// Measurement reports older than this are dropped (§6.3: 10 s).
+    pub measurement_max_age: Duration,
+    /// Most measurement reports queued (oldest dropped beyond).
+    pub max_measurements: usize,
 }
 
 impl Default for QueueLimits {
@@ -66,6 +74,9 @@ impl Default for QueueLimits {
             max_waterfall: 256,
             max_signals: 64,
             max_events: 256,
+            measurement_max_age: limits::QUEUE_MEASUREMENT_DROP_AFTER,
+            // A report a minute: a few cover any stall shorter than the age limit.
+            max_measurements: 8,
         }
     }
 }
@@ -77,6 +88,7 @@ pub struct DropCounters {
     waterfall: AtomicU64,
     signals: AtomicU64,
     events: AtomicU64,
+    measurements: AtomicU64,
 }
 
 impl DropCounters {
@@ -100,6 +112,11 @@ impl DropCounters {
         self.events.load(Ordering::Relaxed)
     }
 
+    /// Measurement reports dropped (older than 10 s, or over the cap).
+    pub fn measurements(&self) -> u64 {
+        self.measurements.load(Ordering::Relaxed)
+    }
+
     fn add(counter: &AtomicU64, n: usize) {
         if n > 0 {
             counter.fetch_add(u64::try_from(n).unwrap_or(u64::MAX), Ordering::Relaxed);
@@ -121,6 +138,8 @@ pub enum Class {
     Signal,
     /// `StationStatus`.
     Status,
+    /// `NoiseFloorReport` (1.1).
+    Measurement,
 }
 
 impl Class {
@@ -131,6 +150,7 @@ impl Class {
             Some(Body::Waterfall(_)) => Self::Waterfall,
             Some(Body::Signal(_)) => Self::Signal,
             Some(Body::Status(_)) => Self::Status,
+            Some(Body::Noise(_)) => Self::Measurement,
             Some(Body::Hello(_) | Body::Response(_) | Body::Event(_)) | None => Self::Control,
         }
     }
@@ -158,6 +178,7 @@ pub struct OutboundQueue {
     audio: VecDeque<Entry>,
     waterfall: VecDeque<Entry>,
     signals: VecDeque<Entry>,
+    measurements: VecDeque<Entry>,
     status: Option<Entry>,
     closed: bool,
 }
@@ -173,6 +194,7 @@ impl OutboundQueue {
             audio: VecDeque::new(),
             waterfall: VecDeque::new(),
             signals: VecDeque::new(),
+            measurements: VecDeque::new(),
             status: None,
             closed: false,
         }
@@ -184,6 +206,7 @@ impl OutboundQueue {
             + self.audio.len()
             + self.waterfall.len()
             + self.signals.len()
+            + self.measurements.len()
             + usize::from(self.status.is_some())
     }
 
@@ -250,6 +273,12 @@ impl OutboundQueue {
                 &self.drops.signals,
             ),
             Class::Status => self.status = Some(entry),
+            Class::Measurement => bounded_push(
+                &mut self.measurements,
+                entry,
+                self.limits.max_measurements,
+                &self.drops.measurements,
+            ),
         }
         self.expire(now);
         true
@@ -264,6 +293,8 @@ impl OutboundQueue {
         DropCounters::add(&self.drops.signals, n);
         let n = drop_older(&mut self.audio, now, self.limits.audio_max_age);
         DropCounters::add(&self.drops.audio, n);
+        let n = drop_older(&mut self.measurements, now, self.limits.measurement_max_age);
+        DropCounters::add(&self.drops.measurements, n);
     }
 
     /// The next message to send at `now`, after applying the age rules.
@@ -274,15 +305,24 @@ impl OutboundQueue {
             return Some(entry.msg);
         }
         let status_seq = self.status.as_ref().map(|e| e.seq);
-        let low_seq = [self.waterfall.front(), self.signals.front()]
-            .into_iter()
-            .flatten()
-            .map(|e| e.seq)
-            .min();
+        let low_seq = [
+            self.waterfall.front(),
+            self.signals.front(),
+            self.measurements.front(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|e| e.seq)
+        .min();
         match (status_seq, low_seq) {
             (Some(s), Some(l)) if s < l => self.status.take().map(|e| e.msg),
             (Some(_), None) => self.status.take().map(|e| e.msg),
-            _ => oldest(&mut [&mut self.waterfall, &mut self.signals]).map(|e| e.msg),
+            _ => oldest(&mut [
+                &mut self.waterfall,
+                &mut self.signals,
+                &mut self.measurements,
+            ])
+            .map(|e| e.msg),
         }
     }
 }
@@ -471,6 +511,7 @@ mod tests {
             Some(Body::Status(s)) => format!("s{}", s.uptime_s),
             Some(Body::Signal(_)) => "g".into(),
             Some(Body::Hello(_)) => "h".into(),
+            Some(Body::Noise(n)) => format!("n{}", n.window_start_unix_ms),
             None => "-".into(),
         }
     }
@@ -547,6 +588,39 @@ mod tests {
         assert_eq!(out, ["r1", "s1"]);
         assert_eq!(drops.waterfall(), 2);
         assert_eq!(drops.audio(), 1);
+    }
+
+    fn noise(minute: i64) -> v1::StationMessage {
+        v1::StationMessage {
+            body: Some(Body::Noise(v1::NoiseFloorReport {
+                window_start_unix_ms: minute,
+                ..Default::default()
+            })),
+        }
+    }
+
+    #[test]
+    fn measurement_reports_are_low_priority_and_age_after_10s() {
+        let (mut q, drops) = queue();
+        let t0 = Instant::now();
+        assert_eq!(Class::of(&noise(0)), Class::Measurement);
+        assert!(!Class::Measurement.is_high());
+        q.push(noise(1), t0);
+        q.push(audio(1), t0);
+        q.push(row(1), t0);
+        q.push(event("duty"), t0);
+        assert_eq!(drain(&mut q, t0), ["a1", "eduty", "n1", "w1"]);
+        q.push(noise(2), t0);
+        q.push(event("duty"), t0);
+        let out = drain(&mut q, t0 + Duration::from_secs(11));
+        assert_eq!(out, ["eduty"]);
+        assert_eq!(drops.measurements(), 1);
+        // Bounded in count too.
+        for m in 0..20 {
+            q.push(noise(m), t0);
+        }
+        assert_eq!(q.len(), 8);
+        assert_eq!(drops.measurements(), 13);
     }
 
     #[test]

@@ -5,7 +5,8 @@
 //! shutdown is requested.
 //!
 //! On any end, every channel and subscription of the connection is closed
-//! in the backend (§2.3): nothing survives into the next connection.
+//! in the backend (§2.3), and its measurement plan stops: nothing survives
+//! into the next connection, and nothing measured is buffered for it.
 
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
@@ -23,7 +24,8 @@ use tonic::transport::{Endpoint, Uri};
 use tracing::{debug, error, info, warn};
 
 use crate::daemon::{ConnectionState, Ctx, Link};
-use crate::dispatch::{self, Media, RequestContext, truncate_utf8};
+use crate::dispatch::{self, Media, RequestContext, Tables, truncate_utf8};
+use crate::measure::{self, MeasureDeps, Measurer, StopReason};
 use crate::outbound::Outbound;
 use crate::renew::Signal;
 use crate::status;
@@ -167,6 +169,19 @@ pub(crate) async fn run(
         0 => limits::DEFAULT_STATUS_INTERVAL,
         ms => Duration::from_millis(u64::from(ms)),
     };
+    let tables: Arc<std::sync::Mutex<Tables>> = Arc::default();
+    let measurer = (version.minor >= limits::MEASUREMENTS_MINOR).then(|| {
+        Measurer::new(MeasureDeps {
+            backend: Arc::clone(&ctx.backend),
+            outbound: Arc::clone(&outbound),
+            tables: Arc::clone(&tables),
+            drops: Arc::clone(&ctx.drops),
+            clock: Arc::clone(&ctx.measure_clock),
+            host: Arc::new(status::host_health),
+            clock_state: Arc::new(measure::clock::clock_state),
+            enabled: ctx.policy.measurements,
+        })
+    });
     let session = Session {
         ctx: Arc::clone(ctx),
         outbound,
@@ -174,7 +189,8 @@ pub(crate) async fn run(
             backend: Arc::clone(&ctx.backend),
             policy: Arc::clone(&ctx.policy),
             minor: version.minor,
-            tables: Arc::default(),
+            tables,
+            measurer,
         },
     };
     let end = session
@@ -342,12 +358,24 @@ impl Session {
                 active_subscriptions: u32::try_from(subscriptions).unwrap_or(u32::MAX),
                 audio_frames_dropped_total: self.ctx.drops.audio(),
                 waterfall_rows_dropped_total: self.ctx.drops.waterfall(),
+                measurement_reports_dropped_total: self.ctx.drops.measurements(),
             },
         )
     }
 
     fn forward_event(&self, mut event: v1::Event) {
         use v1::event::Kind;
+        // A measurement never straddles a change of settings or coverage: the
+        // plan stops first, so the hub sees MEASUREMENT_STOPPED before the
+        // event that made it stop.
+        let stop = match Kind::try_from(event.kind) {
+            Ok(Kind::FrontendChanged) => Some(StopReason::FrontendChanged),
+            Ok(Kind::BackendRestarted) => Some(StopReason::BackendRestarted),
+            _ => None,
+        };
+        if let (Some(reason), Some(m)) = (stop, &self.requests.measurer) {
+            m.stop_for(reason);
+        }
         {
             let mut t = self
                 .requests
@@ -382,9 +410,7 @@ impl Session {
         info!("shutting down: notifying the hub");
         self.outbound.push_body(Body::Event(v1::Event {
             kind: v1::event::Kind::ShuttingDown as i32,
-            channel_id: None,
-            subscription_id: None,
-            detail: String::new(),
+            ..Default::default()
         }));
         self.outbound.close();
         let drained = tokio::time::timeout(self.ctx.shutdown_grace, async {
@@ -410,8 +436,12 @@ impl Session {
         }
     }
 
-    /// §2.3: closes every channel and subscription of this connection.
+    /// §2.3: closes every channel and subscription of this connection, and
+    /// stops its plan.
     async fn close_all(&self) {
+        if let Some(m) = &self.requests.measurer {
+            m.shutdown();
+        }
         let (channels, subscriptions) = self
             .requests
             .tables

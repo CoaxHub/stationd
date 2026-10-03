@@ -19,6 +19,7 @@ package coaxhub.station.v1;
 
 import "coaxhub/station/v1/common.proto";
 import "coaxhub/station/v1/control.proto";
+import "coaxhub/station/v1/measure.proto";
 import "coaxhub/station/v1/media.proto";
 import "coaxhub/station/v1/status.proto";
 
@@ -98,6 +99,9 @@ message Request {
     UnsubscribeWaterfall unsubscribe_waterfall = 16;
     Ping ping = 17;
     AdminOp admin_op = 18;
+    // Protocol 1.1 (measure.proto).
+    StartMeasurements start_measurements = 19;
+    StopMeasurements stop_measurements = 20;
   }
 }
 
@@ -112,7 +116,10 @@ message StationMessage {
     ChannelSignal signal = 5;
     StationStatus status = 6;
     Event event = 7;
+    // Protocol 1.1 (measure.proto).
+    NoiseFloorReport noise = 8;
   }
+  reserved 9;  // a later minor version
 }
 
 // First message on every stream.
@@ -150,5 +157,7 @@ message Response {
     FrontendState frontend_state = 14;
     WaterfallSubscribed waterfall_subscribed = 15;
     Pong pong = 17;
+    // Protocol 1.1 (measure.proto).
+    MeasurementsStarted measurements_started = 19;
   }
 }

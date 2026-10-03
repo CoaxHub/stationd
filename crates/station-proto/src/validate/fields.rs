@@ -4,8 +4,9 @@
 
 use prost::Message as _;
 
-use super::ViolationKind;
 use super::capabilities::sanitize_capabilities;
+use super::measure::{check_measurements_started, check_noise_report};
+use super::{MessageKind, ViolationKind};
 use crate::limits;
 use crate::v1;
 
@@ -46,6 +47,15 @@ pub fn check_message(msg: &v1::StationMessage, minor: u32) -> Result<(), Violati
         Some(Body::Signal(s)) => check_signal(s),
         Some(Body::Status(s)) => check_status(s, minor),
         Some(Body::Event(e)) => check_event(e, minor),
+        Some(Body::Noise(n)) => {
+            if minor < limits::MEASUREMENTS_MINOR {
+                return Err(ViolationKind::MessageNotInMinor {
+                    kind: MessageKind::Noise,
+                    minor,
+                });
+            }
+            check_noise_report(n)
+        }
     }
 }
 
@@ -92,6 +102,7 @@ fn check_response(r: &v1::Response, minor: u32) -> Result<(), ViolationKind> {
         Some(Payload::ChannelUpdated(c)) => check_channel_updated(c, minor),
         Some(Payload::FrontendState(f)) => check_frontend_state(f),
         Some(Payload::WaterfallSubscribed(w)) => check_waterfall_subscribed(w, minor),
+        Some(Payload::MeasurementsStarted(m)) => check_measurements_started(m, minor),
     }
 }
 
@@ -125,7 +136,7 @@ fn check_channel_updated(c: &v1::ChannelUpdated, minor: u32) -> Result<(), Viola
     check_cuts("channel_updated.low_cut_hz", c.low_cut_hz, c.high_cut_hz)
 }
 
-fn check_frontend_state(f: &v1::FrontendState) -> Result<(), ViolationKind> {
+pub(crate) fn check_frontend_state(f: &v1::FrontendState) -> Result<(), ViolationKind> {
     check_finite("frontend_state.gain_db", f.gain_db)?;
     check_finite("frontend_state.attenuation_db", f.attenuation_db)?;
     check_len(
@@ -227,6 +238,30 @@ fn check_event(e: &v1::Event, minor: u32) -> Result<(), ViolationKind> {
     if e.kind == v1::event::Kind::SubscriptionClosed as i32 && e.subscription_id.is_none() {
         return Err(missing("event.subscription_id"));
     }
+    // 1.1 fields: unknown to a 1.0 session, which ignores them (§3).
+    if minor < limits::MEASUREMENTS_MINOR {
+        return Ok(());
+    }
+    if let Some(d) = e.measurement_duty {
+        check_enum::<v1::MeasurementDuty>("event.measurement_duty", d, minor, true)?;
+    }
+    if let Some(r) = e.measurement_stop_reason {
+        check_enum::<v1::MeasurementStopReason>("event.measurement_stop_reason", r, minor, true)?;
+    }
+    if e.kind == v1::event::Kind::MeasurementStopped as i32 && e.measurement_id.is_none() {
+        return Err(missing("event.measurement_id"));
+    }
+    if e.kind == v1::event::Kind::MeasurementDuty as i32 {
+        if e.measurement_id.is_none() {
+            return Err(missing("event.measurement_id"));
+        }
+        if e.measurement_duty.is_none() {
+            return Err(missing("event.measurement_duty"));
+        }
+        if e.effective_unix_ms.is_none() {
+            return Err(missing("event.effective_unix_ms"));
+        }
+    }
     Ok(())
 }
 
@@ -285,12 +320,21 @@ pub(crate) fn check_range(
     Ok(())
 }
 
-/// The minor in which an enum value was introduced. Every value of v1.0 was
-/// introduced in minor 0. When a later minor adds a value, gate it here by
-/// `(field, value)`, so a session negotiated at a lower minor rejects it (§3,
-/// §5 Enums).
-fn introduced_in_minor(_field: &'static str, _value: i32) -> u32 {
-    0
+/// The minor in which an enum value was introduced, gated by `(field,
+/// value)`, so a session negotiated at a lower minor rejects it (§3, §5
+/// Enums). Every value of v1.0 was introduced in minor 0; minor 1 added the
+/// measurement events and enums (measure.proto).
+fn introduced_in_minor(field: &'static str, value: i32) -> u32 {
+    use v1::event::Kind;
+    let measurement_kind =
+        value == Kind::MeasurementStopped as i32 || value == Kind::MeasurementDuty as i32;
+    match field {
+        "event.kind" if measurement_kind => limits::MEASUREMENTS_MINOR,
+        "event.measurement_duty"
+        | "event.measurement_stop_reason"
+        | "measurements_started.duty" => limits::MEASUREMENTS_MINOR,
+        _ => 0,
+    }
 }
 
 /// §5 Enums: `value` must be known in the negotiated `minor`, and must not be

@@ -48,7 +48,16 @@ async fn run(name: &str) {
     let scenario = scenarios::by_name(name).expect("known scenario");
     let (fake, backend) = radiod().await;
     let mut station = common::InProcess::with_backend(backend);
-    let cfg = ScenarioConfig::fast();
+    let cfg = ScenarioConfig {
+        // Each poll is a round trip to the fake radiod in real time, which the
+        // measuring clock, 60 times as fast, outruns once a listener's audio flows
+        // too: the scenarios that wait for reports are left to the fake backend
+        // (conformance.rs) and to the run against radiod on the signal generator;
+        // the ka9q measurement channel has its own tests (backend-ka9q
+        // tests/backend.rs).
+        measure_minute: None,
+        ..ScenarioConfig::fast()
+    };
     if let Err(e) = (scenario.run)(&mut station, &cfg).await {
         panic!("{name} with the ka9q backend: {e}");
     }
@@ -94,6 +103,11 @@ conformance!(
     opens_channel_and_streams_audio,
     subscribes_waterfall_and_streams_rows,
     drops_channels_on_disconnect,
+    measures_when_asked,
+    duty_follows_listeners,
+    stops_measuring_on_frontend_change,
+    one_plan_per_connection,
+    refuses_measurements_when_disabled,
 );
 
 fn ok(r: &v1::Response) -> bool {

@@ -40,10 +40,20 @@ pub fn hello() -> v1::StationMessage {
     msg(Body::Hello(hello_with(1, 0)))
 }
 
-/// A session that accepted `Hello` at `t0`.
+/// A session that accepted `Hello` at `t0` (protocol 1.0).
 pub fn established(t0: Instant) -> Session {
     let mut s = Session::new(t0);
     assert_eq!(s.check(&hello(), t0), Verdict::Accept);
+    s
+}
+
+/// A session that accepted a 1.1 `Hello` at `t0` (measurements).
+pub fn established_1_1(t0: Instant) -> Session {
+    let mut s = Session::new(t0);
+    assert_eq!(
+        s.check(&msg(Body::Hello(hello_with(1, 1))), t0),
+        Verdict::Accept
+    );
     s
 }
 
@@ -142,6 +152,7 @@ pub fn capabilities() -> v1::Capabilities {
         allowed_admin_ops: vec![1],
         frontend_control_allowed: true,
         sdr_model: "RTL-SDR Blog V4".into(),
+        measurements: None,
     }
 }
 
@@ -269,6 +280,7 @@ pub fn event(
         channel_id,
         subscription_id,
         detail: String::new(),
+        ..Default::default()
     }))
 }
 
@@ -303,4 +315,125 @@ pub fn with_subscription(t0: Instant, id: u32, bins: u32, row_interval_ms: u32) 
 
 pub fn is_violation(v: &Verdict) -> bool {
     matches!(v, Verdict::Violation(_))
+}
+
+// ------------------------------------------------------------------ measurements (1.1)
+
+/// 40 m as one band (id 1, two pieces around a DC guard) and 20 m (id 2).
+pub fn start_measurements(measurement_id: u32) -> Command {
+    Command::StartMeasurements(v1::StartMeasurements {
+        measurement_id,
+        noise_bands: vec![
+            v1::NoiseBand {
+                band_id: 1,
+                ranges: vec![range(7_000_000, 7_098_000), range(7_102_000, 7_300_000)],
+                key: "40m".into(),
+            },
+            v1::NoiseBand {
+                band_id: 2,
+                ranges: vec![range(14_000_000, 14_350_000)],
+                key: "20m".into(),
+            },
+        ],
+        noise_interval_ms: 60_000,
+        bin_count: 1024,
+        resolution_bw_hz: 500.0,
+        dwell_ms: 4000,
+        poll_interval_ms: 500,
+    })
+}
+
+/// Accepts band 1 of [`start_measurements`] only, under idle duty.
+pub fn measurements_started(measurement_id: u32) -> Payload {
+    Payload::MeasurementsStarted(v1::MeasurementsStarted {
+        measurement_id,
+        noise_bands: vec![v1::NoiseBand {
+            band_id: 1,
+            ranges: vec![range(7_000_000, 7_098_000), range(7_102_000, 7_300_000)],
+            key: "40m".into(),
+        }],
+        noise_interval_ms: 60_000,
+        duty: v1::MeasurementDuty::Idle as i32,
+        frontend: Some(v1::FrontendState {
+            gain_db: 20.0,
+            center_frequency_hz: 7_100_000,
+            tunable_range: Some(range(6_076_000, 8_124_000)),
+            ..Default::default()
+        }),
+        method_version: 1,
+    })
+}
+
+/// A valid report for band 1 of measurement `measurement_id`, window at
+/// `window_start_unix_ms`.
+pub fn noise(measurement_id: u32, window_start_unix_ms: i64) -> v1::StationMessage {
+    msg(Body::Noise(v1::NoiseFloorReport {
+        measurement_id,
+        window_start_unix_ms,
+        window_ms: 60_000,
+        frontend: Some(v1::FrontendState {
+            gain_db: 20.0,
+            center_frequency_hz: 7_100_000,
+            tunable_range: Some(range(6_076_000, 8_124_000)),
+            ..Default::default()
+        }),
+        overloads: 0,
+        clock: Some(v1::ClockState {
+            synchronized: true,
+            max_error_ms: 5,
+        }),
+        bands: vec![v1::BandNoise {
+            band_id: 1,
+            measured: Some(range(7_000_000, 7_300_000)),
+            resolution_bw_hz: 500.0,
+            samples: 72_000,
+            p10_db_hz: -132.5,
+            p25_db_hz: -131.0,
+            p50_db_hz: -129.9,
+            p90_db_hz: -110.0,
+        }],
+        partial: false,
+        cycle_minutes: 1,
+        cycle_index: 0,
+    }))
+}
+
+/// `Event{MEASUREMENT_DUTY}` for `measurement_id`.
+pub fn duty_event(
+    measurement_id: u32,
+    duty: v1::MeasurementDuty,
+    effective_unix_ms: i64,
+) -> v1::StationMessage {
+    msg(Body::Event(v1::Event {
+        kind: v1::event::Kind::MeasurementDuty as i32,
+        measurement_id: Some(measurement_id),
+        measurement_duty: Some(duty as i32),
+        effective_unix_ms: Some(effective_unix_ms),
+        ..Default::default()
+    }))
+}
+
+/// `Event{MEASUREMENT_STOPPED}` for `measurement_id`.
+pub fn stopped_event(measurement_id: u32) -> v1::StationMessage {
+    msg(Body::Event(v1::Event {
+        kind: v1::event::Kind::MeasurementStopped as i32,
+        measurement_id: Some(measurement_id),
+        measurement_stop_reason: Some(v1::MeasurementStopReason::FrontendChanged as i32),
+        ..Default::default()
+    }))
+}
+
+/// A 1.1 session with plan `measurement_id` started (request 1) and accepted.
+pub fn with_plan(t0: Instant, measurement_id: u32) -> Session {
+    let mut s = established_1_1(t0);
+    s.on_request_sent(&request(1, start_measurements(measurement_id)), t0)
+        .expect("request");
+    assert_eq!(
+        s.check(
+            &response(1, OK, Some(measurements_started(measurement_id))),
+            t0
+        ),
+        Verdict::Accept
+    );
+    s
 }

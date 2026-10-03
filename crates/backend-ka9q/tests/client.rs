@@ -21,7 +21,7 @@ use backend_ka9q::client::{
 };
 use backend_ka9q::command::Command;
 use backend_ka9q::spectrum::{DEFAULT_QUANTIZATION, requantize};
-use backend_ka9q::tags::{PktType, StatusType};
+use backend_ka9q::tags::{DemodType, PktType, StatusType};
 use backend_ka9q::tlv::Encoder;
 use support::{FakeRadiod, fake_scale};
 
@@ -537,6 +537,109 @@ async fn lost_spectrum_channel_is_recreated() {
     while sp.try_recv().is_some() {}
     let f = sp.recv().await.unwrap();
     assert_eq!(f.bins.len(), 256);
+    fake.assert_client_contract();
+}
+
+#[tokio::test(start_paused = true)]
+async fn polled_spectrum_polls_retunes_and_closes_one_command_at_a_time() {
+    let (fake, client) = setup().await;
+    let params = SpectrumParams::new(7.15e6, 1024, 500.0);
+    let (mut sp, created) = client.open_polled_spectrum(params.clone()).await.unwrap();
+    let ssrc = sp.ssrc();
+    // The create reply has no bin data (radiod-notes §6) but has the front end.
+    assert!(created.frame.is_none());
+    assert_eq!(created.status.demod_type, Some(DemodType::Spect2));
+    let start_samples = created.status.input_samples.unwrap();
+    assert_eq!(created.status.filter_blocksize, Some(480_000));
+    assert_eq!(created.status.filter_fir_length, Some(120_001));
+    assert_eq!(sp.params(), &params);
+    // Nothing polls in the background.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(fake.channel(ssrc).unwrap().cmd_cnt, 1);
+
+    let r = sp.poll().await.unwrap();
+    let f = r.frame.unwrap();
+    assert_eq!(
+        (f.bins.len(), f.center_hz, f.bin_width_hz),
+        (1024, 7.15e6, 500.0)
+    );
+    assert!(r.status.input_samples.unwrap() > start_samples);
+
+    // A retune moves the window in place; its own reply already carries a
+    // spectrum at the new frequency.
+    let r = sp.retune(6.6e6).await.unwrap();
+    assert_eq!(sp.ssrc(), ssrc);
+    assert_eq!(r.frame.unwrap().center_hz, 6.6e6);
+    assert_eq!(fake.channel(ssrc).unwrap().frequency, 6.6e6);
+    assert_eq!(sp.poll().await.unwrap().frame.unwrap().center_hz, 6.6e6);
+
+    // RESOLUTION_BW with the same bin count, in place.
+    let r = sp.set_resolution_bw(1000.0).await.unwrap();
+    assert_eq!(r.frame.unwrap().bin_width_hz, 1000.0);
+    assert_eq!(sp.params().resolution_bw_hz, 1000.0);
+    assert_eq!(fake.channel(ssrc).unwrap().bin_count, 1024);
+
+    // Invalid changes are refused locally and change nothing.
+    assert!(matches!(
+        sp.retune(f64::NAN).await.unwrap_err(),
+        ClientError::InvalidParams(_)
+    ));
+    assert!(matches!(
+        sp.set_resolution_bw(0.0).await.unwrap_err(),
+        ClientError::InvalidParams(_)
+    ));
+    assert_eq!(sp.params().center_hz, 6.6e6);
+
+    // A frequency radiod does not apply is reported.
+    fake.state().ignore_frequency = true;
+    assert!(matches!(
+        sp.retune(7.0e6).await.unwrap_err(),
+        ClientError::Rejected { .. }
+    ));
+    fake.state().ignore_frequency = false;
+    assert_eq!(sp.params().center_hz, 6.6e6);
+
+    sp.close().await.unwrap();
+    assert!(
+        fake.wait_until(Duration::from_millis(100), |s| !s
+            .channels
+            .contains_key(&ssrc))
+            .await
+    );
+    fake.assert_client_contract();
+}
+
+#[tokio::test(start_paused = true)]
+async fn polled_spectrum_is_recreated_after_expiry_and_destroyed_on_drop() {
+    let (fake, client) = setup().await;
+    let (mut sp, _) = client
+        .open_polled_spectrum(SpectrumParams::new(10e6, 256, 1000.0))
+        .await
+        .unwrap();
+    let ssrc = sp.ssrc();
+    sp.poll().await.unwrap();
+    fake.expire(ssrc);
+    // The poll re-creates a template channel; the client re-sends the create.
+    let r = sp.poll().await.unwrap();
+    assert!(r.frame.is_none());
+    assert_eq!(sp.recreations(), 1);
+    let fc = fake.channel(ssrc).unwrap();
+    assert_eq!((fc.demod, fc.bin_count, fc.frequency), (4, 256, 10e6));
+    assert_eq!(sp.poll().await.unwrap().frame.unwrap().bins.len(), 256);
+
+    // Unrefreshed, the channel expires after its lifetime.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(!fake.has_channel(ssrc));
+    sp.poll().await.unwrap();
+    assert_eq!(sp.recreations(), 2);
+
+    drop(sp);
+    assert!(
+        fake.wait_until(Duration::from_millis(100), |s| !s
+            .channels
+            .contains_key(&ssrc))
+            .await
+    );
     fake.assert_client_contract();
 }
 

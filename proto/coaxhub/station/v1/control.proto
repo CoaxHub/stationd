@@ -34,6 +34,22 @@ message Capabilities {
   bool frontend_control_allowed = 10;
   // Informational, untrusted, at most 64 bytes: e.g. "RTL-SDR Blog V4".
   string sdr_model = 11;
+  // Protocol 1.1: the station can measure (measure.proto). Absent: it can't,
+  // and the hub sends it no plan.
+  MeasurementLimits measurements = 12;
+}
+
+// What the station's measuring accepts (protocol 1.1, measure.proto).
+message MeasurementLimits {
+  // [measurements] enabled in stationd.toml: the owner's local switch. When
+  // false the station refuses every plan (PERMISSION_DENIED) and the hub
+  // sends none.
+  bool enabled = 1;
+  // The most noise bands the station accepts in a plan; the hub clamps it to 32.
+  uint32 max_noise_bands = 2;
+  reserved 3, 4;  // a later minor version
+  // The measurement method the station runs (MeasurementsStarted.method_version).
+  uint32 method_version = 5;
 }
 
 message WaterfallLimits {

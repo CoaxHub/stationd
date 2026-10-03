@@ -44,6 +44,8 @@ pub struct Counters {
     pub audio_frames_dropped_total: u64,
     /// Waterfall rows dropped by the outbound queue since start.
     pub waterfall_rows_dropped_total: u64,
+    /// Measurement reports dropped by the outbound queue since start.
+    pub measurement_reports_dropped_total: u64,
 }
 
 /// A `StationStatus` from backend health, host metrics and counters.
@@ -66,6 +68,7 @@ pub fn station_status(health: &Health, host: v1::HostHealth, c: Counters) -> v1:
         active_subscriptions: c.active_subscriptions,
         audio_frames_dropped_total: c.audio_frames_dropped_total,
         waterfall_rows_dropped_total: c.waterfall_rows_dropped_total,
+        measurement_reports_dropped_total: c.measurement_reports_dropped_total,
     }
 }
 
@@ -235,6 +238,7 @@ mod tests {
             active_subscriptions: 1,
             audio_frames_dropped_total: 3,
             waterfall_rows_dropped_total: 4,
+            measurement_reports_dropped_total: 5,
         };
         let s = station_status(&health, v1::HostHealth::default(), c);
         assert_eq!(s.uptime_s, 5);

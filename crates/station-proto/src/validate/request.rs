@@ -49,8 +49,10 @@ impl RequestRejection {
 /// `request_id` 0, a missing command-specific sub-message or `UNSPECIFIED`
 /// where a value is required → [`RequestRejection::InvalidArgument`].
 ///
-/// Range and capacity checks (tunable range, `max_channels`, ...) are the
-/// station's own business and not done here.
+/// `StartMeasurements` and `StopMeasurements` on a 1.0 session are
+/// [`RequestRejection::Unsupported`]; a plan with `measurement_id` 0 is
+/// invalid. Range and capacity checks (tunable range, `max_channels`, the
+/// plan's bands, ...) are the station's own business and not done here.
 pub fn check_request(req: &v1::Request, minor: u32) -> Result<CommandKind, RequestRejection> {
     use v1::request::Command;
     let command = req.command.as_ref().ok_or(RequestRejection::Unsupported {
@@ -87,7 +89,22 @@ pub fn check_request(req: &v1::Request, minor: u32) -> Result<CommandKind, Reque
             }
         }
         Command::AdminOp(a) => required::<v1::AdminOpKind>("admin_op.kind", a.kind, minor)?,
-        Command::GetCapabilities(_)
+        Command::StartMeasurements(_) | Command::StopMeasurements(_)
+            if minor < crate::limits::MEASUREMENTS_MINOR =>
+        {
+            return Err(RequestRejection::Unsupported {
+                field: "request.command",
+            });
+        }
+        Command::StartMeasurements(m) => {
+            if m.measurement_id == 0 {
+                return Err(RequestRejection::InvalidArgument {
+                    field: "start_measurements.measurement_id",
+                });
+            }
+        }
+        Command::StopMeasurements(_)
+        | Command::GetCapabilities(_)
         | Command::CloseChannel(_)
         | Command::SetFrontend(_)
         | Command::UnsubscribeWaterfall(_)

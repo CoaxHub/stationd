@@ -33,7 +33,9 @@ pub struct SanitizedCapabilities {
 /// Clamped (not a violation): range ends above 6 GHz (to 6 GHz),
 /// `max_channels` above [`limits::MAX_CHANNELS`], `waterfall.max_bins` above
 /// [`limits::MAX_BINS`], `waterfall.max_subscriptions` above
-/// [`limits::MAX_WATERFALL_SUBSCRIPTIONS`].
+/// [`limits::MAX_WATERFALL_SUBSCRIPTIONS`], `measurements.max_noise_bands`
+/// above [`limits::MAX_NOISE_BANDS`] (§5.2). A 1.0 session drops
+/// `measurements` (a newer field it does not know).
 pub fn sanitize_capabilities(
     caps: &v1::Capabilities,
     minor: u32,
@@ -129,11 +131,26 @@ pub fn sanitize_capabilities(
         &caps.sdr_model,
         limits::MAX_SDR_MODEL_BYTES,
     )?;
+    clamp_measurements(&mut out, minor, &mut clamped);
 
     Ok(SanitizedCapabilities {
         capabilities: out,
         clamped,
     })
+}
+
+/// 1.1: a 1.0 session ignores `measurements` (§3); a 1.1 one clamps it.
+fn clamp_measurements(out: &mut v1::Capabilities, minor: u32, clamped: &mut Vec<&'static str>) {
+    if minor < limits::MEASUREMENTS_MINOR {
+        out.measurements = None;
+    } else if let Some(m) = out.measurements.as_mut() {
+        clamp(
+            &mut m.max_noise_bands,
+            limits::MAX_NOISE_BANDS,
+            "capabilities.measurements.max_noise_bands",
+            clamped,
+        );
+    }
 }
 
 /// A range is nonsense if it is reversed or starts above 6 GHz (nothing of it

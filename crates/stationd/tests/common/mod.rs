@@ -15,6 +15,11 @@ use stationd::{Config, DaemonHandle, RunError, RunOptions};
 
 /// Short intervals matching `ScenarioConfig::fast()`.
 pub fn fast_options() -> RunOptions {
+    fast_options_scaled(60)
+}
+
+/// [`fast_options`] with measuring on a clock `scale` times as fast.
+pub fn fast_options_scaled(scale: u32) -> RunOptions {
     RunOptions {
         backoff: Policy {
             initial: Duration::from_millis(50),
@@ -28,6 +33,12 @@ pub fn fast_options() -> RunOptions {
         keepalive_interval: Duration::from_millis(300),
         keepalive_timeout: Duration::from_millis(300),
         shutdown_grace: Duration::from_secs(1),
+        // Measuring runs on a clock 60 times as fast (ScenarioConfig::fast's
+        // one-second minute).
+        measure_clock: Arc::new(stationd::measure::ScaledClock::new(
+            stationd::measure::clock::system_now_ms(),
+            scale,
+        )),
         ..RunOptions::default()
     }
 }
@@ -44,6 +55,7 @@ pub fn config_toml(target: &Target) -> String {
     format!(
         "allow_frontend_control = {}\nallowed_admin_ops = [{}]\nmax_channels = {}\n\
          max_waterfall_subscriptions = {}\nstate_dir = {:?}\n\
+         [measurements]\nenabled = {}\n\
          [credentials]\ngateway_url = {:?}\ncert = {:?}\nkey = {:?}\ngateway_ca = {:?}\n\
          [backend]\nkind = \"fake\"\n",
         target.policy.allow_frontend_control,
@@ -51,6 +63,7 @@ pub fn config_toml(target: &Target) -> String {
         target.policy.max_channels,
         target.policy.max_waterfall_subscriptions,
         target.work_dir.join("state"),
+        target.policy.measurements,
         target.gateway_url,
         target.cert,
         target.key,
@@ -87,6 +100,8 @@ fn exit_of(result: Result<(), RunError>) -> Exit {
 pub struct InProcess {
     pub handle: Option<DaemonHandle>,
     pub backend: Arc<dyn Backend>,
+    /// How much faster than real time measuring runs (60 by default).
+    pub measure_scale: u32,
     exit: Option<Exit>,
 }
 
@@ -103,6 +118,7 @@ impl InProcess {
         Self {
             handle: None,
             backend,
+            measure_scale: 60,
             exit: None,
         }
     }
@@ -112,7 +128,11 @@ impl InProcess {
 impl StationUnderTest for InProcess {
     async fn start(&mut self, target: &Target) -> Result<(), BoxError> {
         let config = Config::load(&write_config(target))?;
-        let handle = stationd::spawn(&config, Arc::clone(&self.backend), fast_options())?;
+        let handle = stationd::spawn(
+            &config,
+            Arc::clone(&self.backend),
+            fast_options_scaled(self.measure_scale),
+        )?;
         assert_eq!(handle.station_id(), target.station_id);
         self.handle = Some(handle);
         self.exit = None;

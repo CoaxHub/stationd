@@ -12,6 +12,7 @@
 //! | `SetFrontend` | `FIRST_LO_FREQUENCY` for a retune, verified in the reply; gain, AGC, attenuation and antenna are `UNSUPPORTED` |
 //! | `AudioFrame` | the Opus payload of each RTP packet; `seq` re-based per channel (gaps kept), `timestamp` on the 48 kHz RTP clock re-based per channel |
 //! | `ChannelSignal` | SNR and baseband power from the channel's status, at most every 200 ms |
+//! | measurement channels (1.1) | a spectrum2 channel per plan that stationd polls itself, `BIN_COUNT`, `RESOLUTION_BW` and `SPECTRUM_AVG` fixed for its life, hopped by `RADIO_FREQUENCY` in place on radiod's placement grid, closed with `LIFETIME` 1 ([`measure`]) |
 //!
 //! The reported `ChannelOpened.audio` is what radiod actually runs: its
 //! `OUTPUT_SAMPRATE` (48 kHz for `wfm`, which radiod forces only once the
@@ -37,6 +38,7 @@
 
 pub mod group;
 pub mod map;
+pub mod measure;
 pub mod media;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -46,7 +48,8 @@ use std::time::Duration;
 
 use futures_util::StreamExt as _;
 use station_backend::{
-    AudioStream, Backend, BackendError, ChannelId, EventStream, Health, RowStream, SubscriptionId,
+    AudioStream, Backend, BackendError, ChannelId, EventStream, Health, MeasurementChannel,
+    MeasurementGrid, MeasurementId, RowStream, Spectrum, SubscriptionId,
 };
 use station_proto::v1;
 use tokio::sync::{OnceCell, broadcast};
@@ -156,6 +159,8 @@ struct State {
     subscriptions: BTreeMap<SubscriptionId, Subscription>,
     opening_channels: BTreeSet<ChannelId>,
     opening_subscriptions: BTreeSet<SubscriptionId>,
+    /// stationd's measurement channels (protocol 1.1), outside listener capacity.
+    measurements: BTreeMap<MeasurementId, Arc<tokio::sync::Mutex<measure::Measurement>>>,
     /// Monitor intervals in which `AD_OVER` grew, since start.
     overloads_total: u64,
     last_ad_over: Option<u64>,
@@ -428,6 +433,7 @@ impl Ka9qBackend {
                 channel_id: None,
                 subscription_id: None,
                 detail: "radiod reports A/D overrange".to_owned(),
+                ..Default::default()
             });
         }
     }
@@ -461,6 +467,7 @@ impl Ka9qBackend {
                     channel_id: Some(id),
                     subscription_id: None,
                     detail: "outside the new passband".to_owned(),
+                    ..Default::default()
                 });
             }
         }
@@ -471,6 +478,7 @@ impl Ka9qBackend {
                     channel_id: None,
                     subscription_id: Some(id),
                     detail: "outside the new passband".to_owned(),
+                    ..Default::default()
                 });
             }
         }
@@ -848,6 +856,7 @@ impl Backend for Ka9qBackend {
             channel_id: None,
             subscription_id: None,
             detail: String::new(),
+            ..Default::default()
         });
         Ok(state)
     }
@@ -942,6 +951,83 @@ impl Backend for Ka9qBackend {
         Box::pin(
             BroadcastStream::new(self.inner.events.subscribe()).filter_map(|e| async { e.ok() }),
         )
+    }
+
+    fn can_measure(&self) -> bool {
+        true
+    }
+
+    async fn open_measurement(
+        &self,
+        id: MeasurementId,
+        channel: MeasurementChannel,
+    ) -> Result<(), BackendError> {
+        if self.state().measurements.contains_key(&id) {
+            return Err(BackendError::already_exists(format!(
+                "measurement {id} is already open"
+            )));
+        }
+        let client = self.client().await?;
+        let m = measure::Measurement::open(&client, channel).await?;
+        let previous = self
+            .state()
+            .measurements
+            .insert(id, Arc::new(tokio::sync::Mutex::new(m)));
+        if let Some(old) = previous {
+            // Two opens raced: keep the newer, close the other.
+            let _ = old.lock().await.close().await;
+        }
+        Ok(())
+    }
+
+    async fn measurement_grid(&self, resolution_bw_hz: f32) -> Option<MeasurementGrid> {
+        let client = self.client().await.ok()?;
+        let st = self.frontend_status(&client).await.ok()?;
+        measure::grid_of(&st, resolution_bw_hz)
+    }
+
+    async fn retune_measurement(
+        &self,
+        id: MeasurementId,
+        center_hz: u64,
+    ) -> Result<Option<Spectrum>, BackendError> {
+        let m = self.measurement(id)?;
+        let mut m = m.lock().await;
+        m.retune(center_hz).await
+    }
+
+    async fn poll_measurement(&self, id: MeasurementId) -> Result<Spectrum, BackendError> {
+        let m = self.measurement(id)?;
+        let mut m = m.lock().await;
+        m.poll().await
+    }
+
+    async fn close_measurement(&self, id: MeasurementId) -> Result<(), BackendError> {
+        let m = self
+            .state()
+            .measurements
+            .remove(&id)
+            .ok_or_else(|| BackendError::not_found(format!("measurement {id} is not open")))?;
+        let mut m = m.lock().await;
+        m.close().await
+    }
+}
+
+impl Ka9qBackend {
+    fn measurement(
+        &self,
+        id: MeasurementId,
+    ) -> Result<Arc<tokio::sync::Mutex<measure::Measurement>>, BackendError> {
+        self.state()
+            .measurements
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| BackendError::not_found(format!("measurement {id} is not open")))
+    }
+
+    /// The IDs of the open measurement channels, ascending (tests).
+    pub fn measurement_ids(&self) -> Vec<MeasurementId> {
+        self.state().measurements.keys().copied().collect()
     }
 }
 
