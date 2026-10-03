@@ -40,6 +40,7 @@ pub mod group;
 pub mod map;
 pub mod measure;
 pub mod media;
+pub mod placement;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -549,13 +550,19 @@ impl Ka9qBackend {
         let range = req
             .range
             .ok_or_else(|| BackendError::invalid_argument("range is missing"))?;
-        let tunable = self.tunable_range(client).await?;
+        let fe = self.frontend_status(client).await?;
+        let tunable = map::tunable_range(&fe)
+            .ok_or_else(|| BackendError::backend("radiod's status has no front-end range"))?;
         if !map::contains(&tunable, range.start_hz) || !map::contains(&tunable, range.end_hz) {
             return Err(BackendError::out_of_range(
                 "range outside the tunable range",
             ));
         }
-        let g = map::geometry(&range, req.bins)?;
+        let g = map::geometry(
+            &range,
+            req.bins,
+            placement::FrontEnd::from_status(&fe).as_ref(),
+        )?;
         let row_interval_ms = req.row_interval_ms.max(map::MIN_ROW_INTERVAL_MS);
         let params = SpectrumParams {
             center_hz: g.center_hz,
@@ -568,12 +575,13 @@ impl Ka9qBackend {
             .open_spectrum_channel(params)
             .await
             .map_err(client_error)?;
-        let covered = channel.status().and_then(|st| {
-            map::covered_range(st.radio_frequency_hz?, st.resolution_bw_hz?, g.bins)
-        });
+        // Where radiod put the bins, from its reply; else where it should have.
+        let covered = channel
+            .status()
+            .and_then(|st| map::covered_range(&st, g.bins));
         let subscribed = v1::WaterfallSubscribed {
             subscription_id: req.subscription_id,
-            range: Some(covered.unwrap_or(range)),
+            range: Some(covered.unwrap_or(g.covered)),
             bins: g.bins,
             row_interval_ms,
             quantization: Some(map::quantization(req.quantization)?),

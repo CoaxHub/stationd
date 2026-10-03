@@ -333,9 +333,17 @@ async fn stationd_with_a_real_radiod() {
                 clippy::cast_precision_loss,
                 reason = "a bin index"
             )]
-            let expected = ((10e6 - wr.start_hz as f64) / rbw).floor() as usize;
-            println!("E2E carrier_bin_expected={expected} peaks={peaks:?}");
-            check(peaks.iter().all(|p| p.abs_diff(expected) <= 1), || {
+            let (pos, expected) = {
+                let pos = (10e6 - wr.start_hz as f64) / rbw;
+                (pos, pos.floor() as usize)
+            };
+            // Within a tenth of a bin of an edge, either neighbour may win.
+            let near_edge = !(0.1..=0.9).contains(&pos.fract());
+            println!("E2E carrier_bin_expected={expected} near_edge={near_edge} peaks={peaks:?}");
+            #[allow(clippy::cast_precision_loss, reason = "a bin index")]
+            let in_bin =
+                |p: usize| p == expected || (near_edge && (p as f64 + 0.5 - pos).abs() <= 0.6);
+            check(peaks.iter().all(|&p| in_bin(p)), || {
                 format!("carrier not in bin {expected}: {peaks:?}")
             })?;
         }

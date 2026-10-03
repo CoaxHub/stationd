@@ -10,7 +10,9 @@
 #   2. run-radiod-siggen.sh     radiod with the signal generator (testdata/radiod-siggen.conf)
 #   3. crates/stationd/tests/e2e_ka9q.rs (release, COAXHUB_E2E=1): capabilities, a
 #      channel at 50 frames/s, retunes with a continuous sequence, WFM at 48 kHz,
-#      waterfall rows at 10/s with the 10 MHz carrier in the right bin, health
+#      waterfall rows at 10/s with the 10 MHz carrier in the right bin, health;
+#      then, with the signal generator, crates/backend-ka9q/tests/e2e_waterfall.rs:
+#      the carrier in the bin its label says, across ranges and bin counts
 #   4. if an RTL-SDR is plugged in (USB 0bda:2838 or 0bda:2832) and radiod has the
 #      rtlsdr driver: the same test against testdata/radiod-rtlsdr.conf (98 MHz).
 #      Skipped, not failed, when absent; RTLSDR=0 skips it, RTLSDR=1 makes it required.
@@ -50,6 +52,15 @@ run_test() {
   grep '^E2E ' "${results}/e2e-${radiod}.log" >"${results}/e2e-${radiod}.values" || true
 }
 
+run_waterfall_labels() {
+  log "waterfall labels against radiod (siggen)"
+  (
+    cd "${station_dir}"
+    COAXHUB_E2E=1 cargo test --release -p backend-ka9q --test e2e_waterfall -- --nocapture
+  ) 2>&1 | tee "${results}/e2e-waterfall.log"
+  grep '^E2E ' "${results}/e2e-waterfall.log" >"${results}/e2e-waterfall.values" || true
+}
+
 rtlsdr_present() {
   local d
   for d in /sys/bus/usb/devices/*; do
@@ -66,10 +77,11 @@ main() {
   "${script_dir}/build-radiod.sh"
   trap stop_radiod EXIT
 
-  (cd "${station_dir}" && cargo build --release -p stationd --tests)
+  (cd "${station_dir}" && cargo build --release -p stationd -p backend-ka9q --tests)
 
   "${script_dir}/run-radiod-siggen.sh" start
   run_test siggen
+  run_waterfall_labels
   stop_radiod
 
   if [[ "${rtlsdr}" == 0 ]]; then

@@ -37,14 +37,15 @@
 //!   debug prints in `src/spectrum.c` (`"%s wide spectrum: center %.3lf Hz
 //!   bin count %u, rbw %.1lf Hz ..."`, around lines 616-617 and 658-659)
 //!   label `chan->tune.freq` as `center`. Combined with the bin-order
-//!   fact above, output bin `i` (0-based, low-to-high) sits at the same
-//!   signed FFT-bin offset from center as internal `bin_data[i]` would if
-//!   it were still DC-first, i.e. `offset(i) = i - bin_count/2` (integer
-//!   division, matching the C `int` arithmetic in `spectrum.c`), so
+//!   fact above, output bin `i` (0-based, low-to-high) is internal
+//!   `bin_data[(i + bin_count/2) % bin_count]`, whose signed offset is
+//!   `i - ⌈bin_count/2⌉`: with an odd count there is one more bin below
+//!   the center than above (observed on the signal generator: 1023 and
+//!   1024 bins put a carrier in the same bin). So
 //!   `frequency_of_bin(i) = RADIO_FREQUENCY + offset(i) * RESOLUTION_BW`.
-//!   `RESOLUTION_BW` (`rbw`) is sent directly as a status TLV
-//!   (`src/radio_status.c:782`) — we don't need to re-derive it from
-//!   `BIN_COUNT`/FFT size, we just carry it as `bin_width_hz`.
+//!   These are radiod's *reported* values, which are exact in narrowband
+//!   mode; in wideband mode radiod puts the bins on its analysis FFT's
+//!   grid instead (`backend::placement`, radiod-notes.md §10).
 //!
 //! None of the above needs to be re-derived by stationd: radiod computes
 //! `base`/`step`/`rbw` and sends them as TLVs every row, so [`SpectrumFrame`]
@@ -170,16 +171,14 @@ pub struct SpectrumFrame {
 impl SpectrumFrame {
     /// Frequency, in Hz, of the center of bin `i` (0-based, low to high),
     /// per the formula derived in the module docs:
-    /// `center_hz + (i - bins.len() / 2) * bin_width_hz`, using truncating
-    /// integer division for `bins.len() / 2` to match radiod's own C
-    /// arithmetic.
+    /// `center_hz + (i - ⌈bins.len() / 2⌉) * bin_width_hz`.
     #[must_use]
     #[allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
     // Safe: station-protocol caps `max_bins` at 16,384, so these
     // usize -> i64 -> f64 conversions never wrap or lose precision in
     // practice, even though the types don't prove that statically.
     pub fn frequency_of_bin(&self, i: usize) -> f64 {
-        let half = (self.bins.len() / 2) as i64;
+        let half = self.bins.len().div_ceil(2) as i64;
         let offset = i as i64 - half;
         self.center_hz + (offset as f64) * self.bin_width_hz
     }
@@ -287,7 +286,7 @@ pub fn crop(
     // frames' bin-count parity. Bin counts are always tiny (see
     // frequency_of_bin's doc comment), so these conversions are exact.
     #[allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
-    let new_half = (new_bins.len() / 2) as i64;
+    let new_half = new_bins.len().div_ceil(2) as i64;
     let f0 = frame.frequency_of_bin(lo);
     #[allow(clippy::cast_precision_loss)]
     let new_center = f0 + (new_half as f64) * frame.bin_width_hz;
@@ -504,6 +503,15 @@ mod tests {
         assert_eq!(f.frequency_of_bin(0), 999_600.0);
         assert_eq!(f.frequency_of_bin(4), 1_000_000.0);
         assert_eq!(f.frequency_of_bin(7), 1_000_300.0);
+    }
+
+    #[test]
+    fn frequency_of_bin_odd_count_has_one_more_bin_below() {
+        // bin_count = 7: offsets -4 ..= 2.
+        let f = frame(1_000_000.0, 100.0, vec![0; 7]);
+        assert_eq!(f.frequency_of_bin(0), 999_600.0);
+        assert_eq!(f.frequency_of_bin(4), 1_000_000.0);
+        assert_eq!(f.frequency_of_bin(6), 1_000_200.0);
     }
 
     #[test]
