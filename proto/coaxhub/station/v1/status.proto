@@ -12,6 +12,8 @@ syntax = "proto3";
 
 package coaxhub.station.v1;
 
+import "coaxhub/station/v1/measure.proto";
+
 // Periodic health snapshot, every Welcome.status_interval_ms.
 message StationStatus {
   uint64 uptime_s = 1;       // stationd process uptime
@@ -23,6 +25,9 @@ message StationStatus {
   // Frames dropped by the station's outbound queue since stationd start.
   uint64 audio_frames_dropped_total = 7;
   uint64 waterfall_rows_dropped_total = 8;
+  // Protocol 1.1: measurement reports dropped by the outbound queue (older
+  // than 10 s) since stationd start.
+  uint64 measurement_reports_dropped_total = 9;
 }
 
 message HostHealth {
@@ -75,10 +80,21 @@ message Event {
     KIND_SUBSCRIPTION_CLOSED = 6; // subscription_id set
     KIND_FRONTEND_CHANGED = 7;    // tunable range changed; hub re-reads capabilities
     KIND_SHUTTING_DOWN = 8;       // stationd is stopping
+    // Protocol 1.1 (measure.proto):
+    KIND_MEASUREMENT_STOPPED = 9; // measurement_id and measurement_stop_reason set
+    KIND_MEASUREMENT_DUTY = 10;   // measurement_id, measurement_duty and effective_unix_ms set
   }
   Kind kind = 1;
   optional uint32 channel_id = 2;
   optional uint32 subscription_id = 3;
   // Untrusted detail, at most 256 bytes UTF-8. Displayed escaped.
   string detail = 4;
+  // Protocol 1.1: the plan a measurement event is about.
+  optional uint32 measurement_id = 5;
+  // MEASUREMENT_DUTY: the new duty...
+  optional MeasurementDuty measurement_duty = 6;
+  // ...and the UTC minute it applies from, Unix ms (a multiple of 60000).
+  optional int64 effective_unix_ms = 7;
+  // MEASUREMENT_STOPPED: why the station stopped the plan.
+  optional MeasurementStopReason measurement_stop_reason = 8;
 }

@@ -25,6 +25,8 @@
 //!   [`DaemonHandle`], [`ConnectionState`]).
 //! - [`dispatch`]: request handling (every request answered exactly once).
 //! - [`outbound`]: the prioritised, bounded outbound queue (§6.3).
+//! - [`measure`]: the noise floor (protocol 1.1): plans, the
+//!   idle schedule, the reduction.
 //! - [`status`]: `Hello`, `StationStatus` and host metrics.
 //! - [`local_status`]: the runtime status file and `stationd status`;
 //!   [`doctor`]: `stationd doctor`; [`backend_config`]: radiod's config
@@ -42,6 +44,7 @@ pub mod enroll;
 pub mod flavour;
 pub mod local_status;
 pub mod logging;
+pub mod measure;
 pub mod outbound;
 pub mod profile;
 pub mod renew;

@@ -106,6 +106,7 @@ fn station_message_seeds(dir: &Path) -> Res<()> {
             allowed_admin_ops: vec![],
             frontend_control_allowed: true,
             sdr_model: "RTL-SDR".into(),
+            measurements: None,
         }),
     );
     let pong = ok(
@@ -161,6 +162,7 @@ fn station_message_seeds(dir: &Path) -> Res<()> {
         channel_id: Some(3),
         subscription_id: None,
         detail: "passband moved".into(),
+        ..Default::default()
     });
     let updated = ok(
         8,
@@ -187,7 +189,75 @@ fn station_message_seeds(dir: &Path) -> Res<()> {
         }),
     );
 
+    // Protocol 1.1: plan 1 of the target's busy session (idle, band 1).
+    let noise = |window_start_unix_ms| {
+        Body::Noise(v1::NoiseFloorReport {
+            measurement_id: 1,
+            window_start_unix_ms,
+            window_ms: 60_000,
+            frontend: Some(v1::FrontendState::default()),
+            overloads: 0,
+            clock: Some(v1::ClockState {
+                synchronized: true,
+                max_error_ms: 5,
+            }),
+            bands: vec![v1::BandNoise {
+                band_id: 1,
+                measured: Some(range(7_000_000, 7_300_000)),
+                resolution_bw_hz: 500.0,
+                samples: 72_000,
+                p10_db_hz: -132.5,
+                p25_db_hz: -131.0,
+                p50_db_hz: -129.9,
+                p90_db_hz: -110.0,
+            }],
+            partial: false,
+            cycle_minutes: 1,
+            cycle_index: 0,
+        })
+    };
+    let duty = Body::Event(v1::Event {
+        kind: v1::event::Kind::MeasurementDuty as i32,
+        measurement_id: Some(1),
+        measurement_duty: Some(v1::MeasurementDuty::Continuous as i32),
+        effective_unix_ms: Some(1_790_942_460_000),
+        ..Default::default()
+    });
+    let stopped = Body::Event(v1::Event {
+        kind: v1::event::Kind::MeasurementStopped as i32,
+        measurement_id: Some(1),
+        measurement_stop_reason: Some(v1::MeasurementStopReason::FrontendChanged as i32),
+        ..Default::default()
+    });
+    let started = ok(
+        16,
+        Payload::MeasurementsStarted(v1::MeasurementsStarted {
+            measurement_id: 2,
+            noise_bands: vec![v1::NoiseBand {
+                band_id: 2,
+                ranges: vec![range(14_000_000, 14_350_000)],
+                key: "20m".into(),
+            }],
+            noise_interval_ms: 60_000,
+            duty: v1::MeasurementDuty::Continuous as i32,
+            frontend: Some(v1::FrontendState::default()),
+            method_version: 1,
+        }),
+    );
+    let mut measuring = Vec::new();
+    frame(&mut measuring, 0, noise(1_790_942_400_000))?;
+    frame(&mut measuring, 0, duty.clone())?;
+    frame(&mut measuring, 250, noise(1_790_942_460_000))?;
+    frame(&mut measuring, 0, started.clone())?;
+    frame(&mut measuring, 0, stopped.clone())?;
+    frame(&mut measuring, 0, noise(1_790_942_460_000))?;
+    write(dir, "measuring", &measuring)?;
+
     let singles: Vec<(&str, Body)> = vec![
+        ("noise", noise(1_790_942_400_000)),
+        ("event_measurement_duty", duty),
+        ("event_measurement_stopped", stopped),
+        ("response_measurements_started", started),
         ("hello", hello.clone()),
         ("response_capabilities", capabilities),
         ("response_pong", pong.clone()),

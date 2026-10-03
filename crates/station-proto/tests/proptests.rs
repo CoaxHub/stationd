@@ -159,6 +159,7 @@ fn capabilities() -> BoxedStrategy<v1::Capabilities> {
                         allowed_admin_ops: ops,
                         frontend_control_allowed: fca,
                         sdr_model: sdr,
+                        measurements: None,
                     }
                 },
             )
@@ -275,7 +276,7 @@ fn body() -> BoxedStrategy<Option<Body>> {
             })
         ),
         2 => (enum_value(), proptest::option::of(small_id()), proptest::option::of(small_id()), text()).prop_map(
-            |(kind, channel_id, subscription_id, detail)| Body::Event(v1::Event { kind, channel_id, subscription_id, detail })
+            |(kind, channel_id, subscription_id, detail)| Body::Event(v1::Event { kind, channel_id, subscription_id, detail, ..Default::default() })
         ),
     ];
     proptest::option::weighted(0.97, b)

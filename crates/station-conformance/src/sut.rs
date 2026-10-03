@@ -22,6 +22,8 @@ pub struct LocalPolicy {
     pub max_channels: u32,
     /// Hard cap on waterfall subscriptions.
     pub max_waterfall_subscriptions: u32,
+    /// `[measurements] enabled` (protocol 1.1).
+    pub measurements: bool,
 }
 
 impl Default for LocalPolicy {
@@ -32,6 +34,7 @@ impl Default for LocalPolicy {
             allowed_admin_ops: Vec::new(),
             max_channels: 16,
             max_waterfall_subscriptions: 4,
+            measurements: true,
         }
     }
 }

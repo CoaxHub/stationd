@@ -37,6 +37,13 @@ pub struct ChannelStatus {
     /// `GPS_TIME`: nanoseconds since the GPS epoch (`encode_int64` of an
     /// `int64_t`).
     pub gps_time_ns: Option<i64>,
+    /// `INPUT_SAMPLES`: the channel's position in the front end's sample
+    /// stream (`encode_int64` of `filter.out.sample_index`). For a wideband
+    /// spectrum2 channel it is the front end's total sample count at the
+    /// last poll (complex front ends) or that count minus the samples the
+    /// poll analysed (real front ends). It keeps counting across front-end
+    /// stops and starts and does not advance while the front end is stopped.
+    pub input_samples: Option<u64>,
     /// `DESCRIPTION`: front end description (`encode_string`, UTF-8 lossy).
     pub description: Option<String>,
     /// `STATUS_DEST_SOCKET`: where status is multicast (`encode_socket`).
@@ -78,6 +85,12 @@ pub struct ChannelStatus {
     /// `SAMPLES_SINCE_OVER`: samples since the last overrange
     /// (`encode_int64`; sent only after an overrange).
     pub samples_since_over: Option<u64>,
+    /// `FILTER_BLOCKSIZE`: front-end input samples per frame, `L`
+    /// (`encode_int32`).
+    pub filter_blocksize: Option<u32>,
+    /// `FILTER_FIR_LENGTH`: the front-end filter's impulse length, `M`
+    /// (`encode_int32`). The front end's FFT has `L + M - 1` points.
+    pub filter_fir_length: Option<u32>,
     /// `LNA_GAIN`, dB (`encode_int32` of an `int`; tuners with one only).
     pub lna_gain_db: Option<i32>,
     /// `MIXER_GAIN`, dB (`encode_int32` of an `int`).
@@ -185,6 +198,7 @@ impl ChannelStatus {
             S::CommandTag => self.command_tag = Some(f.as_u64()?),
             S::CmdCnt => self.cmd_cnt = Some(f.as_u64()?),
             S::GpsTime => self.gps_time_ns = Some(f.as_i64()?),
+            S::InputSamples => self.input_samples = Some(f.as_u64()?),
             S::Description => self.description = Some(f.as_string_lossy().into_owned()),
             S::StatusDestSocket => self.status_dest_socket = socket(f)?,
             S::OutputDataDestSocket => self.output_data_dest_socket = socket(f)?,
@@ -205,6 +219,8 @@ impl ChannelStatus {
             S::FeIsreal => self.fe_isreal = Some(f.as_bool()?),
             S::AdOver => self.ad_over = Some(f.as_u64()?),
             S::SamplesSinceOver => self.samples_since_over = Some(f.as_u64()?),
+            S::FilterBlocksize => self.filter_blocksize = uint()?,
+            S::FilterFirLength => self.filter_fir_length = uint()?,
             S::LnaGain => self.lna_gain_db = Some(f.as_i32()?),
             S::MixerGain => self.mixer_gain_db = Some(f.as_i32()?),
             S::IfGain => self.if_gain_db = Some(f.as_i32()?),
@@ -409,6 +425,9 @@ mod tests {
         assert_eq!(s.fe_isreal, Some(true));
         assert_eq!(s.ad_over, Some(2));
         assert_eq!(s.samples_since_over, Some(99));
+        assert_eq!(s.input_samples, Some(123_456));
+        assert_eq!(s.filter_blocksize, Some(64_800));
+        assert_eq!(s.filter_fir_length, Some(16_201));
         assert_eq!(s.lna_gain_db, Some(12));
         assert_eq!(s.mixer_gain_db, Some(8));
         assert_eq!(s.if_gain_db, Some(-2));

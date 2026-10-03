@@ -604,6 +604,11 @@ fn status_packet(st: &FakeState, ssrc: u32, ch: &FakeChannel, with_bins: bool) -
         .f32(StatusType::IfPower, IF_POWER_DB)
         .u64(StatusType::AdOver, st.ad_over)
         .u32(StatusType::FilterBlocksize, INPUT_SAMPRATE / 50)
+        .u32(StatusType::FilterFirLength, INPUT_SAMPRATE / 200 + 1)
+        .u64(
+            StatusType::InputSamples,
+            st.frames * u64::from(INPUT_SAMPRATE / 50),
+        )
         .f64(StatusType::RadioFrequency, ch.frequency)
         .i32(StatusType::DemodType, ch.demod)
         .str(StatusType::Preset, &ch.preset);

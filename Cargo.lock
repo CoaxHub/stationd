@@ -1415,6 +1415,7 @@ dependencies = [
  "async-trait",
  "coaxhub-station-proto",
  "futures-util",
+ "proptest",
  "thiserror",
  "tokio",
  "tokio-stream",

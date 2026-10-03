@@ -184,6 +184,113 @@ pub const STRIKE_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 /// [`crate::validate::Session::expire_requests`]).
 pub const TIMED_OUT_REQUESTS_REMEMBERED: usize = 64;
 
+// ------------------------------------------------------------------ §4.1, §5.2: measurements (1.1)
+
+/// §3: the first minor with measurements (measure.proto).
+pub const MEASUREMENTS_MINOR: u32 = 1;
+
+/// §5.2: hub cap on `MeasurementLimits.max_noise_bands`, and the most bands in
+/// a plan or a report.
+pub const MAX_NOISE_BANDS: u32 = 32;
+
+/// §5.2: the most ranges in one `NoiseBand`.
+pub const MAX_BAND_RANGES: usize = 8;
+
+/// §5.2: `NoiseBand.key`, in bytes of `[a-z0-9]`.
+pub const MAX_BAND_KEY_BYTES: usize = 8;
+
+/// §4.1: the report cadence the hub asks for: one report per measured minute.
+pub const NOISE_INTERVAL_MS: u32 = 60_000;
+
+/// §4.1: the cadences a station may run (a cycle stretched over 2 or 5 minutes).
+pub const NOISE_INTERVALS_MS: &[u32] = &[60_000, 120_000, 300_000];
+
+/// §4.1: the length of a measured window (one UTC minute).
+pub const NOISE_WINDOW_MS: u32 = 60_000;
+
+/// §5.2: the lowest and highest quantile a station may report, dB/Hz.
+pub const NOISE_DB_HZ: std::ops::RangeInclusive<f32> = -250.0..=50.0;
+
+/// §5.2: the most bins × spectra one band's window may pool.
+pub const MAX_NOISE_SAMPLES: u32 = 1_000_000;
+
+/// §5.2: a report's window may start at most this long before the hub's clock...
+pub const NOISE_REPORT_MAX_AGE: Duration = Duration::from_secs(15 * 60);
+
+/// §5.2: ...and at most this long after it.
+pub const NOISE_REPORT_MAX_LEAD: Duration = Duration::from_secs(5);
+
+/// §5.2: a duty change may apply from at most this long before the hub's clock...
+pub const DUTY_MAX_AGE: Duration = Duration::from_secs(60);
+
+/// §5.2: ...and at most this long after it.
+pub const DUTY_MAX_LEAD: Duration = Duration::from_secs(65);
+
+/// §5.2: noise reports over the rate limit are dropped; sustained this long, a
+/// violation.
+pub const NOISE_RATE_SUSTAINED: Duration = Duration::from_secs(60);
+
+/// §5.2: at most one `Event{MEASUREMENT_DUTY}` per this long...
+pub const DUTY_EVENT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// §5.2: ...with this burst...
+pub const DUTY_EVENT_BURST: u32 = 2;
+
+/// §5.2: ...and over the limit for this long, a violation.
+pub const DUTY_RATE_SUSTAINED: Duration = Duration::from_secs(10 * 60);
+
+/// §4.1: under idle duty, one UTC minute in this many is measured (hh:00,
+/// hh:05, …).
+pub const IDLE_PERIOD_MINUTES: i64 = 5;
+
+/// §4.1: under idle duty the measurement channels open this long before a
+/// measuring minute (the front end's warm-up: radiod's first spectrum is
+/// valid about 70 ms after the open on an RTL-SDR, as measured; the rest
+/// is margin)...
+pub const IDLE_OPEN_BEFORE: Duration = Duration::from_secs(2);
+
+/// §4.1: ...and close this long after it ends.
+pub const IDLE_CLOSE_AFTER: Duration = Duration::from_millis(500);
+
+/// §6.3: measurement reports waiting longer than this are dropped.
+pub const QUEUE_MEASUREMENT_DROP_AFTER: Duration = Duration::from_secs(10);
+
+/// §4.1: the measurement spectrum channel's bin count (fixed for its life).
+pub const MEASURE_BIN_COUNT: u32 = 1024;
+
+/// §4.1: its resolution bandwidth, Hz: 1024 × 500 Hz is one 512 kHz window.
+pub const MEASURE_RESOLUTION_BW_HZ: f32 = 500.0;
+
+/// §4.1: time on each window, ms.
+pub const MEASURE_DWELL_MS: u32 = 4_000;
+
+/// §4.1: time between two polls, ms (2 polls/s).
+pub const MEASURE_POLL_INTERVAL_MS: u32 = 500;
+
+/// §4.1: the bin counts a station accepts in a plan.
+pub const MEASURE_BIN_COUNTS: std::ops::RangeInclusive<u32> = 64..=4_096;
+
+/// §4.1: the resolution bandwidths a station accepts are wider than this, Hz
+/// (radiod's narrowband mode, 200 Hz bins or less, is not for measuring)...
+pub const MEASURE_NARROWBAND_MAX_RBW_HZ: f32 = 200.0;
+
+/// §4.1: ...and at most this, Hz.
+pub const MEASURE_MAX_RESOLUTION_BW_HZ: f32 = 10_000.0;
+
+/// §4.1: whether a station accepts bins of `rbw_hz` for measuring.
+pub fn is_measurement_rbw(rbw_hz: f32) -> bool {
+    rbw_hz > MEASURE_NARROWBAND_MAX_RBW_HZ && rbw_hz <= MEASURE_MAX_RESOLUTION_BW_HZ
+}
+
+/// §4.1: the dwell times a station accepts, ms.
+pub const MEASURE_DWELL_MS_RANGE: std::ops::RangeInclusive<u32> = 1_000..=15_000;
+
+/// §4.1: the poll intervals a station accepts, ms (at most 10 polls/s).
+pub const MEASURE_POLL_INTERVAL_MS_RANGE: std::ops::RangeInclusive<u32> = 100..=2_000;
+
+/// §4.1: the first measurement method (`method_version`).
+pub const MEASURE_METHOD_VERSION: u32 = 1;
+
 // ------------------------------------------------------------------ common.proto AudioParams
 
 /// common.proto `AudioParams.bitrate_bps`: allowed range.

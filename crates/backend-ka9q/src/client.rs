@@ -963,7 +963,7 @@ impl Ka9qClient {
         params: SpectrumParams,
     ) -> Result<SpectrumChannel, ClientError> {
         params.validate(&self.core.config)?;
-        let ctx = create_spectrum(&self.core, &params).await?;
+        let (ctx, _) = create_spectrum(&self.core, &params).await?;
         let shared = Arc::new(SpectrumShared {
             ssrc: AtomicU32::new(ctx.ssrc),
             current: tokio::sync::Mutex::new(SpectrumCurrent {
@@ -984,6 +984,30 @@ impl Ka9qClient {
             poller: poller.abort_handle(),
             open: true,
         })
+    }
+
+    /// Creates a spectrum2 channel under a new SSRC that its owner polls
+    /// itself, one command at a time ([`PolledSpectrum`]); nothing polls it
+    /// in the background, so `params.row_interval` is not used. Returns the
+    /// channel and radiod's reply to the create command, which has no bin
+    /// data yet (radiod-notes.md §6).
+    pub async fn open_polled_spectrum(
+        &self,
+        params: SpectrumParams,
+    ) -> Result<(PolledSpectrum, SpectrumReply), ClientError> {
+        params.validate(&self.core.config)?;
+        let (ctx, status) = create_spectrum(&self.core, &params).await?;
+        let reply = SpectrumReply::new(status, params.bin_count);
+        Ok((
+            PolledSpectrum {
+                core: Arc::clone(&self.core),
+                ctx,
+                params,
+                recreations: 0,
+                open: true,
+            },
+            reply,
+        ))
     }
 
     /// Asks radiod for the status of every channel (SSRC `0xffffffff`) and
@@ -1715,10 +1739,12 @@ struct SpectrumShared {
     counters: SpectrumCounters,
 }
 
+/// Creates a spectrum2 channel under a new SSRC and returns it with radiod's
+/// reply to the create command (which carries no bin data yet).
 async fn create_spectrum(
     core: &Core,
     params: &SpectrumParams,
-) -> Result<Arc<ChannelCtx>, ClientError> {
+) -> Result<(Arc<ChannelCtx>, Arc<ChannelStatus>), ClientError> {
     let ssrc = core.shared.allocate_ssrc(None)?;
     let ctx = ChannelCtx::new(ssrc);
     let lifetime = core.config.lifetime_frames;
@@ -1728,10 +1754,11 @@ async fn create_spectrum(
         .and_then(|st| {
             params
                 .check(&st)
+                .map(|()| st)
                 .map_err(|reason| ClientError::Rejected { ssrc, reason })
         });
     match created {
-        Ok(()) => Ok(ctx),
+        Ok(st) => Ok((ctx, st)),
         Err(e) => {
             if let Err(d) = core.destroy(&ctx).await {
                 tracing::debug!(ssrc, "destroy after failed open: {d}");
@@ -1915,7 +1942,7 @@ impl SpectrumChannel {
             next.check(&st)
                 .map_err(|reason| ClientError::Rejected { ssrc, reason })?;
         } else {
-            let new_ctx = create_spectrum(&self.core, &next).await?;
+            let (new_ctx, _) = create_spectrum(&self.core, &next).await?;
             let old = std::mem::replace(&mut cur.ctx, new_ctx);
             self.shared.ssrc.store(cur.ctx.ssrc, Ordering::Relaxed);
             bump(&self.shared.counters.geometry_changes);
@@ -1964,6 +1991,161 @@ impl Drop for SpectrumChannel {
             let ssrc = self.ssrc();
             self.core.destroy_nowait(ssrc);
             self.core.shared.release(ssrc);
+        }
+    }
+}
+
+/// One reply of a [`PolledSpectrum`]: radiod's status and, when it carries
+/// usable bin data, the row built from it.
+#[derive(Debug, Clone)]
+pub struct SpectrumReply {
+    /// The status packet, with the front-end fields (`INPUT_SAMPLES`,
+    /// `AD_OVER`, ...) of the moment radiod answered.
+    pub status: Arc<ChannelStatus>,
+    /// The row, `None` when the reply has no bin data (the create reply) or
+    /// no usable scale.
+    pub frame: Option<SpectrumFrame>,
+}
+
+impl SpectrumReply {
+    fn new(status: Arc<ChannelStatus>, bin_count: u32) -> Self {
+        let frame = frame_from_status(&status, bin_count);
+        Self { status, frame }
+    }
+}
+
+/// A spectrum2 channel that its owner polls, retunes and closes, one command
+/// at a time, with no background task: for measurements that need to know
+/// exactly which reply follows which retune. The owner must send a command
+/// at least once per lifetime ([`ClientConfig::lifetime_frames`]) or radiod
+/// removes the channel; the next command then re-creates it (counted in
+/// [`PolledSpectrum::recreations`]). Dropping it sends a best-effort destroy;
+/// prefer [`PolledSpectrum::close`].
+#[derive(Debug)]
+pub struct PolledSpectrum {
+    core: Arc<Core>,
+    ctx: Arc<ChannelCtx>,
+    params: SpectrumParams,
+    recreations: u64,
+    open: bool,
+}
+
+impl PolledSpectrum {
+    /// The channel's SSRC (fixed: the bin count never changes).
+    pub fn ssrc(&self) -> u32 {
+        self.ctx.ssrc
+    }
+
+    /// The current parameters (`row_interval` is not used).
+    pub fn params(&self) -> &SpectrumParams {
+        &self.params
+    }
+
+    /// Times a poll found the channel gone and re-created it.
+    pub fn recreations(&self) -> u64 {
+        self.recreations
+    }
+
+    /// Polls once and waits for the reply, which carries a spectrum radiod
+    /// computed for this poll. If radiod no longer has the channel (it
+    /// expired, or radiod restarted), the poll re-created it from the
+    /// template; the full create command is then sent again on the same
+    /// SSRC and its reply (without bin data) is returned.
+    pub async fn poll(&mut self) -> Result<SpectrumReply, ClientError> {
+        let ssrc = self.ctx.ssrc;
+        let core = &self.core;
+        let st = core
+            .execute(&self.ctx, |tag| core.poll_cmd(ssrc, tag))
+            .await?;
+        if st.demod_type.is_some_and(|d| d != DemodType::Spect2) {
+            tracing::warn!(ssrc, "polled spectrum channel lost; re-creating");
+            self.recreations += 1;
+            let lifetime = core.config.lifetime_frames;
+            let params = &self.params;
+            let st = core
+                .execute(&self.ctx, |tag| params.create_command(ssrc, tag, lifetime))
+                .await?;
+            params
+                .check(&st)
+                .map_err(|reason| ClientError::Rejected { ssrc, reason })?;
+            return Ok(SpectrumReply::new(st, self.params.bin_count));
+        }
+        Ok(SpectrumReply::new(st, self.params.bin_count))
+    }
+
+    /// Moves the channel to `center_hz` with `RADIO_FREQUENCY`, which is
+    /// safe on a live spectrum channel (radiod-notes.md §6). The reply
+    /// carries a spectrum computed after the move.
+    pub async fn retune(&mut self, center_hz: f64) -> Result<SpectrumReply, ClientError> {
+        let next = SpectrumParams {
+            center_hz,
+            ..self.params.clone()
+        };
+        self.change(next, |c| c.radio_frequency_hz(center_hz)).await
+    }
+
+    /// Changes `RESOLUTION_BW` with the same bin count, which reuses radiod's
+    /// bin buffer (radiod-notes.md §6). The span changes with it.
+    pub async fn set_resolution_bw(
+        &mut self,
+        resolution_bw_hz: f32,
+    ) -> Result<SpectrumReply, ClientError> {
+        let next = SpectrumParams {
+            resolution_bw_hz,
+            ..self.params.clone()
+        };
+        self.change(next, |c| c.resolution_bw_hz(resolution_bw_hz))
+            .await
+    }
+
+    async fn change<F>(
+        &mut self,
+        next: SpectrumParams,
+        set: F,
+    ) -> Result<SpectrumReply, ClientError>
+    where
+        F: Fn(Command) -> Command,
+    {
+        next.validate(&self.core.config)?;
+        let ssrc = self.ctx.ssrc;
+        let lifetime = self.core.config.lifetime_frames;
+        let st = self
+            .core
+            .execute(&self.ctx, |tag| {
+                set(Command::new(ssrc, tag)).lifetime(lifetime)
+            })
+            .await?;
+        next.check(&st)
+            .map_err(|reason| ClientError::Rejected { ssrc, reason })?;
+        if st
+            .resolution_bw_hz
+            .is_some_and(|r| (r - f64::from(next.resolution_bw_hz)).abs() > 1e-3)
+        {
+            return Err(ClientError::Rejected {
+                ssrc,
+                reason: format!(
+                    "RESOLUTION_BW is {:?}, requested {}",
+                    st.resolution_bw_hz, next.resolution_bw_hz
+                ),
+            });
+        }
+        self.params = next;
+        Ok(SpectrumReply::new(st, self.params.bin_count))
+    }
+
+    /// Destroys the channel (`LIFETIME` 1) and waits for radiod's reply. The
+    /// channel is forgotten locally even on error.
+    pub async fn close(mut self) -> Result<(), ClientError> {
+        self.open = false;
+        self.core.destroy(&self.ctx).await
+    }
+}
+
+impl Drop for PolledSpectrum {
+    fn drop(&mut self) {
+        if self.open {
+            self.core.destroy_nowait(self.ctx.ssrc);
+            self.core.shared.release(self.ctx.ssrc);
         }
     }
 }

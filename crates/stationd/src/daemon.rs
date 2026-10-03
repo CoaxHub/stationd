@@ -41,6 +41,7 @@ use uuid::Uuid;
 use crate::config::{Config, CredentialsMode, Endpoint, LocalPolicy};
 use crate::credentials::{self, CredentialSource, Credentials, CredentialsError};
 use crate::dispatch::truncate_utf8;
+use crate::measure::{MeasureClock, SystemClock};
 use crate::outbound::{DropCounters, QueueLimits};
 use crate::renew::{self, ApiRenewal, RenewalOptions, RenewalStatus, Signal, UnixClock};
 use crate::session::{self, End};
@@ -78,6 +79,10 @@ pub struct RunOptions {
     pub assignment_timeout: Duration,
     /// Timeout of `StationControl.RenewCertificate` (connect and call).
     pub renew_timeout: Duration,
+    /// The wall clock the measurement schedule follows (the measurement design §4.1): the
+    /// system clock. Tests run it faster ([`crate::measure::ScaledClock`]);
+    /// `stationd.toml` can't change it.
+    pub measure_clock: Arc<dyn MeasureClock>,
 }
 
 impl Default for RunOptions {
@@ -95,6 +100,7 @@ impl Default for RunOptions {
             renewal: RenewalOptions::default(),
             assignment_timeout: crate::station_api::ASSIGNMENT_TIMEOUT,
             renew_timeout: crate::station_api::RENEW_TIMEOUT,
+            measure_clock: Arc::new(SystemClock),
         }
     }
 }
@@ -113,6 +119,7 @@ impl fmt::Debug for RunOptions {
             .field("renewal", &self.renewal)
             .field("assignment_timeout", &self.assignment_timeout)
             .field("renew_timeout", &self.renew_timeout)
+            .field("measure_clock", &self.measure_clock)
             .finish_non_exhaustive()
     }
 }
@@ -249,6 +256,7 @@ pub(crate) struct Ctx {
     pub control: Option<Arc<StationApi>>,
     /// What the daemon observed.
     pub observed: watch::Sender<Observed>,
+    pub measure_clock: Arc<dyn MeasureClock>,
     /// The wall clock, Unix seconds.
     pub clock: UnixClock,
 }
@@ -464,6 +472,7 @@ fn context(
         control,
         observed,
         clock: Arc::clone(&options.renewal.clock),
+        measure_clock: Arc::clone(&options.measure_clock),
     });
     let rest = LoopOptions {
         backoff: options.backoff,

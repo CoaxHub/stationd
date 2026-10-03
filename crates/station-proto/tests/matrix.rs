@@ -23,8 +23,8 @@ fn v(major: u32, minor: u32) -> ProtocolVersion {
 }
 
 #[test]
-fn protocol_version_is_one_zero() {
-    assert_eq!(PROTOCOL_VERSION, v(1, 0));
+fn protocol_version_is_one_one() {
+    assert_eq!(PROTOCOL_VERSION, v(1, 1));
 }
 
 #[test]
@@ -66,7 +66,9 @@ fn hub_negotiation_matrix() {
             ),
         }
     }
-    assert_eq!(negotiate(&hello_with(1, 4)), Ok(v(1, 0)));
+    assert_eq!(negotiate(&hello_with(1, 4)), Ok(v(1, 1)));
+    // A 1.0 station keeps 1.0: no measurements.
+    assert_eq!(negotiate(&hello_with(1, 0)), Ok(v(1, 0)));
     assert!(negotiate(&hello_with(2, 0)).is_err());
     assert_eq!(
         Unsupported {
@@ -105,6 +107,8 @@ fn station_welcome_matrix() {
         }
     }
     assert!(negotiate_welcome(&welcome(Some(v(1, 0)))).is_ok());
+    assert!(negotiate_welcome(&welcome(Some(v(1, 1)))).is_ok());
+    assert!(negotiate_welcome(&welcome(Some(v(1, 2)))).is_err());
 }
 
 #[test]
@@ -136,7 +140,7 @@ fn session_rejects_unsupported_versions_without_a_strike() {
         s.check(&msg(Body::Hello(hello_with(1, 9))), t0),
         Verdict::Accept
     );
-    assert_eq!(s.negotiated_version(), Some(v(1, 0)));
+    assert_eq!(s.negotiated_version(), Some(v(1, 1)));
 }
 
 fn command(kind: CommandKind) -> Command {
@@ -156,6 +160,10 @@ fn command(kind: CommandKind) -> Command {
             hub_time_unix_ms: 0,
         }),
         CommandKind::AdminOp => Command::AdminOp(v1::AdminOp { kind: 1 }),
+        CommandKind::StartMeasurements => start_measurements(7),
+        CommandKind::StopMeasurements => {
+            Command::StopMeasurements(v1::StopMeasurements { measurement_id: 7 })
+        }
     }
 }
 
@@ -168,6 +176,7 @@ fn payload(kind: PayloadKind) -> Payload {
         PayloadKind::FrontendState => frontend_state(),
         PayloadKind::WaterfallSubscribed => waterfall_subscribed(7, 1024, 100),
         PayloadKind::Pong => pong(7),
+        PayloadKind::MeasurementsStarted => measurements_started(7),
     }
 }
 
@@ -193,7 +202,7 @@ fn response_matching_matrix() {
     for cmd in CommandKind::ALL {
         for code in codes {
             for &p in &payloads {
-                let mut s = established(t0);
+                let mut s = established_1_1(t0);
                 s.on_request_sent(&request(1, command(cmd)), t0)
                     .expect("request");
                 let verdict = s.check(&response(1, code as i32, p.map(payload)), t0);
@@ -219,9 +228,9 @@ fn response_matching_matrix() {
             }
         }
     }
-    // 9 commands × 9 codes, one right answer each.
-    assert_eq!(accepted, 81);
-    assert_eq!(rejected, 9 * 9 * 7 - 81);
+    // 11 commands × 9 codes, one right answer each.
+    assert_eq!(accepted, 99);
+    assert_eq!(rejected, 11 * 9 * 8 - 99);
 }
 
 #[test]
@@ -245,6 +254,11 @@ fn ok_payload_table() {
         (CommandKind::UnsubscribeWaterfall, None),
         (CommandKind::Ping, Some(PayloadKind::Pong)),
         (CommandKind::AdminOp, None),
+        (
+            CommandKind::StartMeasurements,
+            Some(PayloadKind::MeasurementsStarted),
+        ),
+        (CommandKind::StopMeasurements, None),
     ];
     for (cmd, p) in expected {
         assert_eq!(cmd.ok_payload(), p, "{cmd}");
@@ -260,7 +274,7 @@ fn ok_payload_table() {
         assert_eq!(PayloadKind::of(&payload(p)), p);
     }
     let names: HashSet<_> = CommandKind::ALL.iter().map(|c| c.as_str()).collect();
-    assert_eq!(names.len(), 9);
+    assert_eq!(names.len(), 11);
 }
 
 #[test]

@@ -9,6 +9,8 @@
 //! allowed_admin_ops = []                   # restart_stationd, restart_backend, update, reboot_host
 //! max_channels = 16                        # default 16, at most 64
 //! max_waterfall_subscriptions = 4          # default 4, at most 16
+//! [measurements]
+//! enabled = true                           # measure the noise floor when the hub asks
 //! [sdr]
 //! profile = "rtlsdr"                       # rtlsdr | rtlsdr-hf (development builds also: siggen)
 //! # center_frequency_hz = 98000000         # optional; default from the profile
@@ -260,6 +262,13 @@ impl RawBackend {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawMeasurements {
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawSdr {
     profile: String,
     center_frequency_hz: Option<u64>,
@@ -305,6 +314,7 @@ struct RawConfig {
     max_channels: u32,
     #[serde(default = "default_max_waterfall_subscriptions")]
     max_waterfall_subscriptions: u32,
+    measurements: Option<RawMeasurements>,
     sdr: Option<RawSdr>,
     state_dir: Option<PathBuf>,
     endpoints: Option<RawEndpoints>,
@@ -324,6 +334,10 @@ pub struct LocalPolicy {
     pub max_channels: u32,
     /// Hard cap on simultaneous waterfall subscriptions.
     pub max_waterfall_subscriptions: u32,
+    /// `[measurements] enabled`: whether the station measures the noise floor
+    /// when the hub asks. The owner's switch; the hub
+    /// can't change it.
+    pub measurements: bool,
 }
 
 impl Default for LocalPolicy {
@@ -334,6 +348,7 @@ impl Default for LocalPolicy {
             allowed_admin_ops: Vec::new(),
             max_channels: DEFAULT_MAX_CHANNELS,
             max_waterfall_subscriptions: DEFAULT_MAX_WATERFALL_SUBSCRIPTIONS,
+            measurements: true,
         }
     }
 }
@@ -558,12 +573,13 @@ impl Config {
                 }
             }
         }
-        let policy = policy(
+        let mut policy = policy(
             raw.allow_frontend_control,
             raw.allowed_admin_ops,
             raw.max_channels,
             raw.max_waterfall_subscriptions,
         )?;
+        policy.measurements = raw.measurements.is_none_or(|m| m.enabled);
         let sdr = raw.sdr.as_ref().map(|s| sdr(s, flavour)).transpose()?;
         let (backend, backend_explicit) = match (raw.backend, sdr) {
             (Some(b), _) => (b.validate()?, true),
@@ -673,6 +689,7 @@ fn policy(
         allowed_admin_ops,
         max_channels,
         max_waterfall_subscriptions,
+        measurements: true,
     })
 }
 
@@ -1040,9 +1057,18 @@ mod tests {
                 allowed_admin_ops: vec![v1::AdminOpKind::RestartBackend, v1::AdminOpKind::Update],
                 max_channels: 64,
                 max_waterfall_subscriptions: 0,
+                measurements: true,
             }
         );
         assert!(c.policy.allows_admin_op(v1::AdminOpKind::Update));
+        let off = parse(&dir, &with("[measurements]\nenabled = false\n")).expect("valid");
+        assert!(!off.policy.measurements);
+        let on = parse(&dir, &with("[measurements]\n")).expect("valid");
+        assert!(on.policy.measurements);
+        assert!(matches!(
+            parse(&dir, &with("[measurements]\nmax_carriers = 3\n")),
+            Err(ConfigError::Parse { .. })
+        ));
         assert!(!c.policy.allows_admin_op(v1::AdminOpKind::RebootHost));
     }
 

@@ -13,6 +13,13 @@ allowed_admin_ops = []              # any of: "restart_stationd", "restart_backe
 max_channels = 16
 max_waterfall_subscriptions = 4
 
+# Measuring the noise floor for your station's RF history, and for the
+# network when the station is public. Measuring never retunes the receiver
+# and never takes a channel from a listener; with no listener it runs the SDR
+# about one minute in five. Off: the station measures nothing.
+[measurements]
+enabled = true
+
 # The receiver. The installer detects the SDR and sets the profile.
 [sdr]
 profile = "rtlsdr"                  # rtlsdr (VHF/UHF), rtlsdr-hf (HF by direct sampling)

@@ -55,6 +55,11 @@ pub struct ScenarioConfig {
     /// Detection of a silent (frozen) hub; `None` skips
     /// `detects_dead_connection`. Production: HTTP/2 keepalive 20 s + 10 s.
     pub dead_peer_within: Option<Duration>,
+    /// How long one minute of the station's measurement schedule takes
+    /// (protocol 1.1, §4.1): 60 s on the system clock, less for a station
+    /// under test on an accelerated clock. `None` skips the measurement
+    /// scenarios that wait for reports.
+    pub measure_minute: Option<Duration>,
 }
 
 impl Default for ScenarioConfig {
@@ -74,6 +79,7 @@ impl Default for ScenarioConfig {
                     + limits::HTTP2_KEEPALIVE_TIMEOUT
                     + Duration::from_secs(5),
             ),
+            measure_minute: Some(Duration::from_secs(60)),
         }
     }
 }
@@ -92,6 +98,8 @@ impl ScenarioConfig {
             revoked_quiet: Duration::from_millis(1500),
             exit_within: Duration::from_secs(5),
             dead_peer_within: Some(Duration::from_secs(3)),
+            // A station on a clock 60 times as fast.
+            measure_minute: Some(Duration::from_secs(1)),
         }
     }
 }
@@ -207,6 +215,26 @@ pub const ALL: &[Scenario] = &[
     scenario!(
         drops_channels_on_disconnect,
         "channels do not survive a reconnect (§2.3)"
+    ),
+    scenario!(
+        measures_when_asked,
+        "a plan gets MeasurementsStarted, then idle-duty reports for measuring minutes only (1.1, §4.1)"
+    ),
+    scenario!(
+        duty_follows_listeners,
+        "a listener channel makes the duty continuous at a minute boundary, closing it makes it idle (1.1, §4.1)"
+    ),
+    scenario!(
+        stops_measuring_on_frontend_change,
+        "SetFrontend stops the plan with Event{MEASUREMENT_STOPPED} (1.1, §4.1)"
+    ),
+    scenario!(
+        one_plan_per_connection,
+        "a second plan is ALREADY_EXISTS, StopMeasurements stops reports, a plan does not survive a reconnect (1.1, §2.3)"
+    ),
+    scenario!(
+        refuses_measurements_when_disabled,
+        "[measurements] enabled = false: capabilities say so and plans are PERMISSION_DENIED (1.1, §7)"
     ),
 ];
 
@@ -467,6 +495,7 @@ pub async fn answers_get_capabilities(
         allowed_admin_ops: vec![v1::AdminOpKind::RestartBackend],
         max_channels: 2,
         max_waterfall_subscriptions: 1,
+        measurements: true,
     };
     let harness = Harness::new(policy.clone()).await;
     run_scenario(sut, cfg, harness, async |h, _sut| {
@@ -1090,6 +1119,383 @@ pub async fn drops_channels_on_disconnect(
             &r,
             v1::ResultCode::Ok,
             "OpenChannel of the same ID on the new connection",
+        )?;
+        Ok(After::Stop(Some(Box::new(conn))))
+    })
+    .await
+}
+
+// ------------------------------------------------------------------ measurements (1.1)
+
+/// A plan for one band in the lower half of the tunable range (clear of the
+/// edges and the centre).
+fn plan_command(caps: &v1::Capabilities, measurement_id: u32) -> Option<Command> {
+    let range = caps.tunable_range?;
+    let width = range.end_hz.checked_sub(range.start_hz)?;
+    if width < 1_000 {
+        return None;
+    }
+    Some(Command::StartMeasurements(v1::StartMeasurements {
+        measurement_id,
+        noise_bands: vec![v1::NoiseBand {
+            band_id: 1,
+            ranges: vec![v1::FrequencyRange {
+                start_hz: range.start_hz + width / 10,
+                end_hz: range.start_hz + width * 4 / 10,
+            }],
+            key: "test".into(),
+        }],
+        noise_interval_ms: limits::NOISE_INTERVAL_MS,
+        bin_count: limits::MEASURE_BIN_COUNT,
+        resolution_bw_hz: limits::MEASURE_RESOLUTION_BW_HZ,
+        dwell_ms: limits::MEASURE_DWELL_MS,
+        poll_interval_ms: limits::MEASURE_POLL_INTERVAL_MS,
+    }))
+}
+
+/// The capabilities of a station that measures with measuring on, or `None`
+/// (the scenario then passes trivially: a 1.0 station never gets a plan).
+async fn measuring_caps(
+    conn: &mut StationConn,
+    cfg: &ScenarioConfig,
+) -> Result<Option<v1::Capabilities>> {
+    let caps = capabilities(&conn.call(get_capabilities(), cfg.response_within).await?)?;
+    let measures = caps.measurements.is_some_and(|m| m.enabled);
+    Ok(measures.then_some(caps))
+}
+
+fn noise_reports(msgs: &[(Instant, v1::StationMessage)]) -> Vec<v1::NoiseFloorReport> {
+    msgs.iter()
+        .filter_map(|(_, m)| match &m.body {
+            Some(Body::Noise(n)) => Some(n.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn measurement_events(
+    msgs: &[(Instant, v1::StationMessage)],
+    kind: v1::event::Kind,
+) -> Vec<v1::Event> {
+    msgs.iter()
+        .filter_map(|(_, m)| match &m.body {
+            Some(Body::Event(e)) if e.kind == kind as i32 => Some(e.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn started(r: &v1::Response) -> Result<v1::MeasurementsStarted> {
+    expect_code(r, v1::ResultCode::Ok, "StartMeasurements")?;
+    match &r.payload {
+        Some(Payload::MeasurementsStarted(m)) => Ok(m.clone()),
+        other => Err(ConformanceError::Unexpected {
+            expected: "MeasurementsStarted payload".into(),
+            got: format!("{other:?}"),
+        }),
+    }
+}
+
+/// No report the hub's validator had to drop as outside the idle schedule.
+fn no_unscheduled(conn: &StationConn) -> Result<()> {
+    let n = conn
+        .drops()
+        .iter()
+        .filter(|d| matches!(d, DropReason::NotScheduled))
+        .count();
+    ensure(n == 0, || {
+        format!("{n} report(s) for minutes the idle schedule skips")
+    })
+}
+
+/// Collects until `pred` holds for what arrived, or `within` passes.
+async fn collect_until(
+    conn: &mut StationConn,
+    within: Duration,
+    step: Duration,
+    pred: impl Fn(&[(Instant, v1::StationMessage)]) -> bool,
+) -> Result<Vec<(Instant, v1::StationMessage)>> {
+    let deadline = Instant::now() + within;
+    let mut all = Vec::new();
+    while Instant::now() < deadline {
+        all.extend(conn.collect(step).await?);
+        if pred(&all) {
+            break;
+        }
+    }
+    Ok(all)
+}
+
+/// `StartMeasurements` → `MeasurementsStarted` (checked against the request
+/// by the validator); under idle duty, reports arrive only for measuring
+/// minutes, each on a whole minute and naming only the accepted band.
+pub async fn measures_when_asked(
+    sut: &mut dyn StationUnderTest,
+    cfg: &ScenarioConfig,
+) -> Result<()> {
+    let harness = Harness::new(LocalPolicy::default()).await;
+    run_scenario(sut, cfg, harness, async |h, _sut| {
+        let mut conn = h.connect(cfg.connect_within, cfg).await?;
+        let (Some(caps), Some(minute)) =
+            (measuring_caps(&mut conn, cfg).await?, cfg.measure_minute)
+        else {
+            return Ok(After::Stop(Some(Box::new(conn))));
+        };
+        let Some(plan) = plan_command(&caps, 5) else {
+            return Ok(After::Stop(Some(Box::new(conn))));
+        };
+        let s = started(&conn.call(plan, cfg.response_within).await?)?;
+        ensure(s.duty == v1::MeasurementDuty::Idle as i32, || {
+            format!(
+                "a station without listeners must start idle, got duty {}",
+                s.duty
+            )
+        })?;
+        ensure(s.frontend.is_some(), || {
+            "MeasurementsStarted without frontend".into()
+        })?;
+        // Within 6 minutes a measuring minute has passed and been reported.
+        let got = collect_until(&mut conn, minute * 7, minute / 2, |m| {
+            !noise_reports(m).is_empty()
+        })
+        .await?;
+        let reports = noise_reports(&got);
+        ensure(!reports.is_empty(), || {
+            "no NoiseFloorReport within 7 minutes of idle duty".into()
+        })?;
+        for n in &reports {
+            ensure(n.measurement_id == 5, || "a report for another plan".into())?;
+            ensure(n.window_start_unix_ms.rem_euclid(60_000) == 0, || {
+                format!("window {} is not a UTC minute", n.window_start_unix_ms)
+            })?;
+            ensure(n.bands.iter().all(|b| b.band_id == 1), || {
+                "a report names a band that is not in the plan".into()
+            })?;
+        }
+        no_unscheduled(&conn)?;
+        Ok(After::Stop(Some(Box::new(conn))))
+    })
+    .await
+}
+
+/// A listener channel makes the duty continuous from a minute boundary
+/// (`Event{MEASUREMENT_DUTY}`), with a report every minute; closing it makes
+/// it idle again.
+pub async fn duty_follows_listeners(
+    sut: &mut dyn StationUnderTest,
+    cfg: &ScenarioConfig,
+) -> Result<()> {
+    let harness = Harness::new(LocalPolicy::default()).await;
+    run_scenario(sut, cfg, harness, async |h, _sut| {
+        let mut conn = h.connect(cfg.connect_within, cfg).await?;
+        let (Some(caps), Some(minute)) =
+            (measuring_caps(&mut conn, cfg).await?, cfg.measure_minute)
+        else {
+            return Ok(After::Stop(Some(Box::new(conn))));
+        };
+        let (Some(plan), Some(open)) = (plan_command(&caps, 6), open_command(&caps, 1)) else {
+            return Ok(After::Stop(Some(Box::new(conn))));
+        };
+        started(&conn.call(plan, cfg.response_within).await?)?;
+        expect_code(
+            &conn.call(open, cfg.response_within).await?,
+            v1::ResultCode::Ok,
+            "OpenChannel",
+        )?;
+        let continuous = |m: &[(Instant, v1::StationMessage)]| {
+            measurement_events(m, v1::event::Kind::MeasurementDuty)
+                .iter()
+                .any(|e| e.measurement_duty == Some(v1::MeasurementDuty::Continuous as i32))
+        };
+        let got = collect_until(&mut conn, minute * 2, minute / 4, continuous).await?;
+        let duty = measurement_events(&got, v1::event::Kind::MeasurementDuty);
+        let Some(change) = duty.first() else {
+            return Err(ConformanceError::Unexpected {
+                expected: "Event{MEASUREMENT_DUTY} within 2 minutes of a listener".into(),
+                got: "none".into(),
+            });
+        };
+        ensure(
+            change.measurement_duty == Some(v1::MeasurementDuty::Continuous as i32),
+            || {
+                format!(
+                    "expected continuous duty, got {:?}",
+                    change.measurement_duty
+                )
+            },
+        )?;
+        let from = change.effective_unix_ms.unwrap_or(1);
+        ensure(from.rem_euclid(60_000) == 0, || {
+            format!("duty from {from}: not a minute")
+        })?;
+        // Continuous: two consecutive minutes are reported.
+        let got = collect_until(&mut conn, minute * 3, minute / 2, |m| {
+            noise_reports(m).len() >= 2
+        })
+        .await?;
+        let starts: Vec<i64> = noise_reports(&got)
+            .iter()
+            .map(|n| n.window_start_unix_ms)
+            .collect();
+        ensure(starts.windows(2).any(|w| w[1] - w[0] == 60_000), || {
+            format!("no consecutive minutes reported under continuous duty: {starts:?}")
+        })?;
+        let close = Command::CloseChannel(v1::CloseChannel { channel_id: 1 });
+        expect_code(
+            &conn.call(close, cfg.response_within).await?,
+            v1::ResultCode::Ok,
+            "CloseChannel",
+        )?;
+        let idle = |m: &[(Instant, v1::StationMessage)]| {
+            measurement_events(m, v1::event::Kind::MeasurementDuty)
+                .iter()
+                .any(|e| e.measurement_duty == Some(v1::MeasurementDuty::Idle as i32))
+        };
+        let got = collect_until(&mut conn, minute * 2, minute / 4, idle).await?;
+        ensure(idle(&got), || {
+            "no idle duty within 2 minutes of the last listener leaving".into()
+        })?;
+        no_unscheduled(&conn)?;
+        Ok(After::Stop(Some(Box::new(conn))))
+    })
+    .await
+}
+
+/// `SetFrontend` stops the running plan: `Event{MEASUREMENT_STOPPED}` with
+/// the frontend reason, and no report for it afterwards.
+pub async fn stops_measuring_on_frontend_change(
+    sut: &mut dyn StationUnderTest,
+    cfg: &ScenarioConfig,
+) -> Result<()> {
+    let harness = Harness::new(LocalPolicy::default()).await;
+    run_scenario(sut, cfg, harness, async |h, _sut| {
+        let mut conn = h.connect(cfg.connect_within, cfg).await?;
+        let Some(caps) = measuring_caps(&mut conn, cfg).await? else {
+            return Ok(After::Stop(Some(Box::new(conn))));
+        };
+        let gain = caps
+            .frontend
+            .as_ref()
+            .filter(|f| f.has_gain)
+            .map(|f| f.min_gain_db);
+        let (Some(plan), Some(gain)) = (plan_command(&caps, 7), gain) else {
+            return Ok(After::Stop(Some(Box::new(conn))));
+        };
+        if !caps.frontend_control_allowed {
+            return Ok(After::Stop(Some(Box::new(conn))));
+        }
+        started(&conn.call(plan, cfg.response_within).await?)?;
+        let set = Command::SetFrontend(v1::SetFrontend {
+            gain_db: Some(gain),
+            ..Default::default()
+        });
+        expect_code(
+            &conn.call(set, cfg.response_within).await?,
+            v1::ResultCode::Ok,
+            "SetFrontend",
+        )?;
+        let got = conn.collect(cfg.quiet_period).await?;
+        let stopped = measurement_events(&got, v1::event::Kind::MeasurementStopped);
+        ensure(stopped.len() == 1, || {
+            format!(
+                "expected one Event{{MEASUREMENT_STOPPED}}, got {}",
+                stopped.len()
+            )
+        })?;
+        ensure(stopped[0].measurement_id == Some(7), || {
+            "MEASUREMENT_STOPPED for another plan".into()
+        })?;
+        ensure(
+            stopped[0].measurement_stop_reason
+                == Some(v1::MeasurementStopReason::FrontendChanged as i32),
+            || format!("stop reason {:?}", stopped[0].measurement_stop_reason),
+        )?;
+        // A new plan may start right away.
+        let Some(again) = plan_command(&caps, 8) else {
+            return Ok(After::Stop(Some(Box::new(conn))));
+        };
+        started(&conn.call(again, cfg.response_within).await?)?;
+        Ok(After::Stop(Some(Box::new(conn))))
+    })
+    .await
+}
+
+/// One plan per connection: a second `StartMeasurements` is `ALREADY_EXISTS`;
+/// `StopMeasurements` stops it (an unknown plan is `NOT_FOUND`); a plan does
+/// not survive a reconnect (a report for it then would be a violation).
+pub async fn one_plan_per_connection(
+    sut: &mut dyn StationUnderTest,
+    cfg: &ScenarioConfig,
+) -> Result<()> {
+    let harness = Harness::new(LocalPolicy::default()).await;
+    run_scenario(sut, cfg, harness, async |h, _sut| {
+        let mut conn = h.connect(cfg.connect_within, cfg).await?;
+        let Some(caps) = measuring_caps(&mut conn, cfg).await? else {
+            return Ok(After::Stop(Some(Box::new(conn))));
+        };
+        let (Some(first), Some(second)) = (plan_command(&caps, 1), plan_command(&caps, 2)) else {
+            return Ok(After::Stop(Some(Box::new(conn))));
+        };
+        started(&conn.call(first.clone(), cfg.response_within).await?)?;
+        expect_code(
+            &conn.call(second, cfg.response_within).await?,
+            v1::ResultCode::AlreadyExists,
+            "a second StartMeasurements",
+        )?;
+        let stop =
+            |measurement_id| Command::StopMeasurements(v1::StopMeasurements { measurement_id });
+        expect_code(
+            &conn.call(stop(9), cfg.response_within).await?,
+            v1::ResultCode::NotFound,
+            "StopMeasurements of an unknown plan",
+        )?;
+        expect_code(
+            &conn.call(stop(1), cfg.response_within).await?,
+            v1::ResultCode::Ok,
+            "StopMeasurements",
+        )?;
+        started(&conn.call(first, cfg.response_within).await?)?;
+        conn.kill();
+        drop(conn);
+        let mut conn = h.connect(cfg.reconnect_within, cfg).await?;
+        // Reports of the old plan now would be a violation (never started here).
+        let window = cfg.measure_minute.map_or(cfg.quiet_period, |m| m * 6);
+        let got = conn.collect(window).await?;
+        ensure(noise_reports(&got).is_empty(), || {
+            "reports of the previous connection's plan".into()
+        })?;
+        Ok(After::Stop(Some(Box::new(conn))))
+    })
+    .await
+}
+
+/// The owner's switch: `Capabilities.measurements.enabled` is false and a
+/// plan is `PERMISSION_DENIED`.
+pub async fn refuses_measurements_when_disabled(
+    sut: &mut dyn StationUnderTest,
+    cfg: &ScenarioConfig,
+) -> Result<()> {
+    let policy = LocalPolicy {
+        measurements: false,
+        ..LocalPolicy::default()
+    };
+    let harness = Harness::new(policy).await;
+    run_scenario(sut, cfg, harness, async |h, _sut| {
+        let mut conn = h.connect(cfg.connect_within, cfg).await?;
+        let caps = capabilities(&conn.call(get_capabilities(), cfg.response_within).await?)?;
+        let Some(m) = caps.measurements else {
+            return Ok(After::Stop(Some(Box::new(conn))));
+        };
+        ensure(!m.enabled, || {
+            "Capabilities.measurements.enabled is true, the local policy says false".into()
+        })?;
+        let Some(plan) = plan_command(&caps, 3) else {
+            return Ok(After::Stop(Some(Box::new(conn))));
+        };
+        expect_code(
+            &conn.call(plan, cfg.response_within).await?,
+            v1::ResultCode::PermissionDenied,
+            "StartMeasurements with measuring off",
         )?;
         Ok(After::Stop(Some(Box::new(conn))))
     })

@@ -57,4 +57,9 @@ conformance!(
     opens_channel_and_streams_audio,
     subscribes_waterfall_and_streams_rows,
     drops_channels_on_disconnect,
+    measures_when_asked,
+    duty_follows_listeners,
+    stops_measuring_on_frontend_change,
+    one_plan_per_connection,
+    refuses_measurements_when_disabled,
 );

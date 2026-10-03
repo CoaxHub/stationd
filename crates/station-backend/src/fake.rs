@@ -16,9 +16,16 @@
 //!   moves the tunable range (center ± sample rate / 2, inside the hardware
 //!   range), closes channels that fall outside it with
 //!   `Event{CHANNEL_CLOSED}` and sends `Event{FRONTEND_CHANGED}`.
+//! - **Measurement channels** (station protocol 1.1): each poll returns a
+//!   spectrum of a noise floor around −125 dB/Hz that drifts by ±3 dB over
+//!   the UTC day, with deterministic per-bin scatter and a few steady
+//!   carriers ([`FAKE_CARRIERS_HZ`]). Opens, retunes and closes are logged
+//!   ([`FakeBackend::measurement_log`]) for tests.
 //!
-//! Timing uses Tokio's clock, so tests can run it under a paused clock.
-//! Nothing here reads the wall clock or a random source.
+//! Timing uses Tokio's clock, so tests can run it under a paused clock. The
+//! only wall-clock read is the hour of the noise floor's daily curve, from
+//! a replaceable clock ([`FakeBackend::with_wall_clock`]). Nothing here reads
+//! a random source.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -32,9 +39,67 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    AudioStream, Backend, BackendError, ChannelId, ChannelOutput, EventStream, Health, RowStream,
-    SubscriptionId,
+    AudioStream, Backend, BackendError, ChannelId, ChannelOutput, EventStream, Health,
+    MeasurementChannel, MeasurementId, RowStream, Spectrum, SubscriptionId,
 };
+
+/// The steady carriers in the fake measurement spectra, Hz: FT8 and CW on
+/// 40 m and 20 m, a broadcast station on 41 m, and an FM broadcast carrier.
+pub const FAKE_CARRIERS_HZ: [u64; 6] = [
+    7_040_000, 7_074_000, 7_255_000, 14_074_000, 14_230_000, 98_000_000,
+];
+
+/// The fake's measurement placement grid, Hz from the front-end centre (as
+/// radiod's with 500 Hz bins).
+pub const FAKE_MEASUREMENT_GRID_HZ: u64 = 1_000;
+
+/// The fake noise floor's daily mean, dB/Hz...
+const FAKE_FLOOR_DB_HZ: f64 = -125.0;
+/// ...and its daily swing, ± dB.
+const FAKE_FLOOR_SWING_DB: f64 = 3.0;
+/// How far a fake carrier stands above the floor, dB.
+const FAKE_CARRIER_DB: f32 = 30.0;
+
+/// What a test sees of the measurement channels ([`FakeBackend::measurement_log`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeasurementOp {
+    /// Opened at this centre.
+    Open {
+        /// The channel.
+        id: MeasurementId,
+        /// Hz.
+        center_hz: u64,
+    },
+    /// Moved to this centre.
+    Retune {
+        /// The channel.
+        id: MeasurementId,
+        /// Hz.
+        center_hz: u64,
+    },
+    /// Closed.
+    Close {
+        /// The channel.
+        id: MeasurementId,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FakeMeasurement {
+    center_hz: u64,
+    bin_count: u32,
+    resolution_bw_hz: f32,
+    polls: u64,
+}
+
+/// The wall clock of the fake noise floor's daily curve: Unix ms.
+pub type WallClock = Arc<dyn Fn() -> i64 + Send + Sync>;
+
+fn system_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
 
 /// Default quantization when a `SubscribeWaterfall` carries none.
 const DEFAULT_QUANTIZATION: v1::Quantization = v1::Quantization {
@@ -120,6 +185,8 @@ impl Default for FakeConfig {
                 allowed_admin_ops: Vec::new(),
                 frontend_control_allowed: false,
                 sdr_model: "CoaxHub fake SDR".to_owned(),
+                // stationd fills this from its local policy (it measures, the backend doesn't decide).
+                measurements: None,
             },
             frontend: v1::FrontendState {
                 gain_db: 20.0,
@@ -173,17 +240,30 @@ struct State {
     health: Health,
     channels: BTreeMap<ChannelId, OpenChannel>,
     subscriptions: BTreeMap<SubscriptionId, CancellationToken>,
+    measurements: BTreeMap<MeasurementId, FakeMeasurement>,
+    measurement_log: Vec<(Instant, MeasurementOp)>,
+    measurement_failure: bool,
 }
 
 /// A deterministic in-memory backend; see the [module docs](self).
 ///
 /// Cloning gives another handle to the same backend.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct FakeBackend {
     info: v1::BackendInfo,
     state: Arc<Mutex<State>>,
     events: broadcast::Sender<v1::Event>,
     epoch: Instant,
+    wall_clock: WallClock,
+}
+
+impl std::fmt::Debug for FakeBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FakeBackend")
+            .field("info", &self.info)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for FakeBackend {
@@ -204,10 +284,37 @@ impl FakeBackend {
                 health: config.health,
                 channels: BTreeMap::new(),
                 subscriptions: BTreeMap::new(),
+                measurements: BTreeMap::new(),
+                measurement_log: Vec::new(),
+                measurement_failure: false,
             })),
             events,
             epoch: Instant::now(),
+            wall_clock: Arc::new(system_unix_ms),
         }
+    }
+
+    /// Replaces the wall clock of the noise floor's daily curve (Unix ms).
+    #[must_use]
+    pub fn with_wall_clock(mut self, clock: WallClock) -> Self {
+        self.wall_clock = clock;
+        self
+    }
+
+    /// Every open, retune and close of a measurement channel so far, with
+    /// the Tokio instant it happened at.
+    pub fn measurement_log(&self) -> Vec<(Instant, MeasurementOp)> {
+        self.state().measurement_log.clone()
+    }
+
+    /// The open measurement channels, ascending.
+    pub fn measurement_ids(&self) -> Vec<MeasurementId> {
+        self.state().measurements.keys().copied().collect()
+    }
+
+    /// Makes every measurement call fail with `BACKEND_ERROR` (or work again).
+    pub fn set_measurement_failure(&self, fail: bool) {
+        self.state().measurement_failure = fail;
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -536,14 +643,13 @@ impl Backend for FakeBackend {
                 channel_id: Some(id),
                 subscription_id: None,
                 detail: "outside the new passband".to_owned(),
+                ..Default::default()
             });
         }
         if retuned {
             self.emit_event(v1::Event {
                 kind: v1::event::Kind::FrontendChanged as i32,
-                channel_id: None,
-                subscription_id: None,
-                detail: String::new(),
+                ..Default::default()
             });
         }
         Ok(reply)
@@ -582,6 +688,188 @@ impl Backend for FakeBackend {
     fn events(&self) -> EventStream {
         // A lagging subscriber skips what it missed.
         Box::pin(BroadcastStream::new(self.events.subscribe()).filter_map(|e| async { e.ok() }))
+    }
+
+    async fn frontend_state(&self) -> Result<v1::FrontendState, BackendError> {
+        Ok(self.state().frontend.clone())
+    }
+
+    fn can_measure(&self) -> bool {
+        true
+    }
+
+    async fn open_measurement(
+        &self,
+        id: MeasurementId,
+        channel: MeasurementChannel,
+    ) -> Result<(), BackendError> {
+        let mut state = self.state();
+        if state.measurement_failure {
+            return Err(BackendError::backend("measurement channels are failing"));
+        }
+        if state.measurements.contains_key(&id) {
+            return Err(BackendError::already_exists(format!(
+                "measurement {id} is already open"
+            )));
+        }
+        if !limits::MEASURE_BIN_COUNTS.contains(&channel.bin_count)
+            || !limits::is_measurement_rbw(channel.resolution_bw_hz)
+        {
+            return Err(BackendError::invalid_argument(
+                "bin count or resolution not allowed",
+            ));
+        }
+        if !contains(state.capabilities.tunable_range.as_ref(), channel.center_hz) {
+            return Err(BackendError::out_of_range(
+                "centre outside the tunable range",
+            ));
+        }
+        state.measurements.insert(
+            id,
+            FakeMeasurement {
+                center_hz: channel.center_hz,
+                bin_count: channel.bin_count,
+                resolution_bw_hz: channel.resolution_bw_hz,
+                polls: 0,
+            },
+        );
+        let center_hz = channel.center_hz;
+        state
+            .measurement_log
+            .push((Instant::now(), MeasurementOp::Open { id, center_hz }));
+        Ok(())
+    }
+
+    async fn measurement_grid(&self, _resolution_bw_hz: f32) -> Option<crate::MeasurementGrid> {
+        Some(crate::MeasurementGrid {
+            anchor_hz: self.state().frontend.center_frequency_hz,
+            grid_hz: FAKE_MEASUREMENT_GRID_HZ,
+        })
+    }
+
+    async fn retune_measurement(
+        &self,
+        id: MeasurementId,
+        center_hz: u64,
+    ) -> Result<Option<Spectrum>, BackendError> {
+        let mut state = self.state();
+        if state.measurement_failure {
+            return Err(BackendError::backend("measurement channels are failing"));
+        }
+        if !contains(state.capabilities.tunable_range.as_ref(), center_hz) {
+            return Err(BackendError::out_of_range(
+                "centre outside the tunable range",
+            ));
+        }
+        let Some(m) = state.measurements.get_mut(&id) else {
+            return Err(BackendError::not_found(format!(
+                "measurement {id} is not open"
+            )));
+        };
+        m.center_hz = center_hz;
+        m.polls = m.polls.wrapping_add(1);
+        let m = *m;
+        state
+            .measurement_log
+            .push((Instant::now(), MeasurementOp::Retune { id, center_hz }));
+        drop(state);
+        // As radiod's: the move's reply carries a spectrum of the new window.
+        Ok(Some(fake_spectrum(id, &m, (self.wall_clock)())))
+    }
+
+    async fn poll_measurement(&self, id: MeasurementId) -> Result<Spectrum, BackendError> {
+        let m = {
+            let mut state = self.state();
+            if state.measurement_failure {
+                return Err(BackendError::backend("measurement channels are failing"));
+            }
+            let Some(m) = state.measurements.get_mut(&id) else {
+                return Err(BackendError::not_found(format!(
+                    "measurement {id} is not open"
+                )));
+            };
+            m.polls = m.polls.wrapping_add(1);
+            *m
+        };
+        Ok(fake_spectrum(id, &m, (self.wall_clock)()))
+    }
+
+    async fn close_measurement(&self, id: MeasurementId) -> Result<(), BackendError> {
+        let mut state = self.state();
+        if state.measurements.remove(&id).is_none() {
+            return Err(BackendError::not_found(format!(
+                "measurement {id} is not open"
+            )));
+        }
+        state
+            .measurement_log
+            .push((Instant::now(), MeasurementOp::Close { id }));
+        Ok(())
+    }
+}
+
+/// `SplitMix64`: a deterministic scatter for the fake spectra.
+fn mix(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// The fake noise floor at `unix_ms`, dB/Hz: lowest before dawn (UTC), a
+/// ±3 dB daily curve.
+fn fake_floor_db_hz(unix_ms: i64) -> f64 {
+    #[allow(clippy::cast_precision_loss, reason = "ms of a day fit an f64")]
+    let day = unix_ms.rem_euclid(86_400_000) as f64 / 86_400_000.0;
+    FAKE_FLOOR_DB_HZ + FAKE_FLOOR_SWING_DB * (std::f64::consts::TAU * (day - 0.375)).sin()
+}
+
+/// One fake spectrum: per-bin power (dB, not density) of the floor, a
+/// scatter like averaged noise, and the carriers in range.
+fn fake_spectrum(id: MeasurementId, m: &FakeMeasurement, unix_ms: i64) -> Spectrum {
+    let rbw = f64::from(m.resolution_bw_hz);
+    let floor = fake_floor_db_hz(unix_ms) + 10.0 * rbw.log10();
+    let half = f64::from(m.bin_count) / 2.0;
+    #[allow(clippy::cast_precision_loss, reason = "frequencies below 2^53 Hz")]
+    let center = m.center_hz as f64;
+    let power_db = (0..m.bin_count)
+        .map(|i| {
+            let hz = center + (f64::from(i) - half.floor()) * rbw;
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "positive"
+            )]
+            let bin_key = (hz / rbw.max(1.0)).max(0.0) as u64;
+            let r = mix(bin_key ^ m.polls.wrapping_mul(0x1000_0000_01B3) ^ u64::from(id) << 48);
+            // Uniform in (0, 1), then the log of an exponential (noise power),
+            // halved: an averaged spectrum scatters less.
+            #[allow(clippy::cast_precision_loss, reason = "53 bits of a random u64")]
+            let u = ((r >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
+            let scatter = 5.0 * (-u.ln()).log10();
+            let carrier = FAKE_CARRIERS_HZ
+                .iter()
+                .map(|&c| {
+                    #[allow(clippy::cast_precision_loss, reason = "frequencies below 2^53 Hz")]
+                    let off = ((hz - c as f64) / rbw).abs();
+                    if off < 0.5 {
+                        f64::from(FAKE_CARRIER_DB)
+                    } else if off < 1.5 {
+                        f64::from(FAKE_CARRIER_DB) - 10.0
+                    } else {
+                        0.0
+                    }
+                })
+                .fold(0.0, f64::max);
+            #[allow(clippy::cast_possible_truncation, reason = "dB values")]
+            let v = (floor + scatter + carrier) as f32;
+            v
+        })
+        .collect();
+    Spectrum {
+        center_hz: m.center_hz,
+        bin_hz: m.resolution_bw_hz,
+        power_db,
     }
 }
 
@@ -777,6 +1065,96 @@ mod tests {
             Ok(_) => v1::ResultCode::Ok,
             Err(e) => e.code,
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn measurement_channels() {
+        // 06:00 UTC: the bottom of the daily curve.
+        let b = FakeBackend::default().with_wall_clock(Arc::new(|| 6 * 3_600_000));
+        assert!(b.can_measure());
+        let ch = MeasurementChannel {
+            center_hz: 7_150_000,
+            bin_count: 1024,
+            resolution_bw_hz: 500.0,
+            poll_interval: Duration::from_millis(500),
+        };
+        b.open_measurement(1, ch).await.expect("open");
+        assert_eq!(
+            code(b.open_measurement(1, ch).await),
+            v1::ResultCode::AlreadyExists
+        );
+        let far = MeasurementChannel {
+            center_hz: 14_000_000,
+            ..ch
+        };
+        assert_eq!(
+            code(b.open_measurement(2, far).await),
+            v1::ResultCode::OutOfRange
+        );
+        let s = b.poll_measurement(1).await.expect("poll");
+        assert_eq!(s.power_db.len(), 1024);
+        assert_eq!(s.center_hz, 7_150_000);
+        // The floor in density: −125 − 3 dB/Hz, plus 27 dB for 500 Hz bins.
+        let mut sorted = s.power_db.clone();
+        sorted.sort_by(f32::total_cmp);
+        let median = sorted[512] - 10.0 * 500f32.log10();
+        assert!((-131.0..-125.0).contains(&median), "{median}");
+        // The 7.074 MHz carrier stands out (bin i is centred at 7.15 MHz + (i − 512) · 500 Hz).
+        let bin = usize::try_from((7_074_000 - (7_150_000 - 256_000)) / 500).expect("bin");
+        assert!(s.power_db[bin] > sorted[1000], "carrier");
+        // Each poll scatters differently, deterministically.
+        let s2 = b.poll_measurement(1).await.expect("poll");
+        assert_ne!(s.power_db, s2.power_db);
+        let moved = b.retune_measurement(1, 7_000_000).await.expect("retune");
+        assert_eq!(
+            moved.map(|s| s.center_hz),
+            Some(7_000_000),
+            "the reply's spectrum"
+        );
+        assert_eq!(
+            b.measurement_grid(500.0).await,
+            Some(crate::MeasurementGrid {
+                anchor_hz: 7_100_000,
+                grid_hz: 1_000
+            })
+        );
+        assert_eq!(
+            b.poll_measurement(1).await.expect("poll").center_hz,
+            7_000_000
+        );
+        b.set_measurement_failure(true);
+        assert_eq!(
+            code(b.poll_measurement(1).await),
+            v1::ResultCode::BackendError
+        );
+        b.set_measurement_failure(false);
+        b.close_measurement(1).await.expect("close");
+        assert_eq!(code(b.close_measurement(1).await), v1::ResultCode::NotFound);
+        assert!(b.measurement_ids().is_empty());
+        let ops: Vec<MeasurementOp> = b.measurement_log().into_iter().map(|(_, op)| op).collect();
+        assert_eq!(
+            ops,
+            [
+                MeasurementOp::Open {
+                    id: 1,
+                    center_hz: 7_150_000
+                },
+                MeasurementOp::Retune {
+                    id: 1,
+                    center_hz: 7_000_000
+                },
+                MeasurementOp::Close { id: 1 },
+            ]
+        );
+        assert_eq!(
+            b.frontend_state()
+                .await
+                .expect("frontend")
+                .center_frequency_hz,
+            7_100_000
+        );
+        // The trait's default: a backend that cannot measure.
+        assert!(fake_floor_db_hz(18 * 3_600_000) > fake_floor_db_hz(6 * 3_600_000));
     }
 
     #[tokio::test]

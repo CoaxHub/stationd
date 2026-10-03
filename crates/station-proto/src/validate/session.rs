@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use prost::Message as _;
 
 use super::fields::check_message;
+use super::measure::Plans;
 use super::negotiate::negotiate;
 use super::rate::{Sustained, TokenBucket, media_capacity};
 use super::waterfall::WaterfallDecoder;
@@ -44,6 +45,13 @@ pub enum RequestError {
     /// `SubscribeWaterfall` for a subscription that is already open.
     #[error("subscription {0} is already open")]
     SubscriptionInUse(u32),
+    /// `StartMeasurements` for a plan that is already open.
+    #[error("measurement {0} is already open")]
+    MeasurementInUse(u32),
+    /// A command the negotiated minor does not have (`StartMeasurements` on a
+    /// 1.0 session).
+    #[error("{0} is not part of the negotiated minor")]
+    NotInMinor(CommandKind),
 }
 
 /// Requests whose deadline passed, from [`Session::expire_requests`].
@@ -78,6 +86,10 @@ enum Pending {
         nonce: u64,
     },
     AdminOp,
+    StartMeasurements {
+        measurement_id: u32,
+    },
+    StopMeasurements,
 }
 
 impl Pending {
@@ -101,6 +113,10 @@ impl Pending {
             Command::UnsubscribeWaterfall(_) => Self::UnsubscribeWaterfall,
             Command::Ping(p) => Self::Ping { nonce: p.nonce },
             Command::AdminOp(_) => Self::AdminOp,
+            Command::StartMeasurements(m) => Self::StartMeasurements {
+                measurement_id: m.measurement_id,
+            },
+            Command::StopMeasurements(_) => Self::StopMeasurements,
         }
     }
 
@@ -115,6 +131,8 @@ impl Pending {
             Self::UnsubscribeWaterfall => CommandKind::UnsubscribeWaterfall,
             Self::Ping { .. } => CommandKind::Ping,
             Self::AdminOp => CommandKind::AdminOp,
+            Self::StartMeasurements { .. } => CommandKind::StartMeasurements,
+            Self::StopMeasurements => CommandKind::StopMeasurements,
         }
     }
 }
@@ -224,6 +242,7 @@ pub struct Session {
     consecutive_timeouts: u32,
     channels: HashMap<u32, Channel>,
     subscriptions: HashMap<u32, Subscription>,
+    plans: Plans,
     status: TokenBucket,
     events: TokenBucket,
     decoder: WaterfallDecoder,
@@ -245,6 +264,7 @@ impl Session {
             consecutive_timeouts: 0,
             channels: HashMap::new(),
             subscriptions: HashMap::new(),
+            plans: Plans::default(),
             status: status_bucket(limits::DEFAULT_STATUS_INTERVAL, now),
             events: TokenBucket::new(
                 f64::from(limits::EVENT_RATE_PER_SECOND),
@@ -298,6 +318,14 @@ impl Session {
             return Err(RequestError::TooManyOutstanding(self.outstanding.len()));
         }
         let command = req.command.as_ref().ok_or(RequestError::MissingCommand)?;
+        let minor = self.version.map_or(0, |v| v.minor);
+        if matches!(
+            command,
+            Command::StartMeasurements(_) | Command::StopMeasurements(_)
+        ) && minor < limits::MEASUREMENTS_MINOR
+        {
+            return Err(RequestError::NotInMinor(CommandKind::of(command)));
+        }
         self.collect_garbage(now);
         match command {
             Command::OpenChannel(o) => {
@@ -330,6 +358,12 @@ impl Session {
                     sub.closed_at.get_or_insert(now);
                 }
             }
+            Command::StartMeasurements(m) => {
+                self.plans
+                    .on_start_sent(m, now)
+                    .map_err(|e| RequestError::MeasurementInUse(e.0))?;
+            }
+            Command::StopMeasurements(m) => self.plans.on_stop_sent(m.measurement_id, now),
             Command::GetCapabilities(_)
             | Command::UpdateChannel(_)
             | Command::SetFrontend(_)
@@ -352,6 +386,11 @@ impl Session {
     /// Whether `channel_id` is open (not closed, not in its grace period).
     pub fn is_channel_open(&self, channel_id: u32, now: Instant) -> bool {
         self.channel_state(channel_id, now) == IdState::Open
+    }
+
+    /// Whether the plan `measurement_id` is open (1.1).
+    pub fn is_measurement_open(&self, measurement_id: u32, now: Instant) -> bool {
+        self.plans.is_open(measurement_id, now)
     }
 
     /// Whether `subscription_id` is open.
@@ -431,9 +470,24 @@ impl Session {
         }
     }
 
-    /// Checks one station message against §5 and updates the session.
+    /// Checks one station message against §5 and updates the session,
+    /// without the wall-clock plausibility checks of §5.2 (see
+    /// [`check_at`](Self::check_at)).
     pub fn check(&mut self, msg: &v1::StationMessage, now: Instant) -> Verdict {
-        match self.check_inner(msg, now) {
+        self.check_at(msg, now, None)
+    }
+
+    /// [`check`](Self::check) with the hub's wall clock, `unix_ms` (Unix
+    /// milliseconds), for the plausibility checks of measurement times
+    /// (§5.2): a noise window outside [now − 15 min, now + 5 s] or a duty
+    /// change outside [now − 60 s, now + 65 s] is dropped. `None` skips them.
+    pub fn check_at(
+        &mut self,
+        msg: &v1::StationMessage,
+        now: Instant,
+        unix_ms: Option<i64>,
+    ) -> Verdict {
+        match self.check_inner(msg, now, unix_ms) {
             Ok(None) => Verdict::Accept,
             Ok(Some(reason)) => Verdict::Drop(reason),
             Err(kind) => Verdict::Violation(kind),
@@ -444,6 +498,7 @@ impl Session {
         &mut self,
         msg: &v1::StationMessage,
         now: Instant,
+        unix_ms: Option<i64>,
     ) -> Result<Option<DropReason>, ViolationKind> {
         use v1::station_message::Body;
         if now > self.last_message_at {
@@ -491,7 +546,8 @@ impl Session {
                     kind: MessageKind::Status,
                 })
             }),
-            Body::Event(e) => Ok(self.check_event(e, now)),
+            Body::Event(e) => self.check_event(e, now, unix_ms),
+            Body::Noise(n) => self.plans.check_noise(n, now, unix_ms),
         }
     }
 
@@ -586,6 +642,17 @@ impl Session {
             }
             (Pending::Ping { nonce }, Some(Payload::Pong(p))) if p.nonce != nonce => {
                 return Err(mismatch("pong.nonce"));
+            }
+            (
+                Pending::StartMeasurements { measurement_id },
+                Some(Payload::MeasurementsStarted(m)),
+            ) => {
+                self.plans
+                    .on_started(measurement_id, m, now)
+                    .map_err(mismatch)?;
+            }
+            (Pending::StartMeasurements { measurement_id }, None) => {
+                self.plans.on_refused(measurement_id);
             }
             _ => {}
         }
@@ -695,22 +762,36 @@ impl Session {
         }
     }
 
-    fn check_event(&mut self, e: &v1::Event, now: Instant) -> Option<DropReason> {
+    fn check_event(
+        &mut self,
+        e: &v1::Event,
+        now: Instant,
+        unix_ms: Option<i64>,
+    ) -> Result<Option<DropReason>, ViolationKind> {
         use v1::event::Kind;
         if !self.events.try_take(now) {
-            return Some(DropReason::RateLimited {
+            return Ok(Some(DropReason::RateLimited {
                 kind: MessageKind::Event,
-            });
+            }));
         }
         if let Some(id) = e.channel_id {
             if self.channel_state(id, now) == IdState::Unknown {
-                return Some(DropReason::UnknownEventTarget);
+                return Ok(Some(DropReason::UnknownEventTarget));
             }
         }
         if let Some(id) = e.subscription_id {
             if self.subscription_state(id, now) == IdState::Unknown {
-                return Some(DropReason::UnknownEventTarget);
+                return Ok(Some(DropReason::UnknownEventTarget));
             }
+        }
+        // 1.1: measurement events (`check_message` dropped the fields' meaning
+        // on a 1.0 session, whose kinds can't be measurement kinds).
+        let measurement_kind = matches!(
+            Kind::try_from(e.kind),
+            Ok(Kind::MeasurementStopped | Kind::MeasurementDuty)
+        );
+        if measurement_kind {
+            return self.plans.check_event(e, now, unix_ms);
         }
         match Kind::try_from(e.kind) {
             Ok(Kind::ChannelClosed) => {
@@ -736,7 +817,7 @@ impl Session {
             }
             _ => {}
         }
-        None
+        Ok(None)
     }
 
     fn channel_state(&self, id: u32, now: Instant) -> IdState {

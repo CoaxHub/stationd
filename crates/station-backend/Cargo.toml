@@ -22,4 +22,5 @@ tokio-util = "0.7.19"
 zstd = { version = "0.14.0", default-features = false }
 
 [dev-dependencies]
+proptest = "1.11.0"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "test-util", "macros"] }

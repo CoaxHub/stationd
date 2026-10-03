@@ -22,17 +22,26 @@
 //!   also simply drop a stream; the backend must tolerate that.
 //! - Nothing here is per connection: `stationd` closes every channel and
 //!   subscription itself when the tunnel drops (§2.3).
+//! - **Measurement channels** (station protocol 1.1, the measurement design §2.2) are
+//!   `stationd`'s own spectrum channels, outside listener capacity: never
+//!   counted against `max_channels` or `max_waterfall_subscriptions`, and
+//!   never a reason to refuse a listener. Their IDs ([`MeasurementId`]) are
+//!   `stationd`'s, not the hub's. A backend that can measure overrides
+//!   [`Backend::can_measure`] and the four `*_measurement` methods: open with
+//!   a fixed bin count and resolution, retune (the bin count never changes on
+//!   a live channel), poll, close. Measuring never changes the front end.
 //!
-//! The `backend-ka9q` crate implements this trait.
+//! `backend-ka9q` implements this trait for radiod.
 
 pub mod fake;
+pub mod reduce;
 
 use std::pin::Pin;
 
 use futures_util::Stream;
 use station_proto::v1;
 
-pub use fake::{FakeBackend, FakeConfig};
+pub use fake::{FAKE_MEASUREMENT_GRID_HZ, FakeBackend, FakeConfig, MeasurementOp};
 
 /// A hub-assigned audio channel ID (`OpenChannel.channel_id`).
 pub type ChannelId = u32;
@@ -40,6 +49,48 @@ pub type ChannelId = u32;
 /// A hub-assigned waterfall subscription ID
 /// (`SubscribeWaterfall.subscription_id`).
 pub type SubscriptionId = u32;
+
+/// A measurement channel ID, chosen by `stationd` (not by the hub).
+pub type MeasurementId = u32;
+
+/// A measurement spectrum channel to open (the measurement design §2.2).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MeasurementChannel {
+    /// The first window's centre, Hz.
+    pub center_hz: u64,
+    /// Bins per spectrum, fixed for the channel's life.
+    pub bin_count: u32,
+    /// Width of one bin, Hz.
+    pub resolution_bw_hz: f32,
+    /// How often `stationd` will poll it (a backend that polls on its own
+    /// clock uses this).
+    pub poll_interval: std::time::Duration,
+}
+
+/// Where a backend places a measurement window exactly: centres whose offset
+/// from `anchor_hz` (radiod: the front end's LO) is a multiple of `grid_hz`.
+/// Off the grid a spectrum may sit up to one bin away from where it says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeasurementGrid {
+    /// The grid's origin, Hz.
+    pub anchor_hz: u64,
+    /// Its step, Hz.
+    pub grid_hz: u64,
+}
+
+/// One polled spectrum of a measurement channel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Spectrum {
+    /// The centre the spectrum was taken at, Hz.
+    pub center_hz: u64,
+    /// Width of one bin, Hz.
+    pub bin_hz: f32,
+    /// Power per bin in dB on the backend's uncalibrated scale (not yet
+    /// normalised to density), lowest frequency first; `bin_count` values.
+    /// Bin `i` is centred at `center_hz + (i − n/2) · bin_hz` (`n/2` rounded
+    /// down: radiod's convention).
+    pub power_db: Vec<f32>,
+}
 
 /// What an open channel produces, in order.
 #[derive(Debug, Clone, PartialEq)]
@@ -172,6 +223,80 @@ pub trait Backend: Send + Sync + 'static {
     /// A new stream of backend events, from now on. Each call returns an
     /// independent stream (`stationd` subscribes once per connection).
     fn events(&self) -> EventStream;
+
+    /// The current front-end settings, for measurement reports. The default
+    /// builds them from [`Backend::capabilities`] and [`Backend::health`]
+    /// (gain and centre; no AGC, attenuation or antenna port).
+    async fn frontend_state(&self) -> Result<v1::FrontendState, BackendError> {
+        let caps = self.capabilities().await?;
+        let health = self.health();
+        let frontend = health.frontend.unwrap_or_default();
+        let center = caps
+            .tunable_range
+            .map_or(frontend.center_frequency_hz, |r| {
+                if frontend.center_frequency_hz == 0 {
+                    r.start_hz / 2 + r.end_hz / 2
+                } else {
+                    frontend.center_frequency_hz
+                }
+            });
+        Ok(v1::FrontendState {
+            gain_db: frontend.gain_db,
+            hardware_agc: false,
+            attenuation_db: 0.0,
+            antenna_port: String::new(),
+            center_frequency_hz: center,
+            tunable_range: caps.tunable_range,
+        })
+    }
+
+    /// Whether this backend has measurement channels (station protocol 1.1).
+    fn can_measure(&self) -> bool {
+        false
+    }
+
+    /// Opens measurement channel `id`.
+    async fn open_measurement(
+        &self,
+        id: MeasurementId,
+        channel: MeasurementChannel,
+    ) -> Result<(), BackendError> {
+        let _ = (id, channel);
+        Err(BackendError::unsupported("this backend cannot measure"))
+    }
+
+    /// Where windows of `resolution_bw_hz` bins sit exactly on the current
+    /// front end; `None` when the backend places them anywhere (or can't
+    /// tell).
+    async fn measurement_grid(&self, resolution_bw_hz: f32) -> Option<MeasurementGrid> {
+        let _ = resolution_bw_hz;
+        None
+    }
+
+    /// Moves measurement channel `id` to `center_hz` (same bin count and
+    /// resolution). Returns the spectrum the move's own reply carries when
+    /// the backend's reply has one taken after the move (radiod's does):
+    /// `stationd` counts it as the dwell's first spectrum.
+    async fn retune_measurement(
+        &self,
+        id: MeasurementId,
+        center_hz: u64,
+    ) -> Result<Option<Spectrum>, BackendError> {
+        let _ = (id, center_hz);
+        Err(BackendError::unsupported("this backend cannot measure"))
+    }
+
+    /// Polls measurement channel `id` for a fresh spectrum.
+    async fn poll_measurement(&self, id: MeasurementId) -> Result<Spectrum, BackendError> {
+        let _ = id;
+        Err(BackendError::unsupported("this backend cannot measure"))
+    }
+
+    /// Closes measurement channel `id`.
+    async fn close_measurement(&self, id: MeasurementId) -> Result<(), BackendError> {
+        let _ = id;
+        Err(BackendError::unsupported("this backend cannot measure"))
+    }
 }
 
 #[cfg(test)]
