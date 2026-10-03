@@ -154,7 +154,7 @@ impl Runner {
     }
 
     fn load(&self) -> Load {
-        let host = (self.deps.host)();
+        let host = self.deps.load.sample();
         let health = self.deps.backend.health();
         Load {
             load_avg_1m: host.load_avg_1m,

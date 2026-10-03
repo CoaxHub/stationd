@@ -84,11 +84,8 @@ pub fn host_health_from(root: &Path) -> v1::HostHealth {
         .map(|s| parse_meminfo(&s))
         .unwrap_or_default();
     v1::HostHealth {
-        load_avg_1m: read("proc/loadavg")
-            .and_then(|s| parse_loadavg(&s))
-            .unwrap_or(0.0),
-        cpu_count: std::thread::available_parallelism()
-            .map_or(0, |n| u32::try_from(n.get()).unwrap_or(u32::MAX)),
+        load_avg_1m: load_avg_1m_from(root),
+        cpu_count: cpu_count(),
         cpu_temp_c: read("sys/class/thermal/thermal_zone0/temp")
             .and_then(|s| parse_millidegrees(&s)),
         mem_used_bytes: mem_total_bytes.saturating_sub(mem_available),
@@ -97,6 +94,20 @@ pub fn host_health_from(root: &Path) -> v1::HostHealth {
             .and_then(|s| parse_uptime(&s))
             .unwrap_or(0),
     }
+}
+
+/// The 1-minute load average from `proc/loadavg` under `root` (0 when it
+/// can't be read).
+pub fn load_avg_1m_from(root: &Path) -> f32 {
+    std::fs::read_to_string(root.join("proc/loadavg"))
+        .ok()
+        .and_then(|s| parse_loadavg(&s))
+        .unwrap_or(0.0)
+}
+
+/// The CPUs this process may use (0 when unknown).
+pub fn cpu_count() -> u32 {
+    std::thread::available_parallelism().map_or(0, |n| u32::try_from(n.get()).unwrap_or(u32::MAX))
 }
 
 fn finite(v: f32) -> Option<f32> {

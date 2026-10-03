@@ -5,7 +5,7 @@
 //! | | development (default) | packaged (`--features packaged`) |
 //! |---|---|---|
 //! | `CoaxHub` domain and root | none built in | compiled in by `build.rs` |
-//! | `state_dir`, `[endpoints]`, `[credentials]`, `[backend]` | accepted | rejected |
+//! | `state_dir`, `[endpoints]`, `[credentials]`, `[backend]`, `[measurements] ignore_host_load` | accepted | rejected |
 //! | SDR profiles | all, including `siggen` | production profiles only |
 //! | runtime status file | `<state_dir>/status.json` | `/run/coaxhub/stationd/status.json` |
 //! | radiod templates | `packaging/radiod-templates/` | `/usr/share/coaxhub/radiod-templates/` |

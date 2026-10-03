@@ -46,11 +46,7 @@ fn rig_with(enabled: bool, backend: FakeBackend) -> Rig {
         tables: Arc::clone(&tables),
         drops,
         clock: Arc::new(clock),
-        host: Arc::new(move || v1::HostHealth {
-            load_avg_1m: *host_load.lock().expect("load"),
-            cpu_count: 4,
-            ..Default::default()
-        }),
+        load: Arc::new(SharedLoad(host_load)),
         clock_state: Arc::new(|| v1::ClockState {
             synchronized: true,
             max_error_ms: 0,
@@ -82,6 +78,19 @@ fn rig_with(enabled: bool, backend: FakeBackend) -> Rig {
         seen,
         load,
         _collector: collector,
+    }
+}
+
+/// A load the test changes as it goes, on 4 CPUs.
+#[derive(Debug)]
+struct SharedLoad(Arc<Mutex<f32>>);
+
+impl LoadSource for SharedLoad {
+    fn sample(&self) -> HostLoad {
+        HostLoad {
+            load_avg_1m: *self.0.lock().expect("load"),
+            cpu_count: 4,
+        }
     }
 }
 

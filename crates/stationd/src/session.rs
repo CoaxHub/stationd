@@ -177,7 +177,7 @@ pub(crate) async fn run(
             tables: Arc::clone(&tables),
             drops: Arc::clone(&ctx.drops),
             clock: Arc::clone(&ctx.measure_clock),
-            host: Arc::new(status::host_health),
+            load: Arc::clone(&ctx.measure_load),
             clock_state: Arc::new(measure::clock::clock_state),
             enabled: ctx.policy.measurements,
         })
