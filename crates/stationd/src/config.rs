@@ -35,6 +35,8 @@
 //! [backend.ka9q]                           # required with kind = "ka9q", refused otherwise
 //! status_group = "239.77.0.6:5006"         # radiod's status group, or its status name
 //! data_group = "239.77.0.4:5004"           # optional; default: asked from radiod
+//! [measurements]
+//! ignore_host_load = true                  # measuring never pauses for the host's load
 //! ```
 //!
 //! - `[sdr]` is required unless a `[backend]` section chooses the backend.
@@ -265,6 +267,9 @@ impl RawBackend {
 struct RawMeasurements {
     #[serde(default = "default_true")]
     enabled: bool,
+    /// Development builds: the pause rule ignores the host's load.
+    #[serde(default)]
+    ignore_host_load: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -525,6 +530,10 @@ pub struct Config {
     pub endpoints: Option<Endpoints>,
     /// Where the tunnel credentials come from.
     pub credentials: CredentialsMode,
+    /// `[measurements] ignore_host_load` (development builds): measuring's
+    /// pause rule ignores the host's load average (the measurement design §4.1), for the
+    /// end-to-end scripts on a busy machine.
+    pub ignore_host_load: bool,
 }
 
 impl Config {
@@ -567,6 +576,12 @@ impl Config {
                 (raw.endpoints.is_some(), "endpoints"),
                 (raw.credentials.is_some(), "credentials"),
                 (raw.backend.is_some(), "backend"),
+                (
+                    raw.measurements
+                        .as_ref()
+                        .is_some_and(|m| m.ignore_host_load),
+                    "measurements.ignore_host_load",
+                ),
             ] {
                 if present {
                     return Err(ConfigError::DevelopmentOnly { field });
@@ -579,7 +594,11 @@ impl Config {
             raw.max_channels,
             raw.max_waterfall_subscriptions,
         )?;
-        policy.measurements = raw.measurements.is_none_or(|m| m.enabled);
+        policy.measurements = raw.measurements.as_ref().is_none_or(|m| m.enabled);
+        let ignore_host_load = raw
+            .measurements
+            .as_ref()
+            .is_some_and(|m| m.ignore_host_load);
         let sdr = raw.sdr.as_ref().map(|s| sdr(s, flavour)).transpose()?;
         let (backend, backend_explicit) = match (raw.backend, sdr) {
             (Some(b), _) => (b.validate()?, true),
@@ -633,6 +652,7 @@ impl Config {
             runtime_dir,
             endpoints,
             credentials,
+            ignore_host_load,
         })
     }
 
@@ -925,6 +945,10 @@ mod tests {
             ),
             (STATIC.to_owned(), "credentials"),
             (format!("{OWNER}\n[backend]\nkind = \"fake\"\n"), "backend"),
+            (
+                format!("{OWNER}\n[measurements]\nignore_host_load = true\n"),
+                "measurements.ignore_host_load",
+            ),
         ];
         for (text, field) in cases {
             // Accepted by development builds...
@@ -1065,6 +1089,17 @@ mod tests {
         assert!(!off.policy.measurements);
         let on = parse(&dir, &with("[measurements]\n")).expect("valid");
         assert!(on.policy.measurements);
+        assert!(!on.ignore_host_load);
+        let ignore =
+            parse(&dir, &with("[measurements]\nignore_host_load = true\n")).expect("valid");
+        assert!(ignore.policy.measurements && ignore.ignore_host_load);
+        // Off is not a development setting: packaged builds accept it.
+        Config::parse_as(
+            &format!("{OWNER}\n[measurements]\nignore_host_load = false\n"),
+            dir.path(),
+            PKG,
+        )
+        .expect("packaged builds accept the default");
         assert!(matches!(
             parse(&dir, &with("[measurements]\nmax_carriers = 3\n")),
             Err(ConfigError::Parse { .. })

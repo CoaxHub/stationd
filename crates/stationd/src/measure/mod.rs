@@ -21,6 +21,7 @@
 //! refused with `PERMISSION_DENIED`.
 
 pub mod clock;
+pub mod load;
 pub mod plan;
 mod runner;
 pub mod schedule;
@@ -39,6 +40,7 @@ use crate::dispatch::Tables;
 use crate::outbound::{DropCounters, Outbound};
 
 pub use self::clock::{MeasureClock, ScaledClock, SystemClock};
+pub use self::load::{FixedLoad, HostLoad, LoadSource, ProcLoad};
 pub use self::runner::{CLOSE_AFTER_MS, HOP_SETTLE_POLLS, OPEN_BEFORE_MS, WARMUP_MS};
 use self::runner::{Runner, StopCause};
 use self::schedule::duty_for;
@@ -56,8 +58,8 @@ pub struct MeasureDeps {
     pub drops: Arc<DropCounters>,
     /// The schedule's wall clock.
     pub clock: Arc<dyn MeasureClock>,
-    /// Host metrics (the load average).
-    pub host: Arc<dyn Fn() -> v1::HostHealth + Send + Sync>,
+    /// The host's load (the pause rule).
+    pub load: Arc<dyn LoadSource>,
     /// The clock state reports carry.
     pub clock_state: Arc<dyn Fn() -> v1::ClockState + Send + Sync>,
     /// `[measurements] enabled`.
@@ -68,6 +70,7 @@ impl std::fmt::Debug for MeasureDeps {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MeasureDeps")
             .field("clock", &self.clock)
+            .field("load", &self.load)
             .field("enabled", &self.enabled)
             .finish_non_exhaustive()
     }

@@ -41,7 +41,7 @@ use uuid::Uuid;
 use crate::config::{Config, CredentialsMode, Endpoint, LocalPolicy};
 use crate::credentials::{self, CredentialSource, Credentials, CredentialsError};
 use crate::dispatch::truncate_utf8;
-use crate::measure::{MeasureClock, SystemClock};
+use crate::measure::{FixedLoad, LoadSource, MeasureClock, ProcLoad, SystemClock};
 use crate::outbound::{DropCounters, QueueLimits};
 use crate::renew::{self, ApiRenewal, RenewalOptions, RenewalStatus, Signal, UnixClock};
 use crate::session::{self, End};
@@ -83,6 +83,12 @@ pub struct RunOptions {
     /// system clock. Tests run it faster ([`crate::measure::ScaledClock`]);
     /// `stationd.toml` can't change it.
     pub measure_clock: Arc<dyn MeasureClock>,
+    /// Where measuring's pause rule reads the host's load (the measurement design §4.1):
+    /// `/proc/loadavg`. Tests use a fixed load ([`crate::measure::FixedLoad`])
+    /// so that measuring doesn't depend on the machine running them;
+    /// `[measurements] ignore_host_load` (development builds) does the same
+    /// for the binary.
+    pub measure_load: Arc<dyn LoadSource>,
 }
 
 impl Default for RunOptions {
@@ -101,6 +107,7 @@ impl Default for RunOptions {
             assignment_timeout: crate::station_api::ASSIGNMENT_TIMEOUT,
             renew_timeout: crate::station_api::RENEW_TIMEOUT,
             measure_clock: Arc::new(SystemClock),
+            measure_load: Arc::new(ProcLoad),
         }
     }
 }
@@ -120,6 +127,7 @@ impl fmt::Debug for RunOptions {
             .field("assignment_timeout", &self.assignment_timeout)
             .field("renew_timeout", &self.renew_timeout)
             .field("measure_clock", &self.measure_clock)
+            .field("measure_load", &self.measure_load)
             .finish_non_exhaustive()
     }
 }
@@ -257,6 +265,7 @@ pub(crate) struct Ctx {
     /// What the daemon observed.
     pub observed: watch::Sender<Observed>,
     pub measure_clock: Arc<dyn MeasureClock>,
+    pub measure_load: Arc<dyn LoadSource>,
     /// The wall clock, Unix seconds.
     pub clock: UnixClock,
 }
@@ -455,6 +464,15 @@ fn context(
     if control.is_none() && matches!(config.credentials, CredentialsMode::Enrolled) {
         info!("no station-api endpoint: assignment refresh and certificate renewal are off");
     }
+    let measure_load: Arc<dyn LoadSource> = if config.ignore_host_load {
+        warn!(
+            "[measurements] ignore_host_load: measuring does not pause for the host's load \
+             (a development setting)"
+        );
+        Arc::new(FixedLoad::idle())
+    } else {
+        Arc::clone(&options.measure_load)
+    };
     let (observed, _) = watch::channel(Observed::default());
     let ctx = Arc::new(Ctx {
         credentials,
@@ -473,6 +491,7 @@ fn context(
         observed,
         clock: Arc::clone(&options.renewal.clock),
         measure_clock: Arc::clone(&options.measure_clock),
+        measure_load,
     });
     let rest = LoopOptions {
         backoff: options.backoff,

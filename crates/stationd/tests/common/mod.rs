@@ -39,6 +39,9 @@ pub fn fast_options_scaled(scale: u32) -> RunOptions {
             stationd::measure::clock::system_now_ms(),
             scale,
         )),
+        // An idle host: measuring never pauses for the load of the machine
+        // running the tests (the measurement design §4.1).
+        measure_load: Arc::new(stationd::measure::FixedLoad::idle()),
         ..RunOptions::default()
     }
 }
@@ -102,6 +105,9 @@ pub struct InProcess {
     pub backend: Arc<dyn Backend>,
     /// How much faster than real time measuring runs (60 by default).
     pub measure_scale: u32,
+    /// The 1-minute load average measuring's pause rule sees (0 by default,
+    /// whatever the machine's load), on this machine's CPUs.
+    pub host_load: f32,
     exit: Option<Exit>,
 }
 
@@ -119,6 +125,7 @@ impl InProcess {
             handle: None,
             backend,
             measure_scale: 60,
+            host_load: 0.0,
             exit: None,
         }
     }
@@ -128,11 +135,11 @@ impl InProcess {
 impl StationUnderTest for InProcess {
     async fn start(&mut self, target: &Target) -> Result<(), BoxError> {
         let config = Config::load(&write_config(target))?;
-        let handle = stationd::spawn(
-            &config,
-            Arc::clone(&self.backend),
-            fast_options_scaled(self.measure_scale),
-        )?;
+        let options = RunOptions {
+            measure_load: Arc::new(stationd::measure::FixedLoad::on_this_host(self.host_load)),
+            ..fast_options_scaled(self.measure_scale)
+        };
+        let handle = stationd::spawn(&config, Arc::clone(&self.backend), options)?;
         assert_eq!(handle.station_id(), target.station_id);
         self.handle = Some(handle);
         self.exit = None;

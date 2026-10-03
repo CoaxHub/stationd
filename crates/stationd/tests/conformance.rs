@@ -63,3 +63,22 @@ conformance!(
     one_plan_per_connection,
     refuses_measurements_when_disabled,
 );
+
+/// The pause rule still holds with the injected load (the measurement design §4.1): on a
+/// host whose load stays at 0.75 × its CPUs, an idle plan measures nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_busy_host_measures_nothing() {
+    let scenario = scenarios::by_name("measures_when_asked").expect("known scenario");
+    let mut station = common::InProcess::default();
+    #[allow(clippy::cast_precision_loss, reason = "CPU counts are small")]
+    let busy = 0.75 * stationd::measure::FixedLoad::idle().0.cpu_count.max(1) as f32;
+    station.host_load = busy;
+    let cfg = ScenarioConfig::fast();
+    let e = (scenario.run)(&mut station, &cfg)
+        .await
+        .expect_err("a busy station must not report");
+    assert!(
+        e.to_string().contains("no NoiseFloorReport"),
+        "unexpected failure: {e}"
+    );
+}
