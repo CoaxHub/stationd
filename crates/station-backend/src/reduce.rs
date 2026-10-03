@@ -85,13 +85,13 @@ impl Histogram {
 
     /// Adds every bin of `spectrum` whose centre lies inside `ranges`
     /// (`[start, end)`, sorted), normalised to density. Bin `i` is centred
-    /// at `center_hz + (i − n/2) · bin_hz` (`n/2` rounded down, radiod's
-    /// convention). Returns how many.
+    /// at `center_hz + (i − ⌈n/2⌉) · bin_hz` (radiod's layout). Returns how
+    /// many.
     pub fn add_spectrum(&mut self, spectrum: &Spectrum, ranges: &[(u64, u64)]) -> u32 {
         let bin = f64::from(spectrum.bin_hz.max(f32::MIN_POSITIVE));
         #[allow(clippy::cast_precision_loss, reason = "lengths and Hz below 2^53")]
         let (half, centre) = (
-            (spectrum.power_db.len() / 2) as f64,
+            spectrum.power_db.len().div_ceil(2) as f64,
             spectrum.center_hz as f64,
         );
         let mut added = 0u32;

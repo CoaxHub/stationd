@@ -55,10 +55,10 @@ pub struct Header {
 
 impl Header {
     /// Frequency of the center of bin `i` (low to high, center at
-    /// `bins / 2`), as `SpectrumFrame::frequency_of_bin`.
+    /// `⌈bins / 2⌉`), as `SpectrumFrame::frequency_of_bin`.
     #[allow(clippy::cast_precision_loss, reason = "bin indices are far below 2^52")]
     pub fn frequency_of_bin(&self, i: u32) -> f64 {
-        let offset = f64::from(i) - f64::from(self.bins / 2);
+        let offset = f64::from(i) - f64::from(self.bins.div_ceil(2));
         self.center_hz + offset * self.bin_width_hz
     }
 }

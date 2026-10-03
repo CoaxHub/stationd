@@ -7,6 +7,7 @@
 use station_backend::BackendError;
 use station_proto::{limits, v1};
 
+use super::placement::{self, FrontEnd, Placement};
 use crate::client::Squelch;
 use crate::spectrum;
 use crate::status::ChannelStatus;
@@ -296,30 +297,55 @@ pub fn midpoint(r: &v1::FrequencyRange) -> u64 {
     r.start_hz + (r.end_hz - r.start_hz) / 2
 }
 
-/// The spectrum2 channel covering a waterfall range.
+/// The spectrum2 channel for a waterfall range.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Geometry {
-    /// `RADIO_FREQUENCY`: the spectrum's center, Hz.
+    /// `RADIO_FREQUENCY`, Hz.
     pub center_hz: f64,
     /// `RESOLUTION_BW`: bin width, Hz.
     pub rbw_hz: f32,
     /// `BIN_COUNT`.
     pub bins: u32,
+    /// Where radiod's bins will be: the low edge of bin 0 to the high edge
+    /// of the last bin, which `bins` equal bins tile.
+    pub covered: v1::FrequencyRange,
 }
 
-/// The spectrum2 geometry whose `bins` bins tile `range` exactly: bin
-/// width `(end - start) / bins`, and the center placed so that bin `i`
-/// (at `center + (i - bins/2) * rbw`, radiod-notes.md §6) is centred on
-/// `start + (i + ½) * rbw`.
-pub fn geometry(range: &v1::FrequencyRange, bins: u32) -> Result<Geometry, BackendError> {
+/// The spectrum2 geometry for `bins` bins across `range`
+/// (radiod-notes.md §10 "Waterfall geometry"):
+///
+/// - bins wider than radiod's crossover (wideband mode) with a known front
+///   end: [`placement::plan_wideband`], whose real bins lie inside the
+///   range and cover all of it but less than two bins;
+/// - otherwise (narrowband mode, which radiod places exactly): bin width
+///   `(end − start) / bins` and the centre bin (`⌈bins/2⌉`) placed so that
+///   the bins tile the range.
+pub fn geometry(
+    range: &v1::FrequencyRange,
+    bins: u32,
+    fe: Option<&FrontEnd>,
+) -> Result<Geometry, BackendError> {
     if range.start_hz >= range.end_hz {
         return Err(BackendError::invalid_argument("range is empty or reversed"));
     }
     if bins == 0 {
         return Err(BackendError::invalid_argument("bins must be positive"));
     }
-    let rbw = (freq(range.end_hz) - freq(range.start_hz)) / f64::from(bins);
-    let center = freq(range.start_hz) + (f64::from(bins / 2) + 0.5) * rbw;
+    let (start, end) = (freq(range.start_hz), freq(range.end_hz));
+    let rbw = (end - start) / f64::from(bins);
+    if rbw > placement::CROSSOVER_HZ {
+        if let Some(w) = fe.and_then(|fe| placement::plan_wideband(fe, start, end, bins)) {
+            if let Some(covered) = edges(&w.placement) {
+                return Ok(Geometry {
+                    center_hz: w.center_hz,
+                    rbw_hz: w.rbw_hz,
+                    bins,
+                    covered,
+                });
+            }
+        }
+    }
+    let center = start + (f64::from(placement::center_index(bins)) + 0.5) * rbw;
     #[allow(
         clippy::cast_possible_truncation,
         reason = "radiod's RESOLUTION_BW is a C float"
@@ -329,23 +355,37 @@ pub fn geometry(range: &v1::FrequencyRange, bins: u32) -> Result<Geometry, Backe
         center_hz: center,
         rbw_hz,
         bins,
+        covered: *range,
     })
 }
 
-/// The range a spectrum2 channel actually covers: the low edge of bin 0 to
-/// the high edge of the last bin, from radiod's reported center and bin
-/// width. Clipped to 0..=6 GHz.
-pub fn covered_range(center_hz: f64, rbw_hz: f64, bins: u32) -> Option<v1::FrequencyRange> {
-    if !(center_hz.is_finite() && rbw_hz.is_finite() && rbw_hz > 0.0) {
-        return None;
-    }
-    let start = center_hz - (f64::from(bins / 2) + 0.5) * rbw_hz;
-    let end = start + f64::from(bins) * rbw_hz;
+/// The range a spectrum2 channel really covers, from its status: where
+/// radiod puts `bins` bins asked for at `RADIO_FREQUENCY` with
+/// `RESOLUTION_BW` ([`placement::placement`]; wideband mode needs the
+/// front-end fields). `None` when a field is missing or the range leaves
+/// 0..=6 GHz.
+pub fn covered_range(st: &ChannelStatus, bins: u32) -> Option<v1::FrequencyRange> {
+    let rf = st.radio_frequency_hz?;
+    let rbw = st.resolution_bw_hz?;
+    edges(&placement::placement(
+        FrontEnd::from_status(st).as_ref(),
+        rf,
+        rbw,
+        bins,
+    )?)
+}
+
+/// The edges of `p` in whole Hz, if within 0..=6 GHz and not empty.
+fn edges(p: &Placement) -> Option<v1::FrequencyRange> {
     #[allow(clippy::cast_precision_loss, reason = "6e9 is exact in f64")]
     let max = limits::MAX_FREQUENCY_HZ as f64;
+    let (low, high) = (p.low_edge(), p.high_edge());
+    if !((0.0..=max).contains(&low.round()) && (0.0..=max).contains(&high.round())) {
+        return None;
+    }
     let range = v1::FrequencyRange {
-        start_hz: hz(start.clamp(0.0, max))?,
-        end_hz: hz(end.clamp(0.0, max))?,
+        start_hz: hz(low)?,
+        end_hz: hz(high)?,
     };
     (range.start_hz < range.end_hz).then_some(range)
 }
@@ -603,27 +643,133 @@ mod tests {
         assert_eq!(sdr_model(&ChannelStatus::default()), "ka9q-radio");
     }
 
+    /// The front end of [`siggen`].
+    fn siggen_fe() -> FrontEnd {
+        FrontEnd::from_status(&ChannelStatus {
+            filter_blocksize: Some(480_000),
+            filter_fir_length: Some(120_001),
+            ..siggen()
+        })
+        .unwrap()
+    }
+
+    /// What radiod reports for a spectrum channel of `g` on [`siggen`].
+    fn spectrum_status(g: &Geometry) -> ChannelStatus {
+        ChannelStatus {
+            radio_frequency_hz: Some(g.center_hz),
+            resolution_bw_hz: Some(f64::from(g.rbw_hz)),
+            filter_blocksize: Some(480_000),
+            filter_fir_length: Some(120_001),
+            ..siggen()
+        }
+    }
+
     #[test]
-    fn geometry_tiles_the_range() {
+    fn wideband_geometry_follows_radiod() {
         let range = v1::FrequencyRange {
             start_hz: 0,
             end_hz: 12_000_000,
         };
-        let g = geometry(&range, 4096).unwrap();
-        assert_eq!(g.bins, 4096);
-        assert_eq!(g.rbw_hz, 2929.6875);
-        // Bin i at center + (i - 2048) * rbw must be start + (i + 0.5) * rbw.
-        let bin = |i: u32| g.center_hz + (f64::from(i) - 2048.0) * f64::from(g.rbw_hz);
-        assert_eq!(bin(0), 0.5 * 2929.6875);
-        let covered = covered_range(g.center_hz, f64::from(g.rbw_hz), g.bins).unwrap();
-        assert_eq!(covered, range);
-        // The 10 MHz carrier lands in bin floor(10e6 / rbw) = 3413.
-        let carrier = ((10e6 - 0.0) / f64::from(g.rbw_hz)).floor();
-        assert_eq!(carrier, 3413.0);
-        assert!(geometry(&v1::FrequencyRange::default(), 64).is_err());
-        assert!(geometry(&range, 0).is_err());
-        assert!(covered_range(f64::NAN, 1.0, 64).is_none());
-        assert!(covered_range(1e6, 0.0, 64).is_none());
+        let fe = siggen_fe();
+        let g = geometry(&range, 1024, Some(&fe)).unwrap();
+        assert_eq!(g.bins, 1024);
+        // 11,718.75 Hz bins would need the bin at DC (half below 0 Hz) or
+        // past Nyquist; 2050 points (11,707.3 Hz) fit inside.
+        assert_eq!(fe.fft_n(f64::from(g.rbw_hz)), Some(2050));
+        assert!(g.covered.start_hz > 0 && g.covered.end_hz <= 12_000_000);
+        assert_eq!(covered_range(&spectrum_status(&g), 1024), Some(g.covered));
+        // The labels a listener sees (the covered range in equal bins) are
+        // radiod's bins within a hertz, and the 10 MHz carrier is in its bin.
+        let p = placement::placement(Some(&fe), g.center_hz, f64::from(g.rbw_hz), 1024).unwrap();
+        let width = (freq(g.covered.end_hz) - freq(g.covered.start_hz)) / 1024.0;
+        let label = |i: u32| freq(g.covered.start_hz) + (f64::from(i) + 0.5) * width;
+        for i in 0..1024 {
+            assert!((label(i) - p.bin_center(i)).abs() < 1.0, "bin {i}");
+        }
+        let carrier = (0..1024)
+            .find(|&i| (label(i) - 10e6).abs() <= width / 2.0)
+            .unwrap();
+        assert!((p.bin_center(carrier) - 10e6).abs() <= p.bin_hz / 2.0);
+        // Without the front end: the nominal request, as asked.
+        let nominal = geometry(&range, 4096, None).unwrap();
+        assert_eq!(nominal.rbw_hz, 2929.6875);
+        assert_eq!(nominal.center_hz, (2048.0 + 0.5) * 2929.6875);
+        assert_eq!(nominal.covered, range);
+        assert!(geometry(&v1::FrequencyRange::default(), 64, Some(&fe)).is_err());
+        assert!(geometry(&range, 0, Some(&fe)).is_err());
+    }
+
+    /// The RTL-SDR of radiod-notes.md §10: the full span in 1024 bins.
+    #[test]
+    fn the_rtlsdr_full_span() {
+        let rtl = ChannelStatus {
+            input_samprate: Some(2_048_000),
+            fe_isreal: Some(false),
+            fe_low_edge_hz: Some(-962_560.0),
+            fe_high_edge_hz: Some(962_560.0),
+            first_lo_hz: Some(7.1e6),
+            filter_blocksize: Some(40_960),
+            filter_fir_length: Some(10_241),
+            ..ChannelStatus::default()
+        };
+        let range = tunable_range(&rtl).unwrap();
+        assert_eq!((range.start_hz, range.end_hz), (6_137_440, 8_062_560));
+        let fe = FrontEnd::from_status(&rtl).unwrap();
+        let g = geometry(&range, 1024, Some(&fe)).unwrap();
+        let st = ChannelStatus {
+            radio_frequency_hz: Some(g.center_hz),
+            resolution_bw_hz: Some(f64::from(g.rbw_hz)),
+            ..rtl.clone()
+        };
+        assert_eq!(covered_range(&st, 1024), Some(g.covered));
+        assert!(g.covered.start_hz >= range.start_hz && g.covered.end_hz <= range.end_hz);
+        // 1091 points (1877.18 Hz bins): 1.54 bins short of the span.
+        assert_eq!(fe.fft_n(f64::from(g.rbw_hz)), Some(1091));
+        assert!(g.covered.end_hz - g.covered.start_hz > 1_925_120 - 2 * 1878);
+        // The nominal request radiod used to get (1880 Hz bins centred at
+        // 7,100,940 Hz) really covers 6,136,180 .. 8,061,939 Hz.
+        let old = ChannelStatus {
+            radio_frequency_hz: Some(7_100_940.0),
+            resolution_bw_hz: Some(1880.0),
+            ..rtl
+        };
+        assert_eq!(
+            covered_range(&old, 1024),
+            Some(v1::FrequencyRange {
+                start_hz: 6_136_180,
+                end_hz: 8_061_939,
+            })
+        );
+    }
+
+    #[test]
+    fn narrowband_geometry_tiles_the_range_exactly() {
+        let range = v1::FrequencyRange {
+            start_hz: 7_000_000,
+            end_hz: 7_102_300,
+        };
+        for bins in [1023, 1024] {
+            let g = geometry(&range, bins, Some(&siggen_fe())).unwrap();
+            assert_eq!(g.covered, range);
+            assert_eq!(covered_range(&spectrum_status(&g), bins), Some(range));
+        }
+        let g = geometry(&range, 1023, None).unwrap();
+        assert_eq!(g.rbw_hz, 100.0);
+        // Bin ⌈1023/2⌉ = 512 is at the centre.
+        assert_eq!(g.center_hz, 7_000_000.0 + 512.5 * 100.0);
+        assert!(covered_range(&ChannelStatus::default(), 64).is_none());
+        let bad = ChannelStatus {
+            resolution_bw_hz: Some(f64::NAN),
+            ..spectrum_status(&g)
+        };
+        assert!(covered_range(&bad, 64).is_none());
+        // Wideband needs the front end.
+        let wide = ChannelStatus {
+            resolution_bw_hz: Some(1000.0),
+            first_lo_hz: None,
+            ..spectrum_status(&g)
+        };
+        assert!(covered_range(&wide, 64).is_none());
     }
 
     #[test]
@@ -732,14 +878,17 @@ mod tests {
         }
 
         #[test]
-        fn geometry_round_trips(start in 0u64..5_000_000_000, span in 1_000u64..100_000_000, bins in 64u32..8192) {
-            let range = v1::FrequencyRange { start_hz: start, end_hz: start + span };
-            let g = geometry(&range, bins).unwrap();
-            let covered = covered_range(g.center_hz, f64::from(g.rbw_hz), bins).unwrap();
-            // f32 bin widths: within a few Hz per bin of the request.
-            let tol = 1 + span / 1_000_000 * u64::from(bins) / 64;
-            prop_assert!(covered.start_hz.abs_diff(range.start_hz) <= tol);
-            prop_assert!(covered.end_hz.abs_diff(range.end_hz) <= tol);
+        fn geometry_round_trips(start in 0u64..11_000_000, span in 13_000u64..12_000_000, bins in 64u32..8192) {
+            let end = (start + span).min(12_000_000);
+            prop_assume!(start < end);
+            let range = v1::FrequencyRange { start_hz: start, end_hz: end };
+            let g = geometry(&range, bins, Some(&siggen_fe())).unwrap();
+            let covered = covered_range(&spectrum_status(&g), bins).unwrap();
+            prop_assert_eq!(covered, g.covered);
+            // Inside the request, short of it by less than two bins.
+            let bin = (end - start) / u64::from(bins) + 1;
+            prop_assert!(covered.start_hz >= start && covered.end_hz <= end);
+            prop_assert!((covered.start_hz - start) + (end - covered.end_hz) <= 2 * bin);
         }
 
         #[test]

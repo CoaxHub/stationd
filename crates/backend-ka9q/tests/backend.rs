@@ -424,7 +424,17 @@ async fn waterfall_rows_are_decodable_and_paced() {
     let (sub, mut rows) = backend.subscribe_waterfall(req).await.unwrap();
     assert_eq!(sub.subscription_id, 5);
     assert_eq!((sub.bins, sub.row_interval_ms), (256, 100));
-    assert_eq!(sub.range, Some(range));
+    // The fake is a real 24 MS/s front end at LO 0 (L 480,000, M 120,001):
+    // 256 bins of 24 MS/s / 514 = 46,692.6 Hz at analysis shift 129, the
+    // widest bins radiod can put inside 0 .. 12 MHz without its window
+    // reaching DC or Nyquist (radiod-notes.md §10).
+    assert_eq!(
+        sub.range,
+        Some(v1::FrequencyRange {
+            start_hz: 23_346,
+            end_hz: 11_976_654,
+        })
+    );
     assert_eq!(
         sub.quantization,
         Some(v1::Quantization {
@@ -435,8 +445,9 @@ async fn waterfall_rows_are_decodable_and_paced() {
     let ssrc = *fake.state().created.last().unwrap();
     let fc = fake.channel(ssrc).unwrap();
     assert_eq!((fc.demod, fc.bin_count), (4, 256));
-    assert_eq!(fc.rbw, 46_875.0);
-    assert_eq!(fc.frequency, 6_000_000.0 + 0.5 * 46_875.0);
+    assert!((fc.rbw - 24e6 / 514.0).abs() < 0.01, "{}", fc.rbw);
+    // Front-end shift 150,584 (40 Hz bins): 150,584 × 514 / 600,000 → 129.
+    assert_eq!(fc.frequency, 150_584.0 * 40.0);
 
     let start = tokio::time::Instant::now();
     let mut decoder = WaterfallDecoder::new();

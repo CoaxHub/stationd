@@ -23,7 +23,7 @@
 //! a window sits exactly where `RADIO_FREQUENCY` says only when its offset
 //! from the front end's LO is a multiple of [`placement_grid_hz`] (1 kHz with
 //! 500 Hz bins on an RTL-SDR or the signal generator); off it, up to one bin
-//! closer to the LO ([`wideband_center`]). stationd puts its windows on that
+//! closer to the LO ([`super::placement`]). stationd puts its windows on that
 //! grid (`Backend::measurement_grid`).
 
 use station_backend::{BackendError, MeasurementChannel, MeasurementGrid, Spectrum};
@@ -132,7 +132,7 @@ impl Measurement {
 
 /// A row as per-bin power in dB (radiod's 8-bit log bins, decoded with the
 /// row's own `SPECTRUM_BASE` and `SPECTRUM_STEP`). Bin `i` is centred at
-/// `center_hz + (i − n/2) · bin_hz`, as [`SpectrumFrame::frequency_of_bin`].
+/// `center_hz + (i − ⌈n/2⌉) · bin_hz`, as [`SpectrumFrame::frequency_of_bin`].
 pub fn spectrum(f: &SpectrumFrame) -> Spectrum {
     #[allow(
         clippy::cast_possible_truncation,
@@ -185,38 +185,6 @@ pub fn placement_grid_hz(
 
 fn gcd(a: u64, b: u64) -> u64 {
     if b == 0 { a } else { gcd(b, a % b) }
-}
-
-/// The centre radiod's wideband spectrum really has when asked for
-/// `requested_hz` (`spectrum.c` `wideband_poll`, `radio.c` `compute_tuning`,
-/// pinned commit): the offset from the LO is rounded to the front end's FFT
-/// bin (`lrint`, ties to even), then scaled to the analysis FFT with C
-/// integer division, which truncates toward zero. Off the placement grid the
-/// spectrum is therefore up to one bin closer to the LO than
-/// `RADIO_FREQUENCY` says.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    reason = "offsets are bounded by the sample rate, far below 2^52"
-)]
-pub fn wideband_center(
-    requested_hz: f64,
-    lo_hz: f64,
-    samprate: u32,
-    blocksize: u32,
-    fir_length: u32,
-    rbw_hz: f64,
-) -> Option<f64> {
-    let points = i64::from(blocksize) + i64::from(fir_length) - 1;
-    if points <= 0 || samprate == 0 || rbw_hz.is_nan() || rbw_hz <= 0.0 {
-        return None;
-    }
-    let samprate = f64::from(samprate);
-    let fe_bin = samprate / points as f64;
-    let fft_n = (samprate / rbw_hz).round_ties_even() as i64;
-    let shift = ((requested_hz - lo_hz) / fe_bin).round_ties_even() as i64;
-    let analysis_shift = shift * fft_n / points; // truncates toward zero, as C does
-    Some(lo_hz + analysis_shift as f64 * samprate / fft_n as f64)
 }
 
 /// The measurement grid of the front end in `st` for `rbw_hz` bins: the LO
@@ -279,17 +247,6 @@ mod tests {
         assert_eq!(placement_grid_hz(500.5, 2_048_000, 40_960, 10_241), None);
         assert_eq!(placement_grid_hz(500.0, 2_048_000, 40_960, 0), None);
         assert_eq!(placement_grid_hz(500.0, 2_000_000, 40_960, 10_241), None);
-    }
-
-    #[test]
-    fn radiod_truncates_off_grid_centres_toward_the_lo() {
-        let rtl = |f: f64| wideband_center(f, 7.1e6, 2_048_000, 40_960, 10_241, 500.0).unwrap();
-        for f in [7.15e6, 7.1e6, 6.6e6, 7.612e6, 7.099e6] {
-            assert!((rtl(f) - f).abs() < 1e-6, "{f}");
-        }
-        assert!((rtl(7_100_500.0) - 7_100_000.0).abs() < 1e-6);
-        assert!((rtl(7_099_500.0) - 7_100_000.0).abs() < 1e-6);
-        assert_eq!(wideband_center(1.0, 0.0, 0, 1, 1, 500.0), None);
     }
 
     #[test]

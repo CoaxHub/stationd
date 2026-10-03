@@ -87,8 +87,8 @@ pub struct Spectrum {
     pub bin_hz: f32,
     /// Power per bin in dB on the backend's uncalibrated scale (not yet
     /// normalised to density), lowest frequency first; `bin_count` values.
-    /// Bin `i` is centred at `center_hz + (i − n/2) · bin_hz` (`n/2` rounded
-    /// down: radiod's convention).
+    /// Bin `i` is centred at `center_hz + (i − ⌈n/2⌉) · bin_hz` (radiod's
+    /// layout: an odd count has one more bin below the centre).
     pub power_db: Vec<f32>,
 }
 
