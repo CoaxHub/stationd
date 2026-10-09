@@ -47,7 +47,7 @@ thiserror = "2.0.21"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "time", "net", "sync"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"] }
 tokio-util = "0.7.19"
-toml = "0.9"
+toml = "1.1"
 tonic = { version = "0.14.6", default-features = false, features = ["channel", "codegen"] }
 tonic-prost = "0.14.6"
 tower-service = "0.3.3"
