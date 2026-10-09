@@ -403,6 +403,11 @@ async fn measurement_scenarios_with_a_real_radiod() {
             panic!("{name} against radiod: {e}");
         }
         println!("E2E measurement_{name}_s={:.1}", t.elapsed().as_secs_f64());
+        // The channel closes a moment after the duty goes idle; give it a few seconds.
+        let closing = Instant::now();
+        while !backend.measurement_ids().is_empty() && closing.elapsed() < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         assert!(
             backend.measurement_ids().is_empty(),
             "{name}: a measurement channel was left open"
