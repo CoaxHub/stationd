@@ -1,0 +1,3 @@
+# The maintainer reviews everything; the root certificate the packages trust in particular.
+* @leonardochaia
+/packaging/roots/ @leonardochaia

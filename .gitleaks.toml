@@ -1,0 +1,5 @@
+# gitleaks allowlist (the repository's secret scanning): the installer test's well-formed
+# but synthetic enrollment token is the Crockford base32 alphabet.
+[allowlist]
+description = "Synthetic test values"
+regexes = ['''0123456789ABCDEFGHJKMNPQRSTVWXYZ''']
