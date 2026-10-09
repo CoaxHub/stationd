@@ -1,0 +1,65 @@
+# A release: on a tag vX.Y.Z, the four coaxhub-stationd packages built with the production
+# domain (the repository variable COAXHUB_DOMAIN) and the production root certificate
+# (packaging/roots/), tested, and attached to a GitHub release with radiod's corresponding
+# source, the installer template and SHA256SUMS. Nothing is signed here: the APT repository
+# and the installer are signed and published from these assets elsewhere (docs/releasing.md).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  COAXHUB_DOMAIN: ${{ vars.COAXHUB_DOMAIN }}
+
+jobs:
+  packages:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write # the release and its assets
+      id-token: write # build provenance
+      attestations: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: The tag names the crate's version, and the domain is the production one
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/stationd/Cargo.toml | head -n1)"
+          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::the tag is $GITHUB_REF_NAME but crates/stationd/Cargo.toml says $version"
+            exit 1
+          fi
+          if [[ -z "$COAXHUB_DOMAIN" || "$COAXHUB_DOMAIN" == coaxhub.test ]]; then
+            echo "::error::the repository variable COAXHUB_DOMAIN must name the production domain"
+            exit 1
+          fi
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build the packages with the production root
+        run: COAXHUB_ROOT_CA=packaging/roots/coaxhub-production.pem packaging/build-all.sh
+      - run: packaging/test/test-packages.sh
+      - run: packaging/test/test-installer.sh
+      - name: Collect the assets
+        run: |
+          set -euo pipefail
+          mkdir dist
+          cp target/packages/*/coaxhub-stationd_*.deb dist/
+          cp "$(ls target/packages/bookworm/ka9q-radio-*.tar.gz | head -n1)" dist/
+          cp installer/station.sh dist/station.sh
+          (cd dist && sha256sum -- * > SHA256SUMS)
+          ls -l dist
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: dist/*.deb
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes \
+            "stationd $GITHUB_REF_NAME: the coaxhub-stationd packages for Debian 12 and 13 on amd64 and arm64, built for $COAXHUB_DOMAIN with the root certificate in packaging/roots/, radiod's corresponding source, the installer template and SHA256SUMS. See docs/releasing.md."
