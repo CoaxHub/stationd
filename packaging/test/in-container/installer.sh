@@ -174,7 +174,7 @@ printf '# installer output:\n%s\n' "$(sed 's/^/#   /' /tmp/install.log)"
 check_eq "happy path: exits 1 (no control plane to enroll with)" 1 "${rc}"
 check_contains "happy path: detects the SDR" "Found an RTL-SDR (0bda:2838, RTL2838UHIDIR)" "${log}"
 check_contains "happy path: reports the failed enrollment" "enrollment failed" "${log}"
-check_contains "happy path: stationd says why" "enroll.coaxhub.test" "${log}"
+check_contains "happy path: stationd says why" "cannot reach the enrollment service at https://enroll." "${log}"
 check_lacks "happy path: the token is not in the output" "${TOKEN_BODY}" "${log}"
 check_eq "keyring mode" "644 root root" "$(mode_owner "${KEYRING}")"
 check_contains "the keyring holds the pinned key" "${FPR}" \
