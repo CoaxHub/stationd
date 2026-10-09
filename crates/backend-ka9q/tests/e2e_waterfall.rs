@@ -136,11 +136,12 @@ async fn waterfall_labels_match_radiod() {
             .iter()
             .max_by_key(|p| peaks.iter().filter(|q| q == p).count())
             .expect("rows");
-        // The labelled bin the carrier is in, and where in it. Within a
-        // tenth of a bin of an edge either neighbour may win (noise, the
-        // window's leakage); elsewhere the peak must be that bin exactly.
+        // The labelled bin the carrier is in, and where in it. Within 0.15
+        // bins of an edge either neighbour may win (noise, the window's
+        // leakage), and the neighbour's centre is then up to 0.65 bins off;
+        // elsewhere the peak must be that bin exactly.
         let pos = (carrier as f64 - covered.start_hz as f64) / width;
-        let near_edge = !(0.1..=0.9).contains(&pos.fract());
+        let near_edge = !(0.15..=0.85).contains(&pos.fract());
         #[allow(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
@@ -149,7 +150,7 @@ async fn waterfall_labels_match_radiod() {
         let expected = pos.max(0.0) as usize;
         let error = label(p) - carrier as f64;
         let ok = if near_edge {
-            error.abs() <= 0.6 * width
+            error.abs() <= 0.65 * width
         } else {
             strict += 1;
             p == expected
