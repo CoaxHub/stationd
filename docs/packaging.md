@@ -12,7 +12,9 @@ A station is one Debian package, `coaxhub-stationd`, installed by a short script
 | **arm64** | `coaxhub-stationd_<v>-<r>~deb12_arm64.deb` | `coaxhub-stationd_<v>-<r>~deb13_arm64.deb` |
 
 - `<v>` is stationd's crate version and `<r>` is `PACKAGE_REVISION` (default 1). The `~debN` suffix orders an upgrade across suites: `0.1.0-1~deb12` < `0.1.0-1~deb13` < `0.1.0-1`.
-- Raspberry Pi OS is Debian: its suite is the Debian codename, and the 64-bit image is arm64. The Pi 3B+ (Cortex-A53) is the oldest target.
+- Raspberry Pi OS is Debian: its suite is the Debian codename, and the 64-bit image is arm64. The Pi 3B (Cortex-A53) is the oldest target.
+- **Only maintained suites.** A suite is a target while Debian still publishes security updates for it, from the security team or from Debian LTS; paid extended support doesn't count. A new Debian stable is added in the first stationd release after it comes out. When a suite's LTS ends, the next release drops it: `build-all.sh` stops building it, the installer refuses it (§6), and packages already in the repository stay but get no new versions. Nothing is built for a suite past its end, even for an existing receiver whose owner would rather not reinstall.
+- Today: bookworm (Debian LTS until June 2028) and trixie. bullseye's LTS ended on 2026-08-31, so it is refused.
 - Each stationd release pins exactly one ka9q-radio commit, the one its TLV table was generated from: `384b269aaf5e9ee1015185ae7c0cdd60f4d2ecbd`.
 
 ## 2. Building
