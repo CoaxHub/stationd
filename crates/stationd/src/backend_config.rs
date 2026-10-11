@@ -15,6 +15,10 @@
 //! A template must use both group placeholders and set `ttl = 0`, so the
 //! groups stay fixed by the package and radiod's traffic stays on the
 //! loopback interface. Any other `{{…}}` is an error.
+//!
+//! Before rendering, `backend-config` logs a warning when the profile cannot
+//! receive with an attached dongle ([`profile_warning`]: `rtlsdr-hf` with an
+//! RTL-SDR Blog V4); it renders the owner's profile all the same.
 
 use std::path::{Path, PathBuf};
 
@@ -155,6 +159,36 @@ pub fn write(templates_dir: &Path, sdr: &SdrSettings, out: &Path) -> Result<(), 
     Ok(())
 }
 
+/// Where Linux lists USB devices.
+pub const USB_DEVICES_DIR: &str = "/sys/bus/usb/devices";
+
+/// The USB `product` string of an RTL-SDR Blog V4 (its manufacturer
+/// string is `RTLSDRBlog`; its IDs are the usual RTL-SDR ones).
+pub const BLOG_V4_PRODUCT: &str = "Blog V4";
+
+/// A warning when the profile cannot receive with an attached dongle:
+/// `rtlsdr-hf` with an RTL-SDR Blog V4, which receives HF through its
+/// upconverter and nothing by direct sampling. `usb_devices` is sysfs's
+/// USB device directory ([`USB_DEVICES_DIR`]). It only warns: the dongle
+/// may be meant for another use, and the owner's profile stands.
+pub fn profile_warning(sdr: &SdrSettings, usb_devices: &Path) -> Option<String> {
+    if sdr.profile.name != "rtlsdr-hf" {
+        return None;
+    }
+    let (port, _) = crate::doctor::usb_devices(usb_devices)
+        .into_iter()
+        .filter(|(_, id)| sdr.profile.usb_ids.contains(id))
+        .find(|(port, _)| {
+            std::fs::read_to_string(usb_devices.join(port).join("product"))
+                .is_ok_and(|p| p.trim() == BLOG_V4_PRODUCT)
+        })?;
+    Some(format!(
+        "the RTL-SDR at USB port {port} is an RTL-SDR Blog V4, and the SDR profile is rtlsdr-hf: \
+         direct sampling receives nothing on a V4; use profile rtlsdr-v4 (set [sdr] profile in \
+         stationd.toml, or run the installer again with --profile rtlsdr-v4)"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,6 +228,12 @@ mod tests {
                 "rtlsdr-hf",
                 Some(14_074_000),
                 "radiod-rtlsdr-hf-14074000.conf",
+            ),
+            ("rtlsdr-v4", None, "radiod-rtlsdr-v4.conf"),
+            (
+                "rtlsdr-v4",
+                Some(145_500_000),
+                "radiod-rtlsdr-v4-145500000.conf",
             ),
             ("siggen", None, "radiod-siggen.conf"),
         ];
@@ -314,6 +354,43 @@ mod tests {
         let e = render_profile(Path::new("/nonexistent"), &s).expect_err("missing");
         assert!(matches!(e, RenderError::Template { .. }), "{e}");
         assert!(RenderError::NoProfile.to_string().contains("[sdr]"));
+    }
+
+    /// A USB device directory as sysfs lists it.
+    fn usb(dir: &Path, port: &str, ids: (&str, &str), product: Option<&str>) {
+        let d = dir.join(port);
+        std::fs::create_dir_all(&d).expect("mkdir");
+        std::fs::write(d.join("idVendor"), format!("{}\n", ids.0)).expect("write");
+        std::fs::write(d.join("idProduct"), format!("{}\n", ids.1)).expect("write");
+        if let Some(p) = product {
+            std::fs::write(d.join("product"), format!("{p}\n")).expect("write");
+        }
+    }
+
+    #[test]
+    fn warns_about_direct_sampling_on_a_blog_v4() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dir = tmp.path();
+        let hf = sdr("rtlsdr-hf", None);
+        // Nothing attached, a hub, a V3, and a device that is not an RTL-SDR.
+        assert_eq!(profile_warning(&hf, &dir.join("none")), None);
+        usb(dir, "usb1", ("1d6b", "0002"), Some("xHCI Host Controller"));
+        usb(dir, "1-1.2", ("0bda", "2838"), Some("RTL2838UHIDIR"));
+        usb(dir, "1-1.4", ("1234", "5678"), Some(BLOG_V4_PRODUCT));
+        std::fs::create_dir(dir.join("1-1.5")).expect("no ids");
+        assert_eq!(profile_warning(&hf, dir), None);
+        // A V4.
+        usb(dir, "1-1.3", ("0bda", "2838"), Some(BLOG_V4_PRODUCT));
+        let w = profile_warning(&hf, dir).expect("a V4 with rtlsdr-hf");
+        assert!(w.contains("USB port 1-1.3"), "{w}");
+        assert!(
+            w.contains("direct sampling receives nothing on a V4; use profile rtlsdr-v4"),
+            "{w}"
+        );
+        // The other profiles have nothing to warn about.
+        for name in ["rtlsdr", "rtlsdr-v4", "siggen"] {
+            assert_eq!(profile_warning(&sdr(name, None), dir), None, "{name}");
+        }
     }
 
     #[test]

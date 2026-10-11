@@ -93,6 +93,12 @@ mkdir -p /tmp/usb/1-1
 printf '0bda\n' >/tmp/usb/1-1/idVendor
 printf '2838\n' >/tmp/usb/1-1/idProduct
 printf 'RTL2838UHIDIR\n' >/tmp/usb/1-1/product
+# A fake RTL-SDR Blog V4: the same IDs, its own USB strings.
+mkdir -p /tmp/usbv4/1-1.3
+printf '0bda\n' >/tmp/usbv4/1-1.3/idVendor
+printf '2838\n' >/tmp/usbv4/1-1.3/idProduct
+printf 'Blog V4\n' >/tmp/usbv4/1-1.3/product
+printf 'RTLSDRBlog\n' >/tmp/usbv4/1-1.3/manufacturer
 mkdir -p /tmp/nousb
 good="$(installer "${FPR}")"
 common=(--skip-time-sync --no-start)
@@ -223,6 +229,30 @@ interactive /tmp/tty.log "Continue anyway? [y/N]" n \
 check_eq "terminal: no SDR, answer no: exits 1" 1 "${rc}"
 check_contains "terminal: no SDR, answer no: stops" "stopped" "$(cat /tmp/tty.log)"
 
+# ---------------------------------------------------------------- RTL-SDR Blog V4
+# Its own profile, without a question (it covers HF and VHF/UHF).
+rc=0
+interactive /tmp/tty.log \
+    -- env COAXHUB_INSTALL_USB_DEVICES=/tmp/usbv4 sh "${good}" --token-file /root/token "${common[@]}" || rc=$?
+tty_log="$(tr -d '\r' </tmp/tty.log)"
+check_eq "V4 on a terminal: exits 1 (no control plane)" 1 "${rc}"
+check_contains "V4 on a terminal: detects it" "Found an RTL-SDR (0bda:2838, Blog V4)" "${tty_log}"
+check_contains "V4 on a terminal: takes rtlsdr-v4" "Using the rtlsdr-v4 profile" "${tty_log}"
+check_lacks "V4 on a terminal: asks no profile question" "Choose [1]:" "${tty_log}"
+check_eq "V4 on a terminal: rtlsdr-v4 is written" 'profile = "rtlsdr-v4"' "$(grep '^profile' "${CONFIG}")"
+check "stationd.toml with rtlsdr-v4 stays valid" stationd check-config
+
+rc="$(COAXHUB_INSTALL_USB_DEVICES=/tmp/usbv4 run /tmp/t.log "${good}" --profile rtlsdr-hf \
+    --token-file /root/token "${common[@]}")"
+check_eq "V4 with --profile rtlsdr-hf: installs it anyway (exits 1, no control plane)" 1 "${rc}"
+check_contains "V4 with --profile rtlsdr-hf: warns" \
+    "direct sampling (rtlsdr-hf) receives nothing on an RTL-SDR Blog V4" "$(cat /tmp/t.log)"
+check_eq "V4 with --profile rtlsdr-hf: rtlsdr-hf is written" 'profile = "rtlsdr-hf"' "$(grep '^profile' "${CONFIG}")"
+
+rc="$(COAXHUB_INSTALL_USB_DEVICES=/tmp/usbv4 run /tmp/t.log "${good}" --token-file /root/token "${common[@]}")"
+check_eq "V4, no terminal: exits 1 (no control plane)" 1 "${rc}"
+check_contains "V4, no terminal: takes rtlsdr-v4" "Using the rtlsdr-v4 profile" "$(cat /tmp/t.log)"
+
 # ---------------------------------------------------------------- again
 sum_before="$(md5sum "${KEYRING}" "${SOURCES}")"
 rc=0
@@ -287,6 +317,13 @@ check_contains "enrolled re-run: skips enrollment" "already enrolled" "${log}"
 check_contains "enrolled re-run: --yes takes the default profile" "Using the rtlsdr profile" "${log}"
 check_contains "enrolled re-run: prints stationd status" "enrolled" "${log}"
 check_eq "enrolled re-run: the key is untouched" "${key_before}" "$(md5sum /var/lib/coaxhub/stationd/key.pem)"
+
+rc=0
+PATH="/tmp/shim:${PATH}" COAXHUB_INSTALL_USB_DEVICES=/tmp/usbv4 sh "${good}" -y --no-start </dev/null \
+    >/tmp/t.log 2>&1 || rc=$?
+check_eq "V4 with --yes: exits 0" 0 "${rc}"
+check_contains "V4 with --yes: takes rtlsdr-v4" "Using the rtlsdr-v4 profile" "$(cat /tmp/t.log)"
+check_eq "V4 with --yes: rtlsdr-v4 is written" 'profile = "rtlsdr-v4"' "$(grep '^profile' "${CONFIG}")"
 
 rc=0
 COAXHUB_INSTALL_USB_DEVICES=/tmp/usb sh "${good}" --profile rtlsdr --reenroll --token-file /root/token \

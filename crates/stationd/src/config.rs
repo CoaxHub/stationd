@@ -12,7 +12,7 @@
 //! [measurements]
 //! enabled = true                           # measure the noise floor when the hub asks
 //! [sdr]
-//! profile = "rtlsdr"                       # rtlsdr | rtlsdr-hf (development builds also: siggen)
+//! profile = "rtlsdr"                       # rtlsdr | rtlsdr-hf | rtlsdr-v4 (development builds also: siggen)
 //! # center_frequency_hz = 98000000         # optional; default from the profile
 //! ```
 //!
@@ -962,7 +962,7 @@ mod tests {
             .expect_err("siggen is dev only");
         assert_eq!(
             e.to_string(),
-            "invalid config value `sdr.profile`: unknown SDR profile \"siggen\"; supported: rtlsdr, rtlsdr-hf"
+            "invalid config value `sdr.profile`: unknown SDR profile \"siggen\"; supported: rtlsdr, rtlsdr-hf, rtlsdr-v4"
         );
         assert!(
             ConfigError::DevelopmentOnly { field: "backend" }
@@ -1029,6 +1029,14 @@ mod tests {
         )
         .expect("valid");
         assert_eq!(c.sdr.expect("sdr").center_hz(), Some(14_200_000));
+        // The V4 covers HF and VHF/UHF in one profile.
+        for (center, want) in [
+            ("", 7_100_000),
+            ("\ncenter_frequency_hz = 145500000", 145_500_000),
+        ] {
+            let c = parse(&dir, &sdr(&format!("profile = \"rtlsdr-v4\"{center}"))).expect("v4");
+            assert_eq!(c.sdr.expect("sdr").center_hz(), Some(want));
+        }
         let c = parse(&dir, &sdr("profile = \"siggen\"")).expect("valid");
         assert_eq!(c.sdr.expect("sdr").center_hz(), None);
         for (body, field) in [
@@ -1042,6 +1050,14 @@ mod tests {
             ),
             (
                 "profile = \"rtlsdr-hf\"\ncenter_frequency_hz = 30000000",
+                "sdr.center_frequency_hz",
+            ),
+            (
+                "profile = \"rtlsdr-v4\"\ncenter_frequency_hz = 400000",
+                "sdr.center_frequency_hz",
+            ),
+            (
+                "profile = \"rtlsdr-v4\"\ncenter_frequency_hz = 1800000000",
                 "sdr.center_frequency_hz",
             ),
             ("profile = \"airspy\"", "sdr.profile"),

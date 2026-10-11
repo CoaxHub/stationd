@@ -289,7 +289,7 @@ mod tests {
         resolution_bw_hz: 500.0,
         dwell_ms: 4000,
     };
-    /// An RTL-SDR at 2.048 MS/s on 7.1 MHz (the packaged `rtlsdr-hf` default).
+    /// An RTL-SDR at 2.048 MS/s on 7.1 MHz (the packaged `rtlsdr-hf` and `rtlsdr-v4` default).
     const RTL_40M: FrontEnd = FrontEnd {
         tunable: (6_076_000, 8_124_000),
         center_hz: 7_100_000,

@@ -95,15 +95,25 @@ One package, `coaxhub-stationd`, built for `arm64` and `amd64`:
 | Path | Contents |
 |---|---|
 | `/usr/bin/stationd` | the daemon |
-| `/usr/lib/coaxhub/radiod/` | the pinned ka9q-radio build (`radiod`, its drivers and presets), private and not on `PATH`; its GPL-3.0 source is published with each release |
-| `/usr/share/coaxhub/radiod-templates/` | radiod config templates, one per SDR profile (`rtlsdr`, `rtlsdr-hf`) |
+| `/usr/lib/coaxhub/radiod/` | the pinned ka9q-radio build (`radiod`, its drivers and presets) and the pinned osmocom librtlsdr its RTL-SDR driver links, private and not on `PATH`; their GPL source is published with each release |
+| `/usr/share/coaxhub/radiod-templates/` | radiod config templates, one per SDR profile (`rtlsdr`, `rtlsdr-hf`, `rtlsdr-v4`) |
 | `/etc/coaxhub/stationd.toml` | the owner's only configuration file |
 | `/var/lib/coaxhub/stationd/` | state: key, certificate, chain, CA bundle, assignment, station ID (mode 0700) |
 | `/run/coaxhub/stationd/status.json` | runtime status, read by `stationd status` |
 | `stationd.service` | the daemon, as user `coaxhub` |
 | `coaxhub-radiod.service` | radiod, as user `coaxhub-radiod`; `stationd` starts after it |
 
-radiod is an implementation detail. The owner picks an SDR profile in `stationd.toml`. Before every start, `coaxhub-radiod.service` runs `stationd backend-config`, which renders radiod's config from the profile into `/run/coaxhub-radiod/`. The multicast groups are fixed by the package and `stationd` connects only to the bundled radiod. Each release pins one radiod commit: the one the TLV tag table was generated from.
+radiod is an implementation detail. The owner picks an SDR profile in `stationd.toml`. Before every start, `coaxhub-radiod.service` runs `stationd backend-config`, which renders radiod's config from the profile into `/run/coaxhub-radiod/`. The multicast groups are fixed by the package and `stationd` connects only to the bundled radiod. Each release pins one radiod commit: the one the TLV tag table was generated from. It also pins one librtlsdr, the same on every suite, new enough for the RTL-SDR Blog V4 ([packaging.md](packaging.md#the-bundled-librtlsdr)).
+
+The SDR profiles:
+
+| Profile | Receiver | Centre frequency |
+|---|---|---|
+| `rtlsdr` (the default) | an RTL-SDR on VHF/UHF, through its tuner | 24 MHz to 1766 MHz; 98 MHz by default |
+| `rtlsdr-hf` | an RTL-SDR with direct sampling (Q branch), such as the Blog V3, on HF; the tuner is bypassed | 0.5 MHz to 28.8 MHz; 7.1 MHz by default |
+| `rtlsdr-v4` | an RTL-SDR Blog V4 on HF, through its built-in upconverter, and on VHF/UHF; direct sampling receives nothing on a V4 | 0.5 MHz to 1766 MHz; 7.1 MHz by default |
+
+`backend-config` warns when the profile is `rtlsdr-hf` and an attached RTL-SDR reports itself as a Blog V4 (its USB `product`), and renders the owner's profile all the same.
 
 Hardening:
 

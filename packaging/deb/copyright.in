@@ -14,6 +14,14 @@ Comment:
  ka9q-radio-@KA9Q_SHORT@.tar.gz (SHA-256 @KA9Q_TARBALL_SHA256@),
  and the scripts that build it are in the CoaxHub/stationd repository
  (packaging/). radiod was built with ARCHOPTS "@ARCHOPTS@".
+ .
+ It also bundles osmocom librtlsdr @RTLSDR_VERSION@, built from commit
+ @RTLSDR_COMMIT@
+ of https://gitea.osmocom.org/sdr/rtl-sdr (librtlsdr.so.0 under
+ /usr/lib/coaxhub/radiod/, which radiod's rtlsdr.so links). Its
+ corresponding source is published next to this package in the CoaxHub APT
+ repository as rtl-sdr-@RTLSDR_SHORT@.tar.gz
+ (SHA-256 @RTLSDR_TARBALL_SHA256@).
 
 Files: *
 Copyright: CoaxHub contributors
@@ -30,6 +38,18 @@ Comment:
 Files: usr/lib/coaxhub/radiod/*
 Copyright: 2017-2026 Phil Karn, KA9Q
 License: GPL-3
+
+Files: usr/lib/coaxhub/radiod/librtlsdr.so.0
+Copyright: 2012-2014 Steve Markgraf <steve@steve-m.de>
+           2012 Dimitri Stolnikov <horiz0n@gmx.net>
+           2012 Hoernchen <la@tfc-server.de>
+           2011-2012 Harald Welte <laforge@gnumonks.org>
+           2012 Sylvain Munaut <tnt@246tNt.com>
+           2012 Hans-Frieder Vogt <hfvogt@gmx.net>
+           2010 Fitipower Integrated Technology Inc
+           2013 Mauro Carvalho Chehab <mchehab@redhat.com>
+           2012-2020 Osmocom Project
+License: GPL-2.0-or-later
 
 License: GPL-3.0-only
  This program is free software: you can redistribute it and/or modify it
@@ -50,3 +70,17 @@ License: GPL-3
  .
  On Debian systems, the complete text of the GNU General Public License
  version 3 can be found in /usr/share/common-licenses/GPL-3.
+
+License: GPL-2.0-or-later
+ This program is free software: you can redistribute it and/or modify it
+ under the terms of the GNU General Public License as published by the Free
+ Software Foundation, either version 2 of the License, or (at your option)
+ any later version.
+ .
+ This program is distributed in the hope that it will be useful, but WITHOUT
+ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ more details.
+ .
+ On Debian systems, the complete text of the GNU General Public License
+ version 2 can be found in /usr/share/common-licenses/GPL-2.

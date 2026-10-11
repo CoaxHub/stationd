@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: GPL-3.0-only
 #
-# RTL-SDR dongles (RTL2832U, 0bda:2838 and 0bda:2832) belong to the bundled
-# radiod (coaxhub-radiod.service) and to nobody else.
+# RTL-SDR dongles (RTL2832U, 0bda:2838 and 0bda:2832, the RTL-SDR Blog V4
+# included) belong to the bundled radiod (coaxhub-radiod.service) and to
+# nobody else.
 #
-# Numbered 72 so it runs after 60-librtlsdr0.rules (GROUP plugdev) and
-# 70-uaccess.rules (which tags software radios for the desktop user), and
-# before 73-seat-late.rules applies the uaccess tag. `:=` makes the
-# assignments final.
+# The package bundles its own librtlsdr and needs no rule from the system's
+# librtlsdr packages. Numbered 72 so it runs after the rules that may be
+# installed anyway (such as bookworm's 60-librtlsdr0.rules, GROUP plugdev)
+# and 70-uaccess.rules (which tags software radios for the desktop
+# user), and before 73-seat-late.rules applies the uaccess tag. `:=` makes
+# the assignments final.
 
 ACTION=="remove", GOTO="coaxhub_rtlsdr_end"
 SUBSYSTEM!="usb", GOTO="coaxhub_rtlsdr_end"

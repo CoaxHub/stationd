@@ -9,7 +9,8 @@
 #   1. checks that it runs as root on Debian or Raspberry Pi OS (bookworm or
 #      trixie), on amd64 or arm64;
 #   2. looks for an RTL-SDR on USB and asks which SDR profile to use:
-#      VHF/UHF (rtlsdr) or HF by direct sampling (rtlsdr-hf);
+#      VHF/UHF (rtlsdr) or HF by direct sampling (rtlsdr-hf); an RTL-SDR
+#      Blog V4 gets its own, HF and VHF/UHF (rtlsdr-v4), without asking;
 #   3. downloads the CoaxHub APT repository key, checks its fingerprint
 #      against the one pinned below, and adds the repository;
 #   4. installs (or upgrades) the coaxhub-stationd package and writes the
@@ -24,7 +25,8 @@
 # Running it again upgrades the package and keeps the enrollment.
 #
 # Options:
-#   --profile rtlsdr|rtlsdr-hf  the SDR profile, without asking
+#   --profile rtlsdr|rtlsdr-hf|rtlsdr-v4
+#                               the SDR profile, without asking
 #   --token-file PATH           read the enrollment token from PATH
 #                               (scripted installs) instead of the terminal
 #   --reenroll                  enroll again even if already enrolled
@@ -46,12 +48,15 @@ CONFIG=/etc/coaxhub/stationd.toml
 PACKAGE=coaxhub-stationd
 # RTL2832U dongles (vendor:product).
 RTLSDR_IDS="0bda:2838 0bda:2832"
+# The USB product string of an RTL-SDR Blog V4 (same IDs as the others).
+BLOG_V4_PRODUCT="Blog V4"
 # Where USB devices are listed (overridable for tests only).
 USB_DEVICES="${COAXHUB_INSTALL_USB_DEVICES:-/sys/bus/usb/devices}"
 TIME_SYNC_TIMEOUT=120
 TOKEN_ATTEMPTS=3
 
 profile=""
+sdr_product=""
 token_file=""
 reenroll=false
 start=true
@@ -75,12 +80,16 @@ usage() {
 		  curl -fsSL https://get.<domain>/station | sudo sh -s -- [options]
 
 		Options:
-		  --profile rtlsdr|rtlsdr-hf  the SDR profile, without asking
+		  --profile rtlsdr|rtlsdr-hf|rtlsdr-v4
+		                              the SDR profile, without asking: rtlsdr (VHF/UHF),
+		                              rtlsdr-hf (HF by direct sampling, e.g. Blog V3),
+		                              rtlsdr-v4 (RTL-SDR Blog V4: HF and VHF/UHF)
 		  --token-file PATH           read the enrollment token from PATH
 		  --reenroll                  enroll again even if already enrolled
 		  --no-start                  do not enable or start the services
 		  --skip-time-sync            do not wait for NTP (containers without systemd)
 		  -y, --yes                   continue without an SDR; default profile if no terminal
+		                              (an RTL-SDR Blog V4 always gets rtlsdr-v4)
 	USAGE
 }
 
@@ -119,8 +128,8 @@ while [ $# -gt 0 ]; do
 done
 
 case "$profile" in
-"" | rtlsdr | rtlsdr-hf) ;;
-*) die "--profile must be rtlsdr (VHF/UHF) or rtlsdr-hf (HF by direct sampling)" ;;
+"" | rtlsdr | rtlsdr-hf | rtlsdr-v4) ;;
+*) die "--profile must be rtlsdr (VHF/UHF), rtlsdr-hf (HF by direct sampling) or rtlsdr-v4 (RTL-SDR Blog V4)" ;;
 esac
 if [ -n "$token_file" ] && [ ! -r "$token_file" ]; then
 	die "cannot read the token file $token_file"
@@ -186,8 +195,8 @@ detect_sdr() {
 		id="$(cat "$dir/idVendor"):$(cat "$dir/idProduct")"
 		for want in $RTLSDR_IDS; do
 			if [ "$id" = "$want" ]; then
-				product=$(cat "$dir/product" 2>/dev/null || true)
-				say "Found an RTL-SDR ($id${product:+, $product})."
+				sdr_product=$(cat "$dir/product" 2>/dev/null || true)
+				say "Found an RTL-SDR ($id${sdr_product:+, $sdr_product})."
 				return 0
 			fi
 		done
@@ -208,6 +217,17 @@ choose_profile() {
 		fi
 	fi
 	if [ -n "$profile" ]; then
+		if [ "$profile" = rtlsdr-hf ] && [ "$sdr_product" = "$BLOG_V4_PRODUCT" ]; then
+			warn "direct sampling (rtlsdr-hf) receives nothing on an RTL-SDR Blog V4; its profile is rtlsdr-v4"
+		fi
+		return 0
+	fi
+	# An RTL-SDR Blog V4 receives HF through its built-in upconverter, which
+	# the package's librtlsdr switches in: its own profile covers HF and
+	# VHF/UHF, so there is nothing to ask (the centre frequency picks the band).
+	if [ "$sdr_product" = "$BLOG_V4_PRODUCT" ]; then
+		profile=rtlsdr-v4
+		say "Using the rtlsdr-v4 profile (RTL-SDR Blog V4: HF and VHF/UHF, 0.5 MHz to 1.7 GHz)."
 		return 0
 	fi
 	if [ "$assume_yes" = true ] || ! have_tty; then

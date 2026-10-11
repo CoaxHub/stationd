@@ -436,6 +436,7 @@ From the pinned `presets.conf`:
   - `RF_GAIN` and `RF_ATTEN` commands call the driver's optional `<driver>_gain`/`<driver>_atten` symbols (`radio.c` `dlsym`); neither `rtlsdr.c` nor `sig_gen.c` has them, and the command is then ignored silently. `RF_AGC` is not a command at all (status only).
   - `FIRST_LO_FREQUENCY` calls `<driver>_tune`; `sig_gen_tune` ignores it, and a fixed `frequency =` locks an RTL-SDR's tuner.
   - So capabilities report no front-end controls and `hardware_range` = the tunable range. `SetFrontend` answers `UNSUPPORTED` for gain, AGC, attenuation and antenna; a retune is sent and accepted only if the reply's `FIRST_LO_FREQUENCY` moved (within 1 kHz).
+- RTL-SDR Blog V4 (the `rtlsdr-v4` profile): `rtlsdr.c` needs no V4 code. It calls `rtlsdr_set_direct_sampling` with the config's `direct_sampling` (default 0, which the V4's template keeps), and its `true_freq` passes a frequency below the R820T PLL's range through uncorrected ("direct sampling, V4 upconverter"), so an HF `frequency =` is the HF frequency. librtlsdr 2.0.0 and newer (the package's) recognises the V4 by its USB strings (`RTLSDRBlog`, `Blog V4`), switches its upconverter in below 28.8 MHz and keeps its 28.8 MHz tuner reference.
 - Overloads: `AD_OVER` counts A/D overranges since radiod started. The backend counts each second in which it grew and sends `Event{FRONTEND_OVERLOAD}` at most every 10 s.
 
 ### Waterfall geometry

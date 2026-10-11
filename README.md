@@ -11,7 +11,7 @@ stationd is the station daemon of [CoaxHub](https://coaxhub.com). It connects an
 - **station-conformance**, `crates/station-conformance/` (MIT): a scripted fake hub for testing a station implementation;
 - the Debian package `coaxhub-stationd` (`packaging/`) and the installer (`installer/`), GPL-3.0-only;
 - `scripts/`: radiod built at its pinned commit, the end-to-end runs, fuzzing and the license-boundary check;
-- `testdata/`: radiod configs (a signal generator, so that everything can be tested without SDR hardware, and two RTL-SDR profiles).
+- `testdata/`: radiod configs (a signal generator, so that everything can be tested without SDR hardware, and the three RTL-SDR profiles: VHF/UHF, HF by direct sampling, and the RTL-SDR Blog V4).
 
 ## Building
 
@@ -24,6 +24,8 @@ sudo apt-get install --no-install-recommends \
     libsamplerate0-dev libusb-1.0-0-dev libncurses-dev librtlsdr-dev rtl-sdr \
     sox tcpdump opus-tools sysstat iproute2
 ```
+
+The end-to-end tests' radiod (`scripts/build-radiod.sh`) links the system's librtlsdr, which drives an RTL-SDR Blog V4 from version 2.0.0 on (trixie's 2.0.2, not bookworm's 0.6.0). The package bundles its own, the same on every suite ([docs/packaging.md](docs/packaging.md#the-bundled-librtlsdr)).
 
 ```sh
 cargo build --release

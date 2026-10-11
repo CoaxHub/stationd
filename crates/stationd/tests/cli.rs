@@ -396,7 +396,7 @@ fn backend_config_renders_the_profile() {
     let out = stationd(&["backend-config", "--out", "-"], &config);
     assert_eq!(out.status.code(), Some(2), "{}", text(&out));
     assert!(
-        text(&out).contains("supported: rtlsdr, rtlsdr-hf, siggen"),
+        text(&out).contains("supported: rtlsdr, rtlsdr-hf, rtlsdr-v4, siggen"),
         "{}",
         text(&out)
     );

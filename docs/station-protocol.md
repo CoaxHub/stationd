@@ -329,7 +329,8 @@ enabled = true
 
 # The receiver. The installer detects the SDR and sets the profile.
 [sdr]
-profile = "rtlsdr"                  # rtlsdr (VHF/UHF), rtlsdr-hf (HF by direct sampling)
+profile = "rtlsdr"                  # rtlsdr (VHF/UHF), rtlsdr-hf (HF by direct sampling, Blog V3),
+                                    # rtlsdr-v4 (RTL-SDR Blog V4: HF and VHF/UHF)
 # center_frequency_hz = 98000000    # optional start frequency; default from the profile
 ```
 
@@ -381,7 +382,7 @@ The trait has one method per request of §4, plus `health`, `events`, and, for 1
 
 | Protocol | radiod action |
 |---|---|
-| `GetCapabilities` | Read the front end's status (sample rate, tuning range, gain and attenuation capabilities) from radiod's status packets and combine it with the local caps. `sdr_model` is radiod's front-end `description`, which the profile's template sets. The HF profile's says "RTL-SDR HF direct sampling", so a service knows the tuner's gain is not in the signal path. |
+| `GetCapabilities` | Read the front end's status (sample rate, tuning range, gain and attenuation capabilities) from radiod's status packets and combine it with the local caps. `sdr_model` is radiod's front-end `description`, which the profile's template sets. The HF profile's (`rtlsdr-hf`) says "RTL-SDR HF direct sampling", so a service knows the tuner's gain is not in the signal path; the RTL-SDR Blog V4's (`rtlsdr-v4`) says "RTL-SDR Blog V4", whose HF goes through its upconverter and tuner, gain included. |
 | `OpenChannel` | Create a dynamic channel (AM `am`, FM `wfm`, NFM `fm`, USB `usb`, LSB `lsb`, CW `cwu`; always mono): a new random SSRC (not 0, not 0xffffffff), with frequency, demodulator preset, filter edges, Opus encoding, bitrate, sample rate and a finite `LIFETIME`. Map the hub's `channel_id` to the SSRC locally, and refresh `LIFETIME` while the channel is open. |
 | `UpdateChannel` | Send frequency, preset and filter changes to that SSRC. |
 | `CloseChannel` | Send `LIFETIME` 1: radiod removes the channel on the next frame. Frequency 0 only mutes a channel; it does not remove it. |

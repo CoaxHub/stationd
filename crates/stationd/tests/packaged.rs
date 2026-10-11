@@ -47,6 +47,11 @@ fn owner_config_uses_the_built_in_endpoints() {
     assert!(matches!(e.root, TrustAnchor::BuiltIn(_)));
     assert_eq!(c.state_dir, Path::new("/var/lib/coaxhub/stationd"));
     assert_eq!(c.runtime_dir, Path::new(PACKAGED_RUNTIME_DIR));
+    for profile in ["rtlsdr", "rtlsdr-v4"] {
+        let text = format!("[sdr]\nprofile = \"{profile}\"\n");
+        let c = Config::parse(&text, dir.path()).expect(profile);
+        assert_eq!(c.sdr.expect("sdr").profile.name, profile);
+    }
 }
 
 #[test]
@@ -85,7 +90,8 @@ fn test_only_settings_are_refused() {
     }
     let e = Config::parse("[sdr]\nprofile = \"siggen\"\n", dir.path()).expect_err("dev only");
     assert!(
-        e.to_string().contains("supported: rtlsdr, rtlsdr-hf"),
+        e.to_string()
+            .contains("supported: rtlsdr, rtlsdr-hf, rtlsdr-v4"),
         "{e}"
     );
 }

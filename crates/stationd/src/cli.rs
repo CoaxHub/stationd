@@ -406,6 +406,11 @@ pub fn backend_config(
     let config = Config::load(path)?;
     let sdr = config.sdr.ok_or(RenderError::NoProfile)?;
     let dir = templates.map_or_else(|| config.flavour.templates_dir(), Path::to_path_buf);
+    if let Some(warning) =
+        backend_config::profile_warning(&sdr, Path::new(backend_config::USB_DEVICES_DIR))
+    {
+        warn!(profile = sdr.profile.name, "{warning}");
+    }
     if out == Path::new("-") {
         return Ok(Some(backend_config::render_profile(&dir, &sdr)?));
     }

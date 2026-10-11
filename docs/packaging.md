@@ -2,7 +2,7 @@
 
 # The station package and installer
 
-A station is one Debian package, `coaxhub-stationd`, installed by a short script ([installer/station.sh](../installer/station.sh)). The package holds stationd, a private copy of radiod and both services, so there is nothing else to install. This document covers how the package is built, what it contains, why each systemd setting is there, and how the package and the installer are tested.
+A station is one Debian package, `coaxhub-stationd`, installed by a short script ([installer/station.sh](../installer/station.sh)). The package holds stationd, a private copy of radiod with its own librtlsdr, and both services, so there is nothing else to install. This document covers how the package is built, what it contains, why each systemd setting is there, and how the package and the installer are tested.
 
 ## 1. Targets and versions
 
@@ -16,6 +16,7 @@ A station is one Debian package, `coaxhub-stationd`, installed by a short script
 - **Only maintained suites.** A suite is a target while Debian still publishes security updates for it, from the security team or from Debian LTS; paid extended support doesn't count. A new Debian stable is added in the first stationd release after it comes out. When a suite's LTS ends, the next release drops it: `build-all.sh` stops building it, the installer refuses it (§6), and packages already in the repository stay but get no new versions. Nothing is built for a suite past its end, even for an existing receiver whose owner would rather not reinstall.
 - Today: bookworm (Debian LTS until June 2028) and trixie. bullseye's LTS ended on 2026-08-31, so it is refused.
 - Each stationd release pins exactly one ka9q-radio commit, the one its TLV table was generated from: `384b269aaf5e9ee1015185ae7c0cdd60f4d2ecbd`.
+- It also pins one osmocom librtlsdr commit, the same on every suite and architecture: tag v2.0.2, `619ac3186ea0ffc092615e1f59f7397e5e6f668c` (§3, [the bundled librtlsdr](#the-bundled-librtlsdr)).
 
 ## 2. Building
 
@@ -41,24 +42,27 @@ Output, in `target/packages/` (the layout an APT repository is built from):
 bookworm/coaxhub-stationd_0.1.0-1~deb12_amd64.deb
 bookworm/coaxhub-stationd_0.1.0-1~deb12_arm64.deb
 bookworm/ka9q-radio-384b269a.tar.gz     the corresponding source of the bundled radiod
+bookworm/rtl-sdr-619ac318.tar.gz        the corresponding source of the bundled librtlsdr
 trixie/coaxhub-stationd_0.1.0-1~deb13_amd64.deb
 trixie/coaxhub-stationd_0.1.0-1~deb13_arm64.deb
-trixie/ka9q-radio-384b269a.tar.gz       the same file
+trixie/ka9q-radio-384b269a.tar.gz       the same files
+trixie/rtl-sdr-619ac318.tar.gz
 ```
 
 ### How
 
 `build-deb.sh` needs only `git` and Docker with BuildKit (`docker build` with buildx). Everything else happens in `debian:<suite>` containers on the Docker daemon, driven by [packaging/deb/Dockerfile](../packaging/deb/Dockerfile) with the repository root as the build context. Nothing is bind-mounted and the result comes back with `--output type=local`, so it works the same on a CI runner, on a workstation and with a remote Docker daemon.
 
-1. **The radiod source.** The pinned commit is fetched once (`git fetch --depth 1`) into `target/packaging/ka9q-radio.git`, and `git archive | gzip -n` makes `ka9q-radio-384b269a.tar.gz`. radiod is built **from that tarball**, so the published source is exactly what was compiled.
-2. **Stage `toolchain`** (cached as an image layer per suite): the native and `aarch64-linux-gnu` C toolchains; the `-dev` libraries radiod links, for amd64 and, through multiarch, arm64 (`libbsd-dev libfftw3-dev libiniparser-dev libopus-dev libusb-1.0-0-dev librtlsdr-dev`); `protobuf-compiler` for station-proto; `dpkg-dev`; Rust from rustup with both targets. The build needs no arm64 emulation: arm64 is cross-compiled.
-3. **Stage `radiod`**: `make radiod rtlsdr.so` with every hardware driver off except `ENABLE_RTLSDR=1`.
+1. **The radiod and librtlsdr sources.** Each pinned commit is fetched once (`git fetch --depth 1`) into `target/packaging/ka9q-radio.git` and `target/packaging/rtl-sdr.git`, and `git archive | gzip -n` makes `ka9q-radio-384b269a.tar.gz` and `rtl-sdr-619ac318.tar.gz`, the same bytes on every run. radiod and librtlsdr are built **from those tarballs**, each a named build context (`ka9q`, `rtlsdr`), so the published source is exactly what was compiled.
+2. **Stage `toolchain`** (cached as an image layer per suite): the native and `aarch64-linux-gnu` C toolchains; the `-dev` libraries radiod and librtlsdr link, for amd64 and, through multiarch, arm64 (`libbsd-dev libfftw3-dev libiniparser-dev libopus-dev libusb-1.0-0-dev`; the suite's `librtlsdr-dev` is not used); `cmake`; `protobuf-compiler` for station-proto; `dpkg-dev`; Rust from rustup with both targets. The build needs no arm64 emulation: arm64 is cross-compiled.
+3. **Stage `librtlsdr`** ([the bundled librtlsdr](#the-bundled-librtlsdr)): checks the tarball's SHA-256 against the one `build-deb.sh` computed (the one the copyright file names), then builds only the shared library with CMake (`-DCMAKE_BUILD_TYPE=Release`, no udev rule, no zero-copy, and `DETACH_KERNEL_DRIVER` on as in Debian's build; for arm64 the cross compiler and the arm64 `pkg-config` directory). The library, `librtlsdr.so.0` (its SONAME), is stripped, and its two public headers go to radiod's stage.
+4. **Stage `radiod`**: `make radiod`, then `make rtlsdr.so` against the private librtlsdr (its headers, and `-Wl,--enable-new-dtags,-rpath,/usr/lib/coaxhub/radiod`, so `rtlsdr.so` has `RUNPATH` `/usr/lib/coaxhub/radiod` and `NEEDED` `librtlsdr.so.0`; the stage checks both), with every hardware driver off except `ENABLE_RTLSDR=1`.
    - `ARCHOPTS` is always passed. Upstream's `-march=native` would tie the binary to the build machine. The defaults are `-march=x86-64-v2 -mtune=generic` for amd64 (any x86-64 CPU since about 2009) and `-march=armv8-a -mtune=cortex-a53` for arm64 (every 64-bit Pi).
    - `config_paths.h` is written by the Dockerfile instead of upstream's Makefile rule, which asks git (the tarball has no `.git`). It holds the same commit, date and summary, and the package's private paths: `PKGLIBDIR`, `PKGDATADIR` and `CONFDIR` are `/usr/lib/coaxhub/radiod` (so a `/etc/radio` from another radiod install never overrides our presets), and `STATEDIR` is `/var/lib/coaxhub-radiod` (FFTW wisdom).
    - Upstream's Makefile calls a bare `ar`; the build puts the target's `ar` first on `PATH`.
    - radiod and `rtlsdr.so` are stripped.
-4. **Stage `stationd`**: `cargo build --release --locked -p stationd --features packaged --target <triple>` with `COAXHUB_DOMAIN` and the root certificate (a named build context holding only `root.pem`). The cargo registry and the target directory are BuildKit cache mounts, so a rebuild compiles only what changed. `cargo tree` lists the linked crates for the copyright file.
-5. **Stage `package`**: [packaging/deb/assemble.sh](../packaging/deb/assemble.sh) lays out the file tree, runs `dpkg-shlibdeps` for the target architecture on the three ELF files, writes `control`, `conffiles` and `md5sums`, sets every mtime to the last commit's time, and runs `dpkg-deb --root-owner-group -Zxz`.
+5. **Stage `stationd`**: `cargo build --release --locked -p stationd --features packaged --target <triple>` with `COAXHUB_DOMAIN` and the root certificate (a named build context holding only `root.pem`). The cargo registry and the target directory are BuildKit cache mounts, so a rebuild compiles only what changed. `cargo tree` lists the linked crates for the copyright file.
+6. **Stage `package`**: [packaging/deb/assemble.sh](../packaging/deb/assemble.sh) lays out the file tree, runs `dpkg-shlibdeps` for the target architecture on the four ELF files (stationd, radiod, `rtlsdr.so`, `librtlsdr.so.0`), checks that `Depends` names libusb and no librtlsdr, writes `control`, `conffiles` and `md5sums`, sets every mtime to the last commit's time, and runs `dpkg-deb --root-owner-group -Zxz`.
 
 Build times on a 16-thread x86-64 development machine:
 
@@ -70,7 +74,7 @@ Build times on a 16-thread x86-64 development machine:
 | trixie arm64 (toolchain cached) | 55 s | 10 s |
 | `build-all.sh` | about 4 min | about 45 s |
 
-Package sizes: 2.4 MB (amd64), 2.2 MB (arm64); installed about 7.6 MB.
+Package sizes: 2.5 MB (amd64), 2.2 MB (arm64); installed about 7.9 MB.
 
 If `docker build` fails with "error getting credentials", the credential helper named in `~/.docker/config.json` is not reachable. Point Docker at an empty config for the build: `mkdir -p /tmp/docker-config && echo '{}' >/tmp/docker-config/config.json && export DOCKER_CONFIG=/tmp/docker-config`.
 
@@ -79,16 +83,26 @@ If `docker build` fails with "error getting credentials", the credential helper 
 | Path | Contents |
 |---|---|
 | `/usr/bin/stationd` | stationd built with `--features packaged`: the domain and root are compiled in; `[backend]`, `[endpoints]`, `[credentials]` and `state_dir` are refused |
-| `/usr/lib/coaxhub/radiod/` | `radiod`, `rtlsdr.so`, `presets.conf`. Private, not on `PATH`. |
-| `/usr/share/coaxhub/radiod-templates/` | `rtlsdr.conf`, `rtlsdr-hf.conf` (the development-only `siggen` is left out) |
+| `/usr/lib/coaxhub/radiod/` | `radiod`, `rtlsdr.so`, `librtlsdr.so.0` (below), `presets.conf`. Private, not on `PATH`. |
+| `/usr/share/coaxhub/radiod-templates/` | `rtlsdr.conf`, `rtlsdr-hf.conf`, `rtlsdr-v4.conf` (the development-only `siggen` is left out) |
 | `/etc/coaxhub/stationd.toml` | conffile: station protocol §7's defaults (`[measurements] enabled = true` among them) and `[sdr] profile = "rtlsdr"` |
 | `/usr/lib/systemd/system/` | `stationd.service`, `coaxhub-radiod.service` |
 | `/usr/lib/udev/rules.d/72-coaxhub-rtlsdr.rules` | RTL-SDR device nodes for the `coaxhub-radiod` group only |
 | `/usr/lib/modprobe.d/coaxhub-stationd.conf` | blacklists `dvb_usb_rtl28xxu` |
-| `/usr/share/doc/coaxhub-stationd/copyright` | DEP-5: GPL-3.0-only; the ka9q-radio commit, its tarball and SHA-256, the `ARCHOPTS`; the Rust crates linked into stationd with their licences |
+| `/usr/share/doc/coaxhub-stationd/copyright` | DEP-5: GPL-3.0-only; the ka9q-radio commit, its tarball and SHA-256, the `ARCHOPTS`; librtlsdr's version, commit, tarball and SHA-256, its copyright holders and GPL-2.0-or-later; the Rust crates linked into stationd with their licences |
 
 - Units, udev rules and modprobe files are under `/usr/lib` on both suites. Both are merged-`/usr` systems, where `/lib` is `/usr/lib`, and trixie's dpkg expects packages to ship files under `/usr` only.
-- `Depends` comes from `dpkg-shlibdeps` (libc6, libfftw3-single3, libopus0, libiniparser1 or libiniparser4, libbsd0, librtlsdr0, libgcc-s1), plus `adduser` and `iproute2`. `Recommends: systemd-timesyncd | time-daemon`.
+- `Depends` comes from `dpkg-shlibdeps` (libc6, libfftw3-single3, libopus0, libiniparser1 or libiniparser4, libbsd0, libusb-1.0-0, libgcc-s1), plus `adduser` and `iproute2`. No librtlsdr package is a dependency, and one installed on the system is never used. `Recommends: systemd-timesyncd | time-daemon`.
+
+### The bundled librtlsdr
+
+radiod's RTL-SDR driver, `rtlsdr.so`, links osmocom librtlsdr. The package builds its own, v2.0.2 (commit `619ac3186ea0ffc092615e1f59f7397e5e6f668c` of `https://gitea.osmocom.org/sdr/rtl-sdr.git`, mirrored at `https://github.com/osmocom/rtl-sdr`), on every suite and architecture, and installs it as `/usr/lib/coaxhub/radiod/librtlsdr.so.0`. `rtlsdr.so` finds it there through its `RUNPATH`, never through the system's library path.
+
+- **Why.** The RTL-SDR Blog V4 (an R828D tuner with a built-in HF upconverter that the library switches by GPIO) needs librtlsdr 2.0.0 or newer. bookworm ships 0.6.0, with which a V4 receives no signals or the wrong frequencies; trixie ships 2.0.2. One library on every suite is one code path to test, and a V3 or any other RTL-SDR works the same with it on both suites.
+- **HF on a V4.** The library switches the upconverter in below 28.8 MHz, so a V4 tunes to the HF frequency itself and its tuner's gain is in the signal path; direct sampling receives nothing on it. ka9q-radio's `rtlsdr.c` passes the frequency through and sets direct sampling only when the config asks for it, so the `rtlsdr-v4` profile is the V4's whole support. A V4 identifies itself by its USB strings (manufacturer `RTLSDRBlog`, product `Blog V4`) and has the usual IDs, `0bda:2838`.
+- **Corresponding source.** `rtl-sdr-619ac318.tar.gz`, next to the packages and in the release, with its SHA-256 in the copyright file. Its licence is GPL-2.0-or-later, which combines with radiod's GPL-3.
+- **Updates.** The pin moves with osmocom's releases, security fixes in particular, as radiod's does ([releasing.md](releasing.md)).
+- **What the package does not take from it**: its utilities (`rtl_sdr`, `rtl_tcp` and the rest) and its udev rule. The package's own udev rule and DVB blacklist (§4) stand on their own; the library's kernel-driver detaching, built in as Debian builds it, frees a dongle the DVB driver still holds before the reboot that applies the blacklist.
 
 **Users and directories** (`postinst`):
 
@@ -144,8 +158,8 @@ Neither unit is enabled or started by the package: a fresh station is not enroll
 
 ### udev and the DVB driver
 
-- `72-coaxhub-rtlsdr.rules` gives RTL-SDR nodes (`0bda:2838`, `0bda:2832`) `root:coaxhub-radiod 0660` and removes the `uaccess` tag. It runs after `60-librtlsdr0.rules` (which would set `plugdev`) and `70-uaccess.rules` (which tags software radios for the desktop user), and before `73-seat-late.rules` applies that tag. The assignments use `:=` so later rules cannot widen them.
-- The kernel's DVB-T driver `dvb_usb_rtl28xxu` claims RTL-SDR dongles. The blacklist applies from the next boot; the installer unloads the module if it is loaded, and `postinst` says so otherwise.
+- `72-coaxhub-rtlsdr.rules` gives RTL-SDR nodes (`0bda:2838`, `0bda:2832`, the Blog V4 included) `root:coaxhub-radiod 0660` and removes the `uaccess` tag. The package needs no rule from the system's librtlsdr packages; when one is installed anyway (bookworm's `60-librtlsdr0.rules` sets `plugdev`), this rule runs after it, and after `70-uaccess.rules` (which tags software radios for the desktop user), and before `73-seat-late.rules` applies that tag. The assignments use `:=` so later rules cannot widen them.
+- The kernel's DVB-T driver `dvb_usb_rtl28xxu` claims RTL-SDR dongles. The package's own blacklist, `/usr/lib/modprobe.d/coaxhub-stationd.conf`, applies from the next boot; the installer unloads the module if it is loaded, and `postinst` says so otherwise.
 
 ## 5. Maintainer scripts
 
@@ -171,7 +185,7 @@ The script refuses to run while either is unreplaced, or when the URL or fingerp
 
 What it does, in order:
 1. **Checks**: root; `ID` or `ID_LIKE` is `debian`; `VERSION_CODENAME` is bookworm or trixie; `dpkg --print-architecture` is amd64 or arm64 (a 32-bit Raspberry Pi OS gets a hint to install the 64-bit one).
-2. **SDR**: looks for `0bda:2838` or `0bda:2832` under `/sys/bus/usb/devices` and asks for the profile (1: `rtlsdr`, the default; 2: `rtlsdr-hf`). Without an SDR it asks whether to continue. All questions are read from `/dev/tty`, because stdin is the script itself under `curl | sudo sh`; `main` redirects its own stdin from `/dev/null`, so no command it runs can swallow the rest of the script. Without a terminal, `--profile` and `--yes` answer them.
+2. **SDR**: looks for `0bda:2838` or `0bda:2832` under `/sys/bus/usb/devices` and asks for the profile (1: `rtlsdr`, the default; 2: `rtlsdr-hf`). When the dongle's USB `product` is `Blog V4`, it takes `rtlsdr-v4` without asking, since that profile covers both HF and VHF/UHF on a V4; `--profile` still chooses, and `--profile rtlsdr-hf` on a V4 is installed with a warning. Without an SDR it asks whether to continue. All questions are read from `/dev/tty`, because stdin is the script itself under `curl | sudo sh`; `main` redirects its own stdin from `/dev/null`, so no command it runs can swallow the rest of the script. Without a terminal, `--profile` and `--yes` answer them.
 3. **Repository key**: installs `gpg` and `curl` if missing, downloads `<APT_URL>/coaxhub-archive-keyring.asc` into a temporary directory and checks, with `gpg --show-keys --with-colons` in a throwaway `GNUPGHOME`, that it holds **exactly one** primary key whose fingerprint is the pinned one (an extra key appended to the file is refused). Only then does it write the dearmored keyring to `/usr/share/keyrings/coaxhub-archive-keyring.gpg` and the deb822 source `/etc/apt/sources.list.d/coaxhub.sources` with `Signed-By:` that keyring alone. A mismatch stops before anything is written. The initial download is protected by HTTPS in production; everything after it by the pinned key.
 4. **Package**: `apt-get update`, `apt-get install coaxhub-stationd` with `--force-confold`, so an owner's edited `stationd.toml` is kept on upgrades. It unloads `dvb_usb_rtl28xxu` if loaded.
 5. **Profile**: sets `[sdr] profile` in `/etc/coaxhub/stationd.toml` with `awk`, keeping every other line, then runs `stationd check-config`.
@@ -193,13 +207,14 @@ packaging/test/test-installer.sh [--quick]    # the installer
 Both need the four packages in `target/packages` and a Docker daemon, and nothing else: the tests copy files into `debian:<suite>` containers with `docker cp`, bind no host ports and mount nothing. Inside, checks print TAP-like `ok N - …` lines.
 
 **`test-packages.sh`**, per suite:
-- **Artefacts** (both architectures, not installed, so arm64 is checked on an amd64 host): control fields, the `~debN` version, `Depends`, the file list, root ownership, no PEM file shipped, the source tarball next to the packages with the SHA-256 the copyright file names, and `file` on stationd, radiod and `rtlsdr.so`: ELF 64-bit, `x86-64` or `ARM aarch64`, stripped.
-- **Install, amd64**, twice: on the bare image (no systemd) and with systemd installed. In a clean container: `apt-get install ./coaxhub-stationd_*.deb` resolves every dependency; `dpkg --verify`; users, groups, modes and paths as in §3; radiod not on `PATH`; the conffile; the copyright file; `stationd --version`; `check-config` says "not enrolled yet" (exit 0), `status` and `run` exit 3; `backend-config` renders both profiles with the fixed groups and TTL 0, also as `coaxhub-radiod` into `/run/coaxhub-radiod`; the packaged build refuses `siggen` and `[backend]`; `radiod -V` reports the pinned commit; every shared library resolves; radiod, run on the rendered config without an SDR, loads its presets and driver from `/usr/lib/coaxhub/radiod` and stops at the missing device. With systemd: `systemd-analyze verify` and `security` (exposure ≤ 2.5 and ≤ 4.5), `systemd-time-wait-sync` enabled. Then a reinstall keeps credentials, modes and an edited `stationd.toml`; `remove` keeps configuration, credentials and users; `purge` leaves no file, user, group, enablement link or `/etc` mention behind and disables `systemd-time-wait-sync` again.
+- **Artefacts** (both architectures, not installed, so arm64 is checked on an amd64 host): control fields, the `~debN` version, `Depends` (libusb, and no librtlsdr), the file list, root ownership, no PEM file shipped, both source tarballs next to the packages with the SHA-256s the copyright file names; `readelf -d`: `rtlsdr.so` needs `librtlsdr.so.0` with `RUNPATH` `/usr/lib/coaxhub/radiod`, and `librtlsdr.so.0` has that SONAME, needs libusb and knows the Blog V4; and `file` on stationd, radiod, `rtlsdr.so` and `librtlsdr.so.0`: ELF 64-bit, `x86-64` or `ARM aarch64`, stripped.
+- **Install, amd64**, twice: on the bare image (no systemd) and with systemd installed. In a clean container: `apt-get install ./coaxhub-stationd_*.deb` resolves every dependency and installs no librtlsdr package; `dpkg --verify`; users, groups, modes and paths as in §3; radiod not on `PATH`; the conffile; the copyright file; `stationd --version`; `check-config` says "not enrolled yet" (exit 0), `status` and `run` exit 3; `backend-config` renders the three profiles with the fixed groups and TTL 0 (`rtlsdr-v4` without direct sampling and with the tuner's gain), also as `coaxhub-radiod` into `/run/coaxhub-radiod`; the packaged build refuses `siggen` and `[backend]`; `radiod -V` reports the pinned commit; every shared library resolves, and `ldd` resolves `rtlsdr.so`'s librtlsdr to the package's; radiod, run on the rendered config without an SDR, loads its presets and driver from `/usr/lib/coaxhub/radiod` and stops at the missing device. With systemd: `systemd-analyze verify` and `security` (exposure ≤ 2.5 and ≤ 4.5), `systemd-time-wait-sync` enabled. Then a reinstall keeps credentials, modes and an edited `stationd.toml`; `remove` keeps configuration, credentials and users; `purge` leaves no file, user, group, enablement link or `/etc` mention behind and disables `systemd-time-wait-sync` again.
 
 **`test-installer.sh`**, per suite: a signing key generated in the test, a repository built with `apt-ftparchive` (`Release`, `InRelease`, `Release.gpg`, amd64 and arm64) and served by `python3 -m http.server` on `127.0.0.1:28080` inside the container. The installer is filled in with `sed`, as its publisher does.
 - Refusals, each leaving no keyring, source or package behind: the unfilled template; `--token` on the command line; not root; an unknown profile; Debian bullseye, Ubuntu, Fedora; armhf and i386 (a `dpkg` shim); no SDR without a terminal or `--yes`; a wrong fingerprint; a key file with a second key appended.
 - The happy path up to enrollment, with the script piped into `sh -s --` as `curl | sudo sh` does (`--token-file`, `--skip-time-sync`, `--no-start`, a fake RTL-SDR): SDR detected, keyring and source written, package installed, profile written once with the rest of the file kept, and enrollment failing cleanly (no control plane) with stationd's reason and exit 1; the token appears nowhere in the output.
 - On a pseudo-terminal, as a person runs it (`in-container/interactive.py`): the profile question, a refused token asking again ("2 of 3"), three refused tokens stopping, "Continue anyway?" answered no; no token is ever echoed.
+- An RTL-SDR Blog V4 (a fake sysfs device with product `Blog V4` and manufacturer `RTLSDRBlog`): `rtlsdr-v4` taken without a question, on a terminal and without one; `--profile rtlsdr-hf` installed with the warning.
 - Re-runs: keyring and source unchanged, one source file, a new profile applied; a malformed token file; with fake credentials (openssl), a re-run skips enrollment, waits for NTP through a `timedatectl` shim and exits 0, and stops when `timedatectl` is missing; `--reenroll` enrolls again, and a failed attempt keeps the old credentials.
 
 Each suite's installer test takes about 2.5 minutes and each package test about 1 minute, mostly `apt-get`.

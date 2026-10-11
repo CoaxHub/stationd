@@ -21,16 +21,20 @@
 # Output (target/packages/<suite>/):
 #   coaxhub-stationd_<version>_<arch>.deb
 #   ka9q-radio-<commit8>.tar.gz   the radiod corresponding source (GPL)
+#   rtl-sdr-<commit8>.tar.gz      the librtlsdr corresponding source (GPL)
 #
-# Caches: the ka9q-radio commit in target/packaging/ka9q-radio.git; the
-# cargo registry and target directories in BuildKit cache mounts; the build
-# toolchain as image layers.
+# Caches: the ka9q-radio and rtl-sdr commits in target/packaging/ka9q-radio.git
+# and target/packaging/rtl-sdr.git; the cargo registry and target directories
+# in BuildKit cache mounts; the build toolchain as image layers.
 
 set -euo pipefail
 
 readonly KA9Q_REPO="https://github.com/ka9q/ka9q-radio.git"
 readonly KA9Q_COMMIT="384b269aaf5e9ee1015185ae7c0cdd60f4d2ecbd"
-readonly KA9Q_SHORT="${KA9Q_COMMIT:0:8}"
+# osmocom librtlsdr, tag v2.0.2: the RTL-SDR Blog V4 needs 2.0.0 or newer.
+readonly RTLSDR_REPO="https://gitea.osmocom.org/sdr/rtl-sdr.git"
+readonly RTLSDR_VERSION="2.0.2"
+readonly RTLSDR_COMMIT="619ac3186ea0ffc092615e1f59f7397e5e6f668c"
 
 station="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly station
@@ -43,7 +47,7 @@ die() {
     exit 1
 }
 usage() {
-    sed -n '3,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,28p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -82,39 +86,48 @@ crate_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' "${station}/crates/station
 [[ -n "${crate_version}" ]] || die "cannot read stationd's version from its Cargo.toml"
 readonly version="${crate_version}-${revision}~deb${debian_version}"
 
-# The pinned ka9q-radio commit, fetched once, and its source tarball: what
-# the package's radiod is built from, and what is published next to it.
-fetch_ka9q() {
-    local git_dir="${cache}/ka9q-radio.git"
+# fetch_source NAME REPO COMMIT DIR: the pinned COMMIT of NAME, fetched once
+# into target/packaging/NAME.git, and its source tarball
+# target/packaging/DIR/NAME-<commit8>.tar.gz (`git archive`, gzip without a
+# timestamp: the same bytes on every run): what the package's binaries are
+# built from (DIR is their named build context), and what is published next
+# to the package. Sets SOURCE_TIME, SOURCE_SUMMARY and SOURCE_SHA256.
+fetch_source() {
+    local name="$1" repo="$2" commit="$3" dir="$4"
+    local short="${commit:0:8}" git_dir="${cache}/${name}.git"
     if [[ ! -d "${git_dir}" ]]; then
         mkdir -p "${cache}"
         git init --quiet --bare "${git_dir}"
     fi
-    if ! git -C "${git_dir}" cat-file -e "${KA9Q_COMMIT}^{commit}" 2>/dev/null; then
-        log "fetching ka9q-radio ${KA9Q_SHORT} from ${KA9Q_REPO}"
-        git -C "${git_dir}" fetch --quiet --depth 1 "${KA9Q_REPO}" "${KA9Q_COMMIT}"
+    if ! git -C "${git_dir}" cat-file -e "${commit}^{commit}" 2>/dev/null; then
+        log "fetching ${name} ${short} from ${repo}"
+        git -C "${git_dir}" fetch --quiet --depth 1 "${repo}" "${commit}"
     fi
-    git -C "${git_dir}" cat-file -e "${KA9Q_COMMIT}^{commit}" ||
-        die "ka9q-radio commit ${KA9Q_COMMIT} not found"
-    local tarball="${cache}/ka9q-src/ka9q-radio-${KA9Q_SHORT}.tar.gz"
+    git -C "${git_dir}" cat-file -e "${commit}^{commit}" ||
+        die "${name} commit ${commit} not found"
+    local tarball="${cache}/${dir}/${name}-${short}.tar.gz"
     if [[ ! -f "${tarball}" ]]; then
-        mkdir -p "${cache}/ka9q-src"
-        git -C "${git_dir}" archive --format=tar --prefix="ka9q-radio-${KA9Q_SHORT}/" "${KA9Q_COMMIT}" |
+        mkdir -p "${cache}/${dir}"
+        git -C "${git_dir}" archive --format=tar --prefix="${name}-${short}/" "${commit}" |
             gzip -n -9 >"${tarball}.tmp"
         mv "${tarball}.tmp" "${tarball}"
     fi
     # Next to the packages of the suite, where scripts/apt-repo.sh looks.
     mkdir -p "${packages}/${suite}"
     cp -p "${tarball}" "${packages}/${suite}/"
-    KA9Q_COMMIT_TIME="$(git -C "${git_dir}" show -s --format=%ci "${KA9Q_COMMIT}")"
-    KA9Q_SUMMARY="$(git -C "${git_dir}" show -s --format=%s "${KA9Q_COMMIT}")"
-    KA9Q_TARBALL_SHA256="$(sha256sum "${tarball}" | cut -d' ' -f1)"
+    SOURCE_TIME="$(git -C "${git_dir}" show -s --format=%ci "${commit}")"
+    SOURCE_SUMMARY="$(git -C "${git_dir}" show -s --format=%s "${commit}")"
+    SOURCE_SHA256="$(sha256sum "${tarball}" | cut -d' ' -f1)"
 }
 
 main() {
     local start
     start="$(date +%s)"
-    fetch_ka9q
+    fetch_source ka9q-radio "${KA9Q_REPO}" "${KA9Q_COMMIT}" ka9q-src
+    local KA9Q_COMMIT_TIME="${SOURCE_TIME}" KA9Q_SUMMARY="${SOURCE_SUMMARY}"
+    local KA9Q_TARBALL_SHA256="${SOURCE_SHA256}"
+    fetch_source rtl-sdr "${RTLSDR_REPO}" "${RTLSDR_COMMIT}" rtl-sdr-src
+    local RTLSDR_TARBALL_SHA256="${SOURCE_SHA256}"
 
     local tmp
     tmp="$(mktemp -d)"
@@ -135,6 +148,7 @@ main() {
         --target export
         --output "type=local,dest=${tmp}/out"
         --build-context "ka9q=${cache}/ka9q-src"
+        --build-context "rtlsdr=${cache}/rtl-sdr-src"
         --build-context "rootca=${tmp}/rootca"
         --build-arg "SUITE=${suite}"
         --build-arg "ARCH=${arch}"
@@ -146,6 +160,9 @@ main() {
         --build-arg "KA9Q_COMMIT_TIME=${KA9Q_COMMIT_TIME}"
         --build-arg "KA9Q_SUMMARY=${KA9Q_SUMMARY}"
         --build-arg "KA9Q_TARBALL_SHA256=${KA9Q_TARBALL_SHA256}"
+        --build-arg "RTLSDR_VERSION=${RTLSDR_VERSION}"
+        --build-arg "RTLSDR_COMMIT=${RTLSDR_COMMIT}"
+        --build-arg "RTLSDR_TARBALL_SHA256=${RTLSDR_TARBALL_SHA256}"
         --build-arg "SOURCE_DATE_EPOCH=${epoch}"
         "${station}"
     )

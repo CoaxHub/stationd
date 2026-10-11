@@ -95,13 +95,27 @@ pub const PROFILES: &[SdrProfile] = &[
     },
     SdrProfile {
         name: "rtlsdr-hf",
-        description: "RTL-SDR on HF by direct sampling (Q branch, e.g. RTL-SDR Blog V3)",
+        description: "RTL-SDR on HF by direct sampling (Q branch), for dongles with direct \
+                      sampling such as the RTL-SDR Blog V3, not the V4",
         usb_ids: RTL_SDR_USB_IDS,
         // Direct sampling at the 28.8 MHz ADC clock; the default covers 40 m.
         center: Some(CenterFrequency {
             default_hz: 7_100_000,
             min_hz: 500_000,
             max_hz: 28_800_000,
+        }),
+        dev_only: false,
+    },
+    SdrProfile {
+        name: "rtlsdr-v4",
+        description: "RTL-SDR Blog V4 (HF by its upconverter, VHF/UHF)",
+        usb_ids: RTL_SDR_USB_IDS,
+        // The V4's R828D tuner with its built-in HF upconverter, which
+        // librtlsdr switches in below 28.8 MHz; the default covers 40 m.
+        center: Some(CenterFrequency {
+            default_hz: 7_100_000,
+            min_hz: 500_000,
+            max_hz: 1_766_000_000,
         }),
         dev_only: false,
     },
@@ -154,10 +168,17 @@ mod tests {
     fn profiles_by_flavour() {
         assert_eq!(by_name("rtlsdr", true).expect("rtlsdr").name, "rtlsdr");
         assert!(by_name("rtlsdr-hf", true).is_ok());
+        assert_eq!(
+            by_name("rtlsdr-v4", true).expect("v4").usb_ids,
+            RTL_SDR_USB_IDS
+        );
         assert!(by_name("siggen", false).is_ok());
         let e = by_name("siggen", true).expect_err("dev only");
-        assert_eq!(e.supported, vec!["rtlsdr", "rtlsdr-hf"]);
-        assert!(e.to_string().contains("rtlsdr, rtlsdr-hf"), "{e}");
+        assert_eq!(e.supported, vec!["rtlsdr", "rtlsdr-hf", "rtlsdr-v4"]);
+        assert!(
+            e.to_string().contains("rtlsdr, rtlsdr-hf, rtlsdr-v4"),
+            "{e}"
+        );
         let e = by_name("airspy", false).expect_err("unknown");
         assert!(e.to_string().contains("siggen"), "{e}");
         assert_eq!(RTL_SDR_USB_IDS[0].to_string(), "0bda:2838");

@@ -5,7 +5,8 @@
 # (packaging/build-all.sh) and a Docker daemon; no bind mounts, no ports.
 #
 #   1. every package, without installing it (arm64 included, on an amd64
-#      host): control fields, file list, ELF machine of each binary;
+#      host): control fields, file list, ELF machine of each binary, the
+#      private librtlsdr and rtlsdr.so's RUNPATH to it, the source tarballs;
 #   2. amd64 on bookworm and trixie, each in a clean container, once on the
 #      bare image and once with systemd installed: install, users, modes,
 #      paths, stationd and radiod checks, systemd-analyze verify, reinstall,
@@ -30,6 +31,7 @@ artefacts() {
         docker cp "$(package_for "${suite}" "${arch}")" "${name}:/test/pkg/" >/dev/null
     done
     docker cp "${PACKAGES}/${suite}/ka9q-radio-384b269a.tar.gz" "${name}:/test/pkg/" >/dev/null
+    docker cp "${PACKAGES}/${suite}/rtl-sdr-619ac318.tar.gz" "${name}:/test/pkg/" >/dev/null
     run_in "${name}" "${TEST_DIR}/in-container/artefacts.sh" "${suite}" amd64 &&
         run_in "${name}" "${TEST_DIR}/in-container/artefacts.sh" "${suite}" arm64
 }
