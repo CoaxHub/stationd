@@ -462,8 +462,10 @@ impl EnrollServer {
 pub fn write_config(dir: &Path, enroll_url: &str, root: &Path) -> PathBuf {
     let text = format!(
         "state_dir = {:?}\n[endpoints]\nenroll_url = {enroll_url:?}\n\
-         station_api_url = {enroll_url:?}\nroot_ca = {root:?}\n[backend]\nkind = \"fake\"\n",
+         station_api_url = {enroll_url:?}\nroot_ca = {root:?}\n[backend]\nkind = \"fake\"\n\
+         usb_devices = {:?}\n",
         dir.join("state"),
+        dir.join("usb"),
     );
     let path = dir.join("stationd.toml");
     std::fs::write(&path, text).expect("write config");
@@ -784,8 +786,10 @@ impl ControlServer {
 pub fn write_enrolled_config(dir: &Path, station_api_url: &str, root: &Path) -> PathBuf {
     let text = format!(
         "state_dir = {:?}\n[endpoints]\nenroll_url = \"https://localhost:9\"\n\
-         station_api_url = {station_api_url:?}\nroot_ca = {root:?}\n[backend]\nkind = \"fake\"\n",
+         station_api_url = {station_api_url:?}\nroot_ca = {root:?}\n[backend]\nkind = \"fake\"\n\
+         usb_devices = {:?}\n",
         dir.join("state"),
+        dir.join("usb"),
     );
     let path = dir.join("stationd.toml");
     std::fs::write(&path, text).expect("write config");

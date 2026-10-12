@@ -5,7 +5,7 @@
 //!
 //! - **high:** `Hello`, responses, events, audio frames;
 //! - **low:** waterfall rows, `ChannelSignal`, `StationStatus`, and
-//!   measurement reports (`NoiseFloorReport`, protocol 1.1).
+//!   measurement reports (`NoiseFloorReport`, §6.4).
 //!
 //! High is always sent first; within a class, oldest first. "The queue
 //! exceeds 250 ms of data" is measured as queueing delay (how long an item
@@ -138,7 +138,7 @@ pub enum Class {
     Signal,
     /// `StationStatus`.
     Status,
-    /// `NoiseFloorReport` (1.1).
+    /// `NoiseFloorReport` (§6.4).
     Measurement,
 }
 

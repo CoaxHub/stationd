@@ -50,6 +50,8 @@ scripts/run-radiod-siggen.sh stop        # SIGTERM; radiod exits after ~1 s
 | RTP data (all dynamic channels) | `239.77.0.4:5004` | `[global] data = 239.77.0.4` (`modes.c:474`), port `DEFAULT_RTP_PORT` (`rtp.h:9`) |
 | Per-channel status copy | `239.77.0.4:5006` | status socket = data address with port 5006 (`modes.c:499`) |
 
+These are the groups of slot 0, the test configs' and the first receiver's. A station runs one radiod per receiver; see [several radiod instances on one host](#several-radiod-instances-on-one-host).
+
 Addressing rules:
 - Numeric IPv4 and IPv6 are accepted for `status` and `data`.
 - A name (not numeric) is not resolved unless `dns = yes`. Instead it is hashed into 239.x.y.z with `make_maddr()` (`radio.c:374`, `multicast.c:831`). No avahi is needed either way.
@@ -62,7 +64,7 @@ Interface and TTL:
 - Observed with `tcpdump -i any`: every radiod packet was on `lo` from `127.0.0.1`. Nothing radiod sent appeared on `eth0`.
 - **`lo` must have the MULTICAST flag.** If the flag is missing, radiod tries `SIOCSIFFLAGS` itself and exits with `EX_NOPERM` when it lacks CAP_NET_ADMIN (`multicast.c:577-592`).
   - A stock Linux `lo`, and Docker's in particular, has no MULTICAST flag. `sudo ip link set dev lo multicast on` sets it; a container needs `NET_ADMIN` for that.
-  - `scripts/build-radiod.sh` checks the flag and sets it with sudo. `coaxhub-radiod.service` sets it before every start.
+  - `scripts/build-radiod.sh` checks the flag and sets it with sudo. `coaxhub-radiod@.service` sets it before every start of an instance.
 - **No route is needed.** Nothing uses `ip route add 224.0.0.0/4 dev lo`. The sockets pick `lo` explicitly.
 - radiod's control socket joins the status group on the default-route interface and also on `lo` (`multicast.c:240-244`). Commands arrive whichever way they are sent. Observed memberships: `ip maddr` shows 239.77.0.6 on both `lo` and `eth0`.
 - Upstream `tune` and `metadump` send commands out `eth0` with TTL 1 or 5 (seen in tcpdump as `eth0 Out 172.20.0.3 > 239.77.0.6.5006`). That leaks commands onto the network. `tune -i lo` keeps them on `lo`.
@@ -78,6 +80,16 @@ Interface and TTL:
 This also works when the client runs under a different UID than radiod: the probe ran as root against radiod running as an unprivileged user.
 
 The client receives its own CMD packets, other clients' commands, and all channels' status on the group. It must filter on `pkt[0] == 0` (STATUS), then on `OUTPUT_SSRC`, then on `COMMAND_TAG`.
+
+### Several radiod instances on one host
+
+A station runs one radiod per receiver (`coaxhub-radiod@<receiver_id>.service`, station protocol §9). This is how the instances share a host:
+
+- **Each instance has its own pair of multicast groups.** A radiod reads commands and writes status on one status group and one data group, and a client tells channels apart by SSRC only within them. `stationd` gives every receiver a local **slot** (0–15) and renders the groups from it: status `239.77.<slot>.6:5006`, data `239.77.<slot>.4:5004`, with the table above being slot 0. The ports are the same for every instance because the sockets are bound to the group address, as in the client recipe above. Two receivers never share a slot.
+- **Everything stays on `lo` with TTL 0**, for every instance. The `MULTICAST` flag on `lo` is a host setting; each instance's unit sets it before it starts, and setting it again changes nothing.
+- **Each instance opens one device**, selected by `serial` in its config. radiod's `rtlsdr` driver selects by serial, so SDRs that report the same serial can't be told apart and at most one receiver uses them; a receiver with an empty serial gets no `serial =` line and opens the only RTL-SDR present (station protocol §9).
+- **SSRCs are per instance.** A channel's SSRC is unique among its own radiod's groups; the same number can exist on two instances. A backend client listens on its receiver's groups only and filters as above.
+- **An instance exits alone.** When its dongle is unplugged or stops streaming, only that radiod exits (§11) and its unit restarts it; the other instances keep running.
 
 ## 3. Test config (`testdata/radiod-siggen.conf`)
 
@@ -455,7 +467,7 @@ From the pinned `presets.conf`:
 - Observed with `crates/backend-ka9q/tests/e2e_waterfall.rs` (run by `scripts/e2e-station.sh`): for the full span and spans of 2 MHz, 512 kHz, 150 kHz, 100 kHz, 40 kHz and 20 kHz in 64 to 4096 bins (odd counts included), with the carrier at five places in each, the carrier's bin is the one its label says, on the real 24 MS/s signal generator (33 requests) and on a complex 2.048 MS/s one (LO 1.024 MHz, carrier at 1,234,567 Hz; 28 requests). The bin is checked exactly unless the carrier is within a tenth of a bin of a labelled edge, where either neighbour may win. Nominal requests fail 16 and 14 of them, from both causes: wideband placement (2048, 1023, 701 and 64 bins) and the odd-count centre (1023 bins, narrowband included).
 - Full span on the signal generator: 0 .. 12 MHz in 1024 bins is reported as 5,854 .. 11,994,146 Hz (2050 points, 11,707.3 Hz bins: 11,718.75 Hz bins would need the bin at DC, half below 0 Hz, or the window's top past Nyquist); the 10 MHz carrier is in bin 853 in every row; rows at 10.0/s; noise floor −96 dB/Hz after density normalisation; 542 bytes per zstd row.
 
-### Measurement channels (station protocol 1.1)
+### Measurement channels (station protocol §4.1)
 
 stationd measures the noise floor on spectrum2 channels of its own (`backend::measure`), outside the hub's channels and subscriptions:
 
@@ -535,4 +547,4 @@ In wideband mode (`RESOLUTION_BW` > `CROSSOVER`) the bins are FFT bins of the A/
 
 ### RTL-SDR failure
 
-- `rtlsdr_read_thread` calls `exit(EX_NOINPUT)` when `rtlsdr_read_async` returns an error (the dongle was unplugged or stopped streaming): radiod exits rather than hang, and its service restarts it (`coaxhub-radiod.service`: `Restart=on-failure`, `RestartSec=5`). A client sees its commands time out, then its next poll re-creates the channel from the template, which the backend client detects (`DEMOD_TYPE` 0) and re-creates.
+- `rtlsdr_read_thread` calls `exit(EX_NOINPUT)` when `rtlsdr_read_async` returns an error (the dongle was unplugged or stopped streaming): radiod exits rather than hang, and its unit restarts it (`coaxhub-radiod@.service`: `Restart=on-failure`, `RestartSec=5`). A client sees its commands time out, then its next poll re-creates the channel from the template, which the backend client detects (`DEMOD_TYPE` 0) and re-creates.

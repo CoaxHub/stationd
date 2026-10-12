@@ -108,7 +108,7 @@ fn first_message_must_be_hello() {
     assert_eq!(s.check(&hello(), t0), Verdict::Accept);
     assert_eq!(
         s.negotiated_version(),
-        Some(v1::ProtocolVersion { major: 1, minor: 0 })
+        Some(v1::ProtocolVersion { major: 2, minor: 0 })
     );
 }
 
@@ -139,7 +139,7 @@ fn empty_message_is_a_violation() {
 #[test]
 fn malformed_hello() {
     let t0 = Instant::now();
-    let mut h = hello_with(1, 0);
+    let mut h = hello_with(2, 0);
     h.protocol_version = None;
     assert_eq!(
         violation(Session::new(t0).check(&msg(Body::Hello(h)), t0)),
@@ -147,12 +147,12 @@ fn malformed_hello() {
             field: "hello.protocol_version"
         }
     );
-    let mut h = hello_with(1, 0);
+    let mut h = hello_with(2, 0);
     h.backend = None;
     assert!(is_violation(
         &Session::new(t0).check(&msg(Body::Hello(h)), t0)
     ));
-    let mut h = hello_with(1, 0);
+    let mut h = hello_with(2, 0);
     h.backend = Some(v1::BackendInfo::default());
     assert_eq!(
         violation(Session::new(t0).check(&msg(Body::Hello(h)), t0)),
@@ -161,7 +161,7 @@ fn malformed_hello() {
         }
     );
     // Hello precedes negotiation: a backend kind from a newer minor is fine.
-    let mut h = hello_with(1, 3);
+    let mut h = hello_with(2, 3);
     h.backend = Some(v1::BackendInfo {
         kind: 17,
         version: String::new(),
@@ -176,11 +176,29 @@ fn malformed_hello() {
 
 type Build = fn(String) -> v1::StationMessage;
 
-fn string_cases() -> [(Build, &'static str, usize); 7] {
+fn hardware_with(f: impl FnOnce(&mut v1::Sdr)) -> v1::StationMessage {
+    let mut h = hardware();
+    if let Some(sdr) = h.sdrs.first_mut() {
+        f(sdr);
+    }
+    response(1, OK, Some(Payload::Hardware(h)))
+}
+
+fn status_with(f: impl FnOnce(&mut v1::ReceiverHealth)) -> v1::StationMessage {
+    let mut m = status();
+    if let Some(Body::Status(x)) = m.body.as_mut() {
+        if let Some(rx) = x.receivers.first_mut() {
+            f(rx);
+        }
+    }
+    m
+}
+
+fn string_cases() -> [(Build, &'static str, usize); 13] {
     [
         (
             |s| {
-                let mut h = hello_with(1, 0);
+                let mut h = hello_with(2, 0);
                 h.daemon_version = s;
                 msg(Body::Hello(h))
             },
@@ -189,7 +207,7 @@ fn string_cases() -> [(Build, &'static str, usize); 7] {
         ),
         (
             |s| {
-                let mut h = hello_with(1, 0);
+                let mut h = hello_with(2, 0);
                 h.platform = s;
                 msg(Body::Hello(h))
             },
@@ -198,7 +216,7 @@ fn string_cases() -> [(Build, &'static str, usize); 7] {
         ),
         (
             |s| {
-                let mut h = hello_with(1, 0);
+                let mut h = hello_with(2, 0);
                 h.backend = Some(v1::BackendInfo {
                     kind: 1,
                     version: s,
@@ -207,6 +225,42 @@ fn string_cases() -> [(Build, &'static str, usize); 7] {
             },
             "hello.backend.version",
             64,
+        ),
+        (
+            |s| hardware_with(|sdr| sdr.manufacturer = s),
+            "hardware.sdrs.manufacturer",
+            128,
+        ),
+        (
+            |s| hardware_with(|sdr| sdr.product = s),
+            "hardware.sdrs.product",
+            128,
+        ),
+        (
+            |s| hardware_with(|sdr| sdr.serial = s),
+            "hardware.sdrs.serial",
+            128,
+        ),
+        (
+            |s| hardware_with(|sdr| sdr.port = s),
+            "hardware.sdrs.port",
+            32,
+        ),
+        (
+            |s| {
+                let Payload::ReceiversConfigured(mut r) = receivers_configured(&[RX]) else {
+                    unreachable!()
+                };
+                r.receivers[0].detail = s;
+                response(1, OK, Some(Payload::ReceiversConfigured(r)))
+            },
+            "receivers_configured.receivers.detail",
+            256,
+        ),
+        (
+            |s| status_with(|rx| rx.detail = s),
+            "status.receivers.detail",
+            256,
         ),
         (
             |s| {
@@ -225,16 +279,17 @@ fn string_cases() -> [(Build, &'static str, usize); 7] {
         (
             |s| {
                 let mut caps = capabilities();
-                caps.sdr_model = s;
+                caps.receivers[0].sdr_model = s;
                 response(1, OK, Some(Payload::Capabilities(caps)))
             },
-            "capabilities.sdr_model",
+            "capabilities.receivers.sdr_model",
             64,
         ),
         (
             |s| {
                 msg(Body::Event(v1::Event {
                     kind: v1::event::Kind::DeviceLost as i32,
+                    receiver_id: Some(RX),
                     detail: s,
                     ..Default::default()
                 }))
@@ -244,15 +299,14 @@ fn string_cases() -> [(Build, &'static str, usize); 7] {
         ),
         (
             |s| {
-                msg(Body::Status(v1::StationStatus {
-                    backend: Some(v1::BackendHealth {
+                status_with(|rx| {
+                    rx.backend = Some(v1::BackendHealth {
                         state: 1,
                         version: s,
-                    }),
-                    ..Default::default()
-                }))
+                    });
+                })
             },
-            "status.backend.version",
+            "status.receivers.backend.version",
             64,
         ),
     ]
@@ -285,23 +339,36 @@ fn string_caps() {
 #[test]
 fn antenna_labels() {
     let mut caps = capabilities();
-    if let Some(f) = caps.frontend.as_mut() {
+    if let Some(f) = caps.receivers[0].frontend.as_mut() {
         f.antenna_ports = vec!["x".repeat(16); 8];
     }
     assert!(sanitize_capabilities(&caps, 0).is_ok());
-    if let Some(f) = caps.frontend.as_mut() {
+    if let Some(f) = caps.receivers[0].frontend.as_mut() {
         f.antenna_ports.push("I".into());
     }
     assert_eq!(
         sanitize_capabilities(&caps, 0).map(drop),
         Err(ViolationKind::TooManyEntries {
-            field: "capabilities.frontend.antenna_ports",
+            field: "capabilities.receivers.frontend.antenna_ports",
+            len: 9,
+            max: 8
+        })
+    );
+    // A profile's front-end settings carry the same caps.
+    let mut h = hardware();
+    if let Some(f) = h.profiles[0].frontend.as_mut() {
+        f.antenna_ports = vec!["x".repeat(16); 9];
+    }
+    assert_eq!(
+        check_message(&response(1, OK, Some(Payload::Hardware(h))), 0),
+        Err(ViolationKind::TooManyEntries {
+            field: "hardware.profiles.frontend.antenna_ports",
             len: 9,
             max: 8
         })
     );
     let mut caps = capabilities();
-    if let Some(f) = caps.frontend.as_mut() {
+    if let Some(f) = caps.receivers[0].frontend.as_mut() {
         f.antenna_ports = vec!["x".repeat(17)];
     }
     assert!(matches!(
@@ -382,21 +449,60 @@ fn enums_known_and_specified() {
         check_message(&e, 0),
         Err(ViolationKind::UnspecifiedEnum { .. })
     ));
-    // Health states in StationStatus.
-    let mut st = status();
-    if let Some(Body::Status(x)) = st.body.as_mut() {
-        if let Some(f) = x.frontend.as_mut() {
+    // Health states in StationStatus (§5.1: present means specified).
+    assert!(is_err(&status_with(|rx| {
+        if let Some(f) = rx.frontend.as_mut() {
             f.state = 9;
         }
-    }
-    assert!(is_err(&st));
-    let mut st = status();
-    if let Some(Body::Status(x)) = st.body.as_mut() {
-        if let Some(b) = x.backend.as_mut() {
+    })));
+    assert!(is_err(&status_with(|rx| {
+        if let Some(b) = rx.backend.as_mut() {
             b.state = 0;
         }
+    })));
+    assert_eq!(
+        check_message(&status_with(|rx| rx.state = 0), 0),
+        Err(ViolationKind::UnspecifiedEnum {
+            field: "status.receivers.state"
+        })
+    );
+    assert!(matches!(
+        check_message(&status_with(|rx| rx.state = 5), 0),
+        Err(ViolationKind::UnknownEnumValue {
+            field: "status.receivers.state",
+            value: 5,
+            ..
+        })
+    ));
+    // Absent health sub-messages are fine.
+    assert!(!is_err(&status_with(|rx| {
+        rx.backend = None;
+        rx.frontend = None;
+    })));
+    // Receiver states in ReceiversConfigured.
+    for bad in [0, 5] {
+        let Payload::ReceiversConfigured(mut r) = receivers_configured(&[RX]) else {
+            unreachable!()
+        };
+        r.receivers[0].state = bad;
+        assert!(is_err(&response(
+            1,
+            OK,
+            Some(Payload::ReceiversConfigured(r))
+        )));
     }
-    assert!(is_err(&st));
+    // Models and profiles in Hardware.
+    for bad in [0, 4, -1] {
+        let mut h = hardware();
+        h.sdrs[0].models[0].model = bad;
+        assert!(is_err(&response(1, OK, Some(Payload::Hardware(h)))));
+        let mut h = hardware();
+        h.sdrs[0].models[0].profiles.push(bad);
+        assert!(is_err(&response(1, OK, Some(Payload::Hardware(h)))));
+        let mut h = hardware();
+        h.profiles[0].profile = bad;
+        assert!(is_err(&response(1, OK, Some(Payload::Hardware(h)))));
+    }
     // Enum lists in Capabilities.
     for bad in [0, 7, -1] {
         let mut caps = capabilities();
@@ -405,9 +511,6 @@ fn enums_known_and_specified() {
         let mut caps = capabilities();
         caps.codecs.push(bad);
         assert!(sanitize_capabilities(&caps, 0).is_err(), "codec {bad}");
-        let mut caps = capabilities();
-        caps.allowed_admin_ops.push(bad);
-        assert!(sanitize_capabilities(&caps, 0).is_err(), "admin op {bad}");
     }
     // Enums inside response payloads.
     let Payload::ChannelOpened(mut co) = channel_opened(1, 20) else {
@@ -447,6 +550,10 @@ fn response_payload_sanity() {
         waterfall_subscribed(1, 1024, 100),
         pong(1),
         Payload::Capabilities(capabilities()),
+        Payload::Hardware(hardware()),
+        Payload::Hardware(v1::Hardware::default()),
+        receivers_configured(&[RX, RX2]),
+        receivers_configured(&[]),
     ];
     for p in good {
         assert_eq!(
@@ -649,6 +756,39 @@ fn responses_must_echo_the_request() {
             }),
             channel_updated(2),
             "channel_updated.channel_id",
+        ),
+        (
+            open_channel_on(RX2, 1, 20),
+            channel_opened(1, 20),
+            "channel_opened.receiver_id",
+        ),
+        (
+            Command::SetFrontend(v1::SetFrontend {
+                receiver_id: RX2,
+                ..Default::default()
+            }),
+            frontend_state(),
+            "frontend_state.receiver_id",
+        ),
+        (
+            subscribe_on(RX2, 1, 1024, 100),
+            waterfall_subscribed(1, 1024, 100),
+            "waterfall_subscribed.receiver_id",
+        ),
+        (
+            configure(&[RX, RX2]),
+            receivers_configured(&[RX]),
+            "receivers_configured.receivers",
+        ),
+        (
+            configure(&[RX]),
+            receivers_configured(&[RX, RX2]),
+            "receivers_configured.receivers.receiver_id",
+        ),
+        (
+            configure(&[RX]),
+            receivers_configured(&[RX, RX]),
+            "receivers_configured.receivers.receiver_id",
         ),
         (
             subscribe(1, 1024, 100),
@@ -979,7 +1119,7 @@ fn channel_signal_rate_and_floats() {
 #[test]
 fn status_rate_follows_the_interval() {
     let t0 = Instant::now();
-    let mut s = established(t0);
+    let mut s = configured(t0, &[RX]);
     // Default 10 s interval: at most one per 5 s.
     assert_eq!(s.check(&status(), t0), Verdict::Accept);
     assert_eq!(
@@ -994,7 +1134,7 @@ fn status_rate_follows_the_interval() {
         assert_eq!(s.check(&status(), t0 + secs(5 + 10 * i)), Verdict::Accept);
     }
     // Welcome with a 2 s interval: one per second.
-    let mut s = established(t0);
+    let mut s = configured(t0, &[RX]);
     s.on_welcome_sent(
         &v1::Welcome {
             status_interval_ms: 2000,
@@ -1017,7 +1157,7 @@ fn status_rate_follows_the_interval() {
 #[test]
 fn status_floats_must_be_finite() {
     let t0 = Instant::now();
-    let setters: [fn(&mut v1::StationStatus); 4] = [
+    let setters: [fn(&mut v1::StationStatus); 5] = [
         |x| {
             x.host
                 .as_mut()
@@ -1031,16 +1171,21 @@ fn status_floats_must_be_finite() {
                 .for_each(|h| h.cpu_temp_c = Some(f32::INFINITY));
         },
         |x| {
-            x.frontend
-                .as_mut()
-                .into_iter()
+            x.receivers
+                .iter_mut()
+                .filter_map(|r| r.frontend.as_mut())
                 .for_each(|f| f.gain_db = f32::NAN);
         },
         |x| {
-            x.frontend
-                .as_mut()
-                .into_iter()
+            x.receivers
+                .iter_mut()
+                .filter_map(|r| r.frontend.as_mut())
                 .for_each(|f| f.input_power_dbfs = Some(f32::NAN));
+        },
+        |x| {
+            x.receivers
+                .iter_mut()
+                .for_each(|r| r.backend_cpu = Some(f32::NEG_INFINITY));
         },
     ];
     for set in setters {
@@ -1049,13 +1194,51 @@ fn status_floats_must_be_finite() {
             set(x);
         }
         assert!(matches!(
-            violation(established(t0).check(&m, t0)),
+            violation(configured(t0, &[RX]).check(&m, t0)),
             ViolationKind::NonFiniteFloat { .. }
         ));
     }
-    // An empty status is fine.
+    // An empty status is fine, before a receiver set too.
     let empty = msg(Body::Status(v1::StationStatus::default()));
     assert_eq!(established(t0).check(&empty, t0), Verdict::Accept);
+    assert_eq!(configured(t0, &[]).check(&empty, t0), Verdict::Accept);
+}
+
+#[test]
+fn status_receivers_configured_once() {
+    let t0 = Instant::now();
+    let mut s = configured(t0, &[RX, RX2]);
+    assert_eq!(s.check(&status_of(&[RX2, RX]), t0), Verdict::Accept);
+    // A receiver twice is malformed.
+    assert_eq!(
+        violation(configured(t0, &[RX]).check(&status_of(&[RX, RX]), t0)),
+        ViolationKind::DuplicateReceiver {
+            field: "status.receivers.receiver_id",
+            receiver_id: RX
+        }
+    );
+    // More than 16.
+    let many: Vec<u32> = (1..=17).collect();
+    assert!(matches!(
+        check_message(&status_of(&many), 0),
+        Err(ViolationKind::TooManyEntries {
+            field: "status.receivers",
+            len: 17,
+            max: 16
+        })
+    ));
+    // A receiver the hub never configured.
+    assert_eq!(
+        violation(configured(t0, &[RX]).check(&status_of(&[RX, 9]), t0)),
+        ViolationKind::UnknownReceiver {
+            kind: MessageKind::Status,
+            receiver_id: 9
+        }
+    );
+    assert!(matches!(
+        violation(configured(t0, &[RX]).check(&status_of(&[0]), t0)),
+        ViolationKind::UnknownReceiver { receiver_id: 0, .. }
+    ));
 }
 
 // ------------------------------------------------------------------ Event
@@ -1063,7 +1246,7 @@ fn status_floats_must_be_finite() {
 #[test]
 fn event_rate_burst_fifty_then_ten_per_second() {
     let t0 = Instant::now();
-    let mut s = established(t0);
+    let mut s = configured(t0, &[RX]);
     let e = event(v1::event::Kind::FrontendOverload, None, None);
     for _ in 0..50 {
         assert_eq!(s.check(&e, t0), Verdict::Accept);
@@ -1125,18 +1308,86 @@ fn event_ids_must_be_open_or_just_closed() {
 }
 
 #[test]
+fn events_name_their_receiver() {
+    use v1::event::Kind;
+    let t0 = Instant::now();
+    // §5.1: these kinds without receiver_id are violations.
+    for kind in [
+        Kind::ReceiverState,
+        Kind::DeviceLost,
+        Kind::DeviceRestored,
+        Kind::FrontendOverload,
+        Kind::FrontendChanged,
+        Kind::BackendRestarted,
+    ] {
+        let mut m = event(kind, None, None);
+        assert_eq!(check_message(&m, 0), Ok(()), "{kind:?}");
+        if let Some(Body::Event(e)) = m.body.as_mut() {
+            e.receiver_id = None;
+        }
+        assert_eq!(
+            violation(configured(t0, &[RX]).check(&m, t0)),
+            ViolationKind::MissingField {
+                field: "event.receiver_id"
+            },
+            "{kind:?}"
+        );
+    }
+    // RECEIVER_STATE needs a specified state.
+    for state in [None, Some(0), Some(9)] {
+        let mut m = event(Kind::ReceiverState, None, None);
+        if let Some(Body::Event(e)) = m.body.as_mut() {
+            e.receiver_state = state;
+        }
+        assert!(is_err(&m), "{state:?}");
+    }
+    let mut m = event(Kind::ReceiverState, None, None);
+    if let Some(Body::Event(e)) = m.body.as_mut() {
+        e.receiver_state = Some(v1::ReceiverState::NoDevice as i32);
+        e.detail = "SDR 00000001 is not plugged in".into();
+    }
+    assert_eq!(configured(t0, &[RX]).check(&m, t0), Verdict::Accept);
+    // HARDWARE_CHANGED and SHUTTING_DOWN name no receiver.
+    for kind in [Kind::HardwareChanged, Kind::ShuttingDown] {
+        assert_eq!(
+            configured(t0, &[RX]).check(&event(kind, None, None), t0),
+            Verdict::Accept
+        );
+    }
+    // A receiver the hub didn't configure: dropped, never a violation.
+    let mut s = configured(t0, &[RX]);
+    assert_eq!(
+        s.check(&receiver_event(Kind::FrontendOverload, 7), t0),
+        Verdict::Drop(DropReason::UnknownEventTarget)
+    );
+    // Before the station accepted a set it runs the one it kept: dropped.
+    let mut s = established(t0);
+    assert_eq!(
+        s.check(&receiver_event(Kind::DeviceLost, 7), t0),
+        Verdict::Drop(DropReason::AwaitingReceivers {
+            kind: MessageKind::Event
+        })
+    );
+}
+
+#[test]
 fn station_side_close_events_close_ids() {
     let t0 = Instant::now();
-    let mut s = with_channel(t0, 1);
-    s.on_request_sent(&request(2, subscribe(5, 256, 100)), t0)
+    let mut s = configured(t0, &[RX, RX2]);
+    s.on_request_sent(&request(2, open_channel(1, 20)), t0)
+        .expect("request");
+    s.on_request_sent(&request(3, subscribe(5, 256, 100)), t0)
         .expect("request");
     assert_eq!(
         s.check(
-            &response(2, OK, Some(waterfall_subscribed(5, 256, 100))),
+            &response(3, OK, Some(waterfall_subscribed(5, 256, 100))),
             t0
         ),
         Verdict::Accept
     );
+    // A channel on the other receiver.
+    s.on_request_sent(&request(4, open_channel_on(RX2, 2, 20)), t0)
+        .expect("request");
     // Station closed channel 1 (e.g. SetFrontend moved the passband).
     assert_eq!(
         s.check(&event(v1::event::Kind::ChannelClosed, Some(1), None), t0),
@@ -1158,7 +1409,7 @@ fn station_side_close_events_close_ids() {
         Verdict::Accept
     );
     assert!(!s2.is_subscription_open(5, t0));
-    // Backend restart closes everything.
+    // A backend restart closes everything on its receiver, nothing else.
     assert!(s.is_subscription_open(5, t0));
     assert_eq!(
         s.check(&event(v1::event::Kind::BackendRestarted, None, None), t0),
@@ -1168,6 +1419,15 @@ fn station_side_close_events_close_ids() {
     assert!(is_violation(
         &s.check(&waterfall(5, zstd_row(256)), t0 + secs(6))
     ));
+    assert!(s.is_channel_open(2, t0 + secs(6)));
+    assert_eq!(
+        s.check(
+            &receiver_event(v1::event::Kind::BackendRestarted, RX2),
+            t0 + secs(6)
+        ),
+        Verdict::Accept
+    );
+    assert!(!s.is_channel_open(2, t0 + secs(6)));
 }
 
 // ------------------------------------------------------------------ ID lifecycle and grace
@@ -1270,9 +1530,12 @@ fn capabilities_accept_and_clamp() {
     assert_eq!(clean.capabilities, capabilities());
 
     let mut caps = capabilities();
-    caps.hardware_range = Some(range(0, 7_250_000_000));
-    caps.tunable_range = Some(range(5_000_000_000, 6_500_000_000));
-    caps.max_channels = 1000;
+    caps.receivers[0].hardware_range = Some(range(0, 7_250_000_000));
+    caps.receivers[0].tunable_range = Some(range(5_000_000_000, 6_500_000_000));
+    caps.receivers[0].max_channels = 1000;
+    let mut second = receiver_capabilities(RX2, 13_000_000);
+    second.max_channels = 65;
+    caps.receivers.push(second);
     caps.waterfall = Some(v1::WaterfallLimits {
         max_bins: 1 << 20,
         min_row_interval_ms: 0,
@@ -1282,17 +1545,21 @@ fn capabilities_accept_and_clamp() {
     assert_eq!(
         out.clamped,
         [
-            "capabilities.hardware_range.end_hz",
-            "capabilities.tunable_range.end_hz",
-            "capabilities.max_channels",
+            "capabilities.receivers.hardware_range.end_hz",
+            "capabilities.receivers.tunable_range.end_hz",
+            "capabilities.receivers.max_channels",
             "capabilities.waterfall.max_bins",
             "capabilities.waterfall.max_subscriptions"
         ]
     );
     let c = out.capabilities;
-    assert_eq!(c.hardware_range, Some(range(0, 6_000_000_000)));
-    assert_eq!(c.tunable_range, Some(range(5_000_000_000, 6_000_000_000)));
-    assert_eq!(c.max_channels, 64);
+    assert_eq!(c.receivers[0].hardware_range, Some(range(0, 6_000_000_000)));
+    assert_eq!(
+        c.receivers[0].tunable_range,
+        Some(range(5_000_000_000, 6_000_000_000))
+    );
+    assert_eq!(c.receivers[0].max_channels, 64);
+    assert_eq!(c.receivers[1].max_channels, 64);
     assert_eq!(
         c.waterfall.map(|w| (w.max_bins, w.max_subscriptions)),
         Some((16_384, 16))
@@ -1312,72 +1579,91 @@ fn capabilities_accept_and_clamp() {
 
 #[test]
 fn nonsense_capabilities_are_violations() {
-    let mut cases: Vec<(v1::Capabilities, ViolationKind)> = Vec::new();
     let base = capabilities();
+    let with_rx = |f: &dyn Fn(&mut v1::ReceiverCapabilities)| {
+        let mut c = capabilities();
+        f(&mut c.receivers[0]);
+        c
+    };
+    let mut cases: Vec<(v1::Capabilities, ViolationKind)> = vec![
+        (
+            with_rx(&|r| r.tunable_range = Some(range(0, 1_800_000_000))),
+            ViolationKind::TunableOutsideHardware { receiver_id: RX },
+        ),
+        (
+            with_rx(&|r| {
+                r.tunable_range = Some(range(1, 2));
+                r.hardware_range = Some(range(10, 1_000));
+            }),
+            ViolationKind::TunableOutsideHardware { receiver_id: RX },
+        ),
+        (
+            with_rx(&|r| r.hardware_range = Some(range(10, 5))),
+            ViolationKind::InvalidRange {
+                field: "capabilities.receivers.hardware_range",
+            },
+        ),
+        (
+            with_rx(&|r| r.tunable_range = Some(range(10, 5))),
+            ViolationKind::InvalidRange {
+                field: "capabilities.receivers.tunable_range",
+            },
+        ),
+        (
+            with_rx(&|r| {
+                r.hardware_range = Some(range(6_000_000_001, 7_000_000_000));
+                r.tunable_range = Some(range(6_000_000_001, 6_100_000_000));
+            }),
+            ViolationKind::InvalidRange {
+                field: "capabilities.receivers.hardware_range",
+            },
+        ),
+        (
+            with_rx(&|r| r.hardware_range = None),
+            ViolationKind::MissingField {
+                field: "capabilities.receivers.hardware_range",
+            },
+        ),
+        (
+            with_rx(&|r| r.tunable_range = None),
+            ViolationKind::MissingField {
+                field: "capabilities.receivers.tunable_range",
+            },
+        ),
+        (
+            with_rx(&|r| r.receiver_id = 0),
+            ViolationKind::UnknownReceiver {
+                kind: MessageKind::Response,
+                receiver_id: 0,
+            },
+        ),
+    ];
+    // A receiver twice.
+    let mut twice = capabilities();
+    twice.receivers.push(receiver_capabilities(RX, 13_000_000));
     cases.push((
-        v1::Capabilities {
-            tunable_range: Some(range(0, 1_800_000_000)),
-            ..base.clone()
+        twice,
+        ViolationKind::DuplicateReceiver {
+            field: "capabilities.receivers.receiver_id",
+            receiver_id: RX,
         },
-        ViolationKind::TunableOutsideHardware,
     ));
+    // More than 16.
+    let mut many = capabilities();
+    many.receivers = (1..=17)
+        .map(|id| receiver_capabilities(id, u64::from(id) * 10_000_000))
+        .collect();
     cases.push((
-        v1::Capabilities {
-            tunable_range: Some(range(1, 2)),
-            hardware_range: Some(range(10, 1_000)),
-            ..base.clone()
-        },
-        ViolationKind::TunableOutsideHardware,
-    ));
-    cases.push((
-        v1::Capabilities {
-            hardware_range: Some(range(10, 5)),
-            ..base.clone()
-        },
-        ViolationKind::InvalidRange {
-            field: "capabilities.hardware_range",
-        },
-    ));
-    cases.push((
-        v1::Capabilities {
-            tunable_range: Some(range(10, 5)),
-            ..base.clone()
-        },
-        ViolationKind::InvalidRange {
-            field: "capabilities.tunable_range",
-        },
-    ));
-    cases.push((
-        v1::Capabilities {
-            hardware_range: Some(range(6_000_000_001, 7_000_000_000)),
-            tunable_range: Some(range(6_000_000_001, 6_100_000_000)),
-            ..base.clone()
-        },
-        ViolationKind::InvalidRange {
-            field: "capabilities.hardware_range",
-        },
-    ));
-    cases.push((
-        v1::Capabilities {
-            hardware_range: None,
-            ..base.clone()
-        },
-        ViolationKind::MissingField {
-            field: "capabilities.hardware_range",
-        },
-    ));
-    cases.push((
-        v1::Capabilities {
-            tunable_range: None,
-            ..base.clone()
-        },
-        ViolationKind::MissingField {
-            field: "capabilities.tunable_range",
+        many,
+        ViolationKind::TooManyEntries {
+            field: "capabilities.receivers",
+            len: 17,
+            max: 16,
         },
     ));
     for field in 0..3 {
         let mut c = base.clone();
-        if let Some(f) = c.frontend.as_mut() {
+        if let Some(f) = c.receivers[0].frontend.as_mut() {
             match field {
                 0 => f.min_gain_db = f32::NAN,
                 1 => f.max_gain_db = f32::INFINITY,
@@ -1404,13 +1690,35 @@ fn nonsense_capabilities_are_violations() {
             expected
         );
     }
-    // No frontend / no waterfall section is fine.
-    let bare = v1::Capabilities {
-        frontend: None,
+    // No frontend / no waterfall section / no receiver at all is fine.
+    let mut bare = v1::Capabilities {
         waterfall: None,
         ..base
     };
+    bare.receivers[0].frontend = None;
     assert!(sanitize_capabilities(&bare, 0).is_ok());
+    bare.receivers.clear();
+    assert!(sanitize_capabilities(&bare, 0).is_ok());
+}
+
+#[test]
+fn overlapping_receivers_are_not_a_violation() {
+    let t0 = Instant::now();
+    let mut caps = capabilities();
+    // 5.9–8.3 MHz and 7.0–9.4 MHz.
+    caps.receivers.push(receiver_capabilities(RX2, 7_000_000));
+    assert!(sanitize_capabilities(&caps, 0).is_ok());
+    let mut s = configured(t0, &[RX, RX2]);
+    s.on_request_sent(
+        &request(2, Command::GetCapabilities(v1::GetCapabilities {})),
+        t0,
+    )
+    .expect("request");
+    assert_eq!(
+        s.check(&response(2, OK, Some(Payload::Capabilities(caps))), t0),
+        Verdict::Accept
+    );
+    assert_eq!(s.running_receivers(), [RX, RX2]);
 }
 
 // ------------------------------------------------------------------ §2.1 timeouts
@@ -1502,8 +1810,17 @@ fn timed_out_memory_is_bounded() {
     let mut s = established(t0);
     let mut now = t0;
     for id in 1..=100u64 {
-        s.on_request_sent(&request(id, Command::AdminOp(v1::AdminOp { kind: 1 })), now)
-            .expect("request");
+        s.on_request_sent(
+            &request(
+                id,
+                Command::AdminOp(v1::AdminOp {
+                    kind: 1,
+                    receiver_id: None,
+                }),
+            ),
+            now,
+        )
+        .expect("request");
         now += secs(6);
         s.expire_requests(now);
     }
@@ -1578,7 +1895,18 @@ fn request_bookkeeping_errors() {
         s.on_request_sent(&request(37, ping()), t0),
         Err(RequestError::TooManyOutstanding(32))
     );
+    // A receiver set with an ID of 0, an ID twice, or more than 16.
+    let mut s = established(t0);
+    let many: Vec<u32> = (1..=17).collect();
+    for ids in [&[0][..], &[1, 2, 1][..], &many[..]] {
+        assert_eq!(
+            s.on_request_sent(&request(1, configure(ids)), t0),
+            Err(RequestError::InvalidReceiverSet)
+        );
+    }
+    assert!(!s.is_receiver_configured(1, t0));
     for e in [
+        RequestError::InvalidReceiverSet,
         RequestError::NotEstablished,
         RequestError::ZeroRequestId,
         RequestError::NotIncreasing { last: 1, got: 1 },

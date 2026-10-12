@@ -2,16 +2,21 @@
 //! The DSP backend interface of `stationd` (station-protocol §9) and a
 //! deterministic [`FakeBackend`].
 //!
-//! `stationd` owns the tunnel, the local policy (`stationd.toml`) and the
-//! per-connection channel and subscription tables; a [`Backend`] only drives
-//! the radio. Every method takes and returns `station_proto::v1` types, so
-//! the daemon forwards results to the hub without translation.
+//! A [`Backend`] drives **one receiver**: one SDR and its DSP process
+//! (radiod). `stationd` owns the tunnel, the station's receivers (which
+//! backend serves which receiver, §4.2) and the per-connection channel and
+//! subscription tables; it holds one backend per running receiver and routes
+//! each request by its `receiver_id`. A backend doesn't know its receiver's
+//! ID: it echoes the request's where an answer has one, and `stationd` sets
+//! it in every answer, `FrontendState` and event that names a receiver.
+//! Every method takes and returns `station_proto::v1` types, so the daemon
+//! forwards results to the hub without translation.
 //!
 //! Contract for implementations:
 //!
 //! - IDs come from the hub (§4). `open_channel` must create a channel with
 //!   exactly `req.channel_id` and fail with `ALREADY_EXISTS` if it is in use;
-//!   likewise for subscriptions.
+//!   likewise for subscriptions. A channel never leaves its receiver.
 //! - Failures are a [`BackendError`] carrying the `ResultCode` the hub gets
 //!   (`OUT_OF_RANGE`, `RESOURCE_EXHAUSTED`, `UNSUPPORTED`, `NOT_FOUND`,
 //!   `BACKEND_ERROR`, ...). The message is shown to the owner, escaped.
@@ -22,9 +27,9 @@
 //!   also simply drop a stream; the backend must tolerate that.
 //! - Nothing here is per connection: `stationd` closes every channel and
 //!   subscription itself when the tunnel drops (§2.3).
-//! - **Measurement channels** (station protocol 1.1, the measurement design §2.2) are
+//! - **Measurement channels** (station protocol §4.1) are
 //!   `stationd`'s own spectrum channels, outside listener capacity: never
-//!   counted against `max_channels` or `max_waterfall_subscriptions`, and
+//!   counted against `max_channels` or the waterfall subscriptions, and
 //!   never a reason to refuse a listener. Their IDs ([`MeasurementId`]) are
 //!   `stationd`'s, not the hub's. A backend that can measure overrides
 //!   [`Backend::can_measure`] and the four `*_measurement` methods: open with
@@ -111,6 +116,24 @@ pub type RowStream = Pin<Box<dyn Stream<Item = v1::WaterfallRow> + Send + 'stati
 /// which `stationd` sends itself).
 pub type EventStream = Pin<Box<dyn Stream<Item = v1::Event> + Send + 'static>>;
 
+/// What one receiver's backend can do (§9 `GetCapabilities`): the
+/// receiver's own capabilities, and what its backend demodulates, encodes
+/// and streams. `stationd` combines the backends of the running receivers
+/// into one `Capabilities`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BackendCapabilities {
+    /// The receiver: tunable and hardware ranges, sample rate, channel
+    /// limit, front-end controls and `sdr_model`. `receiver_id` is 0;
+    /// `stationd` sets it.
+    pub receiver: v1::ReceiverCapabilities,
+    /// The modes it demodulates (`v1::Mode` values).
+    pub modes: Vec<i32>,
+    /// The codecs it encodes (`v1::AudioCodec` values).
+    pub codecs: Vec<i32>,
+    /// Its waterfall; `None` when it has none.
+    pub waterfall: Option<v1::WaterfallLimits>,
+}
+
 /// Backend and front-end health, for `StationStatus` (§9).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Health {
@@ -175,19 +198,22 @@ impl BackendError {
     }
 }
 
-/// A DSP backend driven by `stationd` (station-protocol §9).
+/// The DSP backend of one receiver, driven by `stationd`
+/// (station-protocol §9).
 ///
 /// All methods may be called concurrently. Implementations must never panic
 /// on hub-supplied values: `stationd` has only checked enums and required
-/// fields (`station_proto::validate::check_request`), not ranges.
+/// fields (`station_proto::validate::check_request`) and that the request
+/// names this receiver, not ranges.
 #[async_trait::async_trait]
 pub trait Backend: Send + Sync + 'static {
     /// The backend kind and version reported in `Hello.backend`.
     fn info(&self) -> v1::BackendInfo;
 
-    /// Current capabilities (§9 `GetCapabilities`). `stationd` intersects
-    /// them with the owner's local caps before answering.
-    async fn capabilities(&self) -> Result<v1::Capabilities, BackendError>;
+    /// Current capabilities (§9 `GetCapabilities`). An answer also tells
+    /// `stationd` that the backend answers: until it does, the receiver is
+    /// `STARTING` (§4.2).
+    async fn capabilities(&self) -> Result<BackendCapabilities, BackendError>;
 
     /// Creates channel `req.channel_id` and starts its audio (§4).
     async fn open_channel(
@@ -204,8 +230,10 @@ pub trait Backend: Send + Sync + 'static {
     /// Closes a channel; its [`AudioStream`] ends.
     async fn close_channel(&self, id: ChannelId) -> Result<(), BackendError>;
 
-    /// Applies shared front-end settings (§4 `SetFrontend`). `stationd` has
-    /// already checked `allow_frontend_control`.
+    /// Applies front-end settings to this receiver (§4 `SetFrontend`): what
+    /// its `FrontendControls` offer live, `UNSUPPORTED` for the rest.
+    /// `stationd` has already checked a new centre against the receiver's
+    /// profile.
     async fn set_frontend(&self, req: v1::SetFrontend) -> Result<v1::FrontendState, BackendError>;
 
     /// Starts waterfall subscription `req.subscription_id` (§4, §6.2).
@@ -228,7 +256,7 @@ pub trait Backend: Send + Sync + 'static {
     /// builds them from [`Backend::capabilities`] and [`Backend::health`]
     /// (gain and centre; no AGC, attenuation or antenna port).
     async fn frontend_state(&self) -> Result<v1::FrontendState, BackendError> {
-        let caps = self.capabilities().await?;
+        let caps = self.capabilities().await?.receiver;
         let health = self.health();
         let frontend = health.frontend.unwrap_or_default();
         let center = caps
@@ -241,6 +269,7 @@ pub trait Backend: Send + Sync + 'static {
                 }
             });
         Ok(v1::FrontendState {
+            receiver_id: 0,
             gain_db: frontend.gain_db,
             hardware_agc: false,
             attenuation_db: 0.0,
@@ -250,7 +279,7 @@ pub trait Backend: Send + Sync + 'static {
         })
     }
 
-    /// Whether this backend has measurement channels (station protocol 1.1).
+    /// Whether this backend has measurement channels (station protocol §4.1).
     fn can_measure(&self) -> bool {
         false
     }

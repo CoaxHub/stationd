@@ -9,10 +9,11 @@
 //!   tonic `StationGateway`, `Enrollment` and `StationControl` clients and
 //!   servers.
 //! - [`PROTOCOL_VERSION`] and [`limits`]: every number from
-//!   `docs/station-protocol.md` (§2.1, §2.2, §4, §5, §6.3, §8).
+//!   `docs/station-protocol.md` (§2.1, §2.2, §4, §5, §6.3, §7, §8).
 //! - [`validate`]: the hub-side validation of §5 (stateless checks plus the
 //!   stateful [`validate::Session`]), version negotiation (§3), strikes and
-//!   the ingress quota.
+//!   the ingress quota; and the rules of a receiver set (§4.2), shared by
+//!   the station, the hub and the control plane.
 //! - [`backoff`]: the station's reconnection policy (§2.2).
 //! - [`identity`]: the station ID from the mTLS client certificate (§8).
 //!
@@ -49,6 +50,6 @@ pub mod v1 {
     include!(concat!(env!("OUT_DIR"), "/coaxhub.station.v1.rs"));
 }
 
-/// The protocol version this crate implements: `coaxhub.station.v1`, 1.1
-/// (station-protocol §3). Minor 1 added measurements (measure.proto).
-pub const PROTOCOL_VERSION: v1::ProtocolVersion = v1::ProtocolVersion { major: 1, minor: 1 };
+/// The protocol version this crate implements: `coaxhub.station.v1`, 2.0
+/// (station-protocol §3): a station has receivers.
+pub const PROTOCOL_VERSION: v1::ProtocolVersion = v1::ProtocolVersion { major: 2, minor: 0 };

@@ -89,7 +89,7 @@ A crash found by fuzzing gets a regression test using the saved corpus input bef
 ./scripts/e2e-station.sh
 ```
 
-It builds and starts `radiod`, sets the loopback `MULTICAST` flag, runs stationd with the ka9q backend against it, repeats that on an RTL-SDR when one is plugged in, and always stops `radiod` afterwards, even on failure. [docs/radiod-notes.md](docs/radiod-notes.md) describes the `radiod` behaviour the code depends on. Read it before touching the ka9q client.
+It builds and starts `radiod`, sets the loopback `MULTICAST` flag, runs stationd with the ka9q backend against it, repeats that on an RTL-SDR when one is plugged in, and always stops `radiod` afterwards, even on failure. The signal generator is the development-only `siggen` profile: its LO is fixed at 0 Hz (0 to 12 MHz), so it has no centre range and its front end can't retune; `SetFrontend` and the measurement stop it causes are covered by the conformance suite, not by this run. [docs/radiod-notes.md](docs/radiod-notes.md) describes the `radiod` behaviour the code depends on. Read it before touching the ka9q client.
 
 **Packages and the installer** (Docker with BuildKit):
 

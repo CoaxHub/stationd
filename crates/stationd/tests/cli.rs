@@ -9,7 +9,6 @@ mod common;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use station_conformance::LocalPolicy;
 use station_conformance::scenarios::{Harness, ScenarioConfig};
 
 const BIN: &str = env!("CARGO_BIN_EXE_stationd");
@@ -39,7 +38,7 @@ fn usage_errors_exit_2() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn check_config_then_run_until_sigterm() {
-    let mut h = Harness::new(LocalPolicy::default()).await.expect("harness");
+    let mut h = Harness::new().await.expect("harness");
     let path = common::write_config(&h.target);
     let out = Command::new(BIN)
         .args(["check-config", "--config"])
@@ -99,7 +98,7 @@ async fn check_config_then_run_until_sigterm() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn revoked_exits_3() {
-    let mut h = Harness::new(LocalPolicy::default()).await.expect("harness");
+    let mut h = Harness::new().await.expect("harness");
     let path = common::write_config(&h.target);
     let child = Command::new(BIN)
         .args(["run", "-c"])
@@ -277,7 +276,8 @@ async fn enroll_status_run_doctor_unenroll() {
     for line in [
         "pass  config",
         "pass  enrollment",
-        "skip  sdr",
+        "warn  sdrs         no RTL-SDR on USB",
+        "pass  receivers    none applied yet",
         "skip  radiod",
         "pass  enroll",
         "pass  gateway",
@@ -321,7 +321,7 @@ async fn enroll_status_run_doctor_unenroll() {
 fn enroll_errors() {
     let dir = tempfile::tempdir().expect("tmp");
     let config = dir.path().join("stationd.toml");
-    std::fs::write(&config, "[sdr]\nprofile = \"siggen\"\n").expect("write");
+    std::fs::write(&config, "[backend]\nkind = \"fake\"\n").expect("write");
     // No [endpoints] in a development build.
     let out = stationd(&["enroll", "--token", TOKEN], &config);
     assert_eq!(out.status.code(), Some(2), "{}", text(&out));
@@ -351,25 +351,68 @@ fn enroll_errors() {
     assert!(text(&out).contains("no enrollment token"), "{}", text(&out));
 }
 
+/// What the packaging tests check of a packaged build, on a development
+/// one: each receiver of receivers.json rendered from its profile with its
+/// serial and its slot's groups.
 #[test]
-fn backend_config_renders_the_profile() {
+fn backend_config_renders_a_receiver() {
     let dir = tempfile::tempdir().expect("tmp");
     let config = dir.path().join("stationd.toml");
-    std::fs::write(&config, "[sdr]\nprofile = \"siggen\"\n").expect("write");
-    let out = stationd(&["backend-config", "--out", "-"], &config);
-    assert!(out.status.success(), "{}", text(&out));
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("hardware = sig_gen"), "{stdout}");
-    assert!(stdout.contains("status = 239.77.0.6\n"), "{stdout}");
-
+    std::fs::write(&config, "state_dir = \"state\"\n").expect("write");
+    let receivers = dir.path().join("state/receivers");
+    std::fs::create_dir_all(&receivers).expect("mkdir");
     std::fs::write(
-        &config,
-        "[sdr]\nprofile = \"rtlsdr\"\ncenter_frequency_hz = 145500000\n",
+        receivers.join("receivers.json"),
+        r#"{"receivers": [
+          {"receiver_id": 11, "slot": 3, "sdr_serial": "A0000011", "model": "rtlsdr_other",
+           "profile": "rtlsdr", "center_frequency_hz": 98000000},
+          {"receiver_id": 12, "slot": 7, "sdr_serial": "A0000012", "model": "rtlsdr_direct_sampling",
+           "profile": "rtlsdr_hf", "center_frequency_hz": 7100000},
+          {"receiver_id": 13, "slot": 12, "sdr_serial": "A0000013", "model": "rtlsdr_blog_v4",
+           "profile": "rtlsdr_v4", "center_frequency_hz": 14200000},
+          {"receiver_id": 14, "slot": 1, "sdr_serial": "", "model": "rtlsdr_other",
+           "profile": "siggen", "center_frequency_hz": 98000000}
+        ]}"#,
     )
     .expect("write");
+    let render = |id: &str| stationd(&["backend-config", "--receiver", id, "--out", "-"], &config);
+    for (id, slot, serial) in [
+        ("11", 3, "A0000011"),
+        ("12", 7, "A0000012"),
+        ("13", 12, "A0000013"),
+    ] {
+        let out = render(id);
+        assert!(out.status.success(), "{}", text(&out));
+        let conf = String::from_utf8_lossy(&out.stdout);
+        assert!(conf.contains("hardware = rtlsdr\n"), "{conf}");
+        assert!(conf.contains(&format!("serial = {serial}\n")), "{conf}");
+        assert!(
+            conf.contains(&format!("status = 239.77.{slot}.6\n")),
+            "{conf}"
+        );
+        assert!(
+            conf.contains(&format!("data = 239.77.{slot}.4\n")),
+            "{conf}"
+        );
+        assert!(!conf.contains("239.77.0."), "{conf}");
+        assert!(conf.contains("ttl = 0\n"), "{conf}");
+    }
+    let hf = String::from_utf8_lossy(&render("12").stdout).into_owned();
+    assert!(hf.contains("direct_sampling = 2\n"), "{hf}");
+    let v4 = String::from_utf8_lossy(&render("13").stdout).into_owned();
+    assert!(
+        v4.contains("gain = 30\n") && v4.contains("frequency = 14200000\n"),
+        "{v4}"
+    );
+    assert!(v4.contains("description = \"RTL-SDR Blog V4\""), "{v4}");
+    // A development build renders the signal generator too.
+    let siggen = String::from_utf8_lossy(&render("14").stdout).into_owned();
+    assert!(siggen.contains("hardware = sig_gen"), "{siggen}");
+    assert!(!siggen.contains("serial ="), "{siggen}");
+    // Into a file, as the unit does.
     let rendered = dir.path().join("radiod.conf");
     let out = Command::new(BIN)
-        .args(["backend-config", "--config"])
+        .args(["backend-config", "--receiver", "11", "--config"])
         .arg(&config)
         .arg("--out")
         .arg(&rendered)
@@ -377,9 +420,19 @@ fn backend_config_renders_the_profile() {
         .expect("run");
     assert!(out.status.success(), "{}", text(&out));
     let conf = std::fs::read_to_string(&rendered).expect("rendered");
-    assert!(conf.contains("frequency = 145500000\n"), "{conf}");
+    assert!(conf.contains("frequency = 98000000\n"), "{conf}");
+    // Refusals: an unknown receiver, receiver 0 (configuration errors), a
+    // missing template (a runtime failure).
+    for (id, code, needle) in [
+        ("99", 2, "receiver 99 is not in the applied receiver set"),
+        ("0", 2, "receiver 0 does not exist"),
+    ] {
+        let out = render(id);
+        assert_eq!(out.status.code(), Some(code), "{}", text(&out));
+        assert!(text(&out).contains(needle), "{}", text(&out));
+    }
     let out = Command::new(BIN)
-        .args(["backend-config", "--config"])
+        .args(["backend-config", "--receiver", "11", "--config"])
         .arg(&config)
         .args(["--out", "-", "--templates", "/nonexistent"])
         .output()
@@ -390,27 +443,15 @@ fn backend_config_renders_the_profile() {
         "{}",
         text(&out)
     );
-
-    // Unknown profile: a config error listing the supported ones.
-    std::fs::write(&config, "[sdr]\nprofile = \"airspy\"\n").expect("write");
-    let out = stationd(&["backend-config", "--out", "-"], &config);
+    // An unusable receivers.json is a configuration error.
+    std::fs::write(receivers.join("receivers.json"), "{\"receivers\": 3}").expect("write");
+    let out = render("11");
     assert_eq!(out.status.code(), Some(2), "{}", text(&out));
-    assert!(
-        text(&out).contains("supported: rtlsdr, rtlsdr-hf, rtlsdr-v4, siggen"),
-        "{}",
-        text(&out)
-    );
-
-    // No [sdr]: nothing to render.
-    std::fs::write(&config, "[backend]\nkind = \"fake\"\n").expect("write");
-    let out = stationd(&["backend-config", "--out", "-"], &config);
-    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
-    assert!(text(&out).contains("no [sdr] profile"), "{}", text(&out));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn static_credentials_cannot_enroll_or_unenroll() {
-    let h = Harness::new(LocalPolicy::default()).await.expect("harness");
+    let h = Harness::new().await.expect("harness");
     let path = common::write_config(&h.target);
     let out = stationd(&["enroll", "--token", TOKEN], &path);
     assert_eq!(out.status.code(), Some(2), "{}", text(&out));

@@ -11,7 +11,9 @@
 //!   station message with the §5 validator and recording
 //!   everything.
 //! - [`pki::TestPki`]: throwaway certificates generated in memory.
-//! - [`sut::StationUnderTest`]: how scenarios start and stop the station.
+//! - [`sut::StationUnderTest`]: how scenarios start and stop the station;
+//!   [`sut::SimulatedSdr`]: the SDRs it sees, plugged and unplugged by the
+//!   scenarios.
 //! - [`scenarios`]: named conformance scenarios ([`scenarios::ALL`]).
 //!
 //! ```no_run
@@ -36,4 +38,4 @@ pub use hub::{FakeHub, HubTls, Record, RecordEvent, StationConn, TlsVersions};
 pub use io::ConnInfo;
 pub use pki::TestPki;
 pub use scenarios::{Scenario, ScenarioConfig};
-pub use sut::{Exit, LocalPolicy, StationUnderTest, Target};
+pub use sut::{Exit, SimulatedSdr, StationUnderTest, Target};

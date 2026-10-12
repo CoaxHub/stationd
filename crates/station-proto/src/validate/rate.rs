@@ -57,6 +57,16 @@ impl TokenBucket {
         self.rate_per_sec
     }
 
+    /// Changes the rate and capacity from `now` on. Time until `now` refills
+    /// at the old rate; the balance is kept, capped at the new capacity.
+    pub(crate) fn set_limits(&mut self, rate_per_sec: f64, capacity: f64, now: Instant) {
+        self.refill(now);
+        let fresh = Self::new(rate_per_sec, capacity, now);
+        self.rate_per_sec = fresh.rate_per_sec;
+        self.capacity = fresh.capacity;
+        self.tokens = self.tokens.min(self.capacity);
+    }
+
     fn refill(&mut self, now: Instant) {
         let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
         if now > self.last {

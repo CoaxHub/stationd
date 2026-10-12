@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! radiod group addresses as written in `stationd.toml` (station-protocol
-//! §7): `status_group` and `data_group`.
+//! radiod group addresses as written in a development `stationd.toml`
+//! (station-protocol §7: `[backend.ka9q] status_group` and `data_group`, a
+//! radiod of your own), and the groups of a receiver's slot ([`slot_groups`],
+//! §9: the bundled radiod of each receiver).
 //!
 //! Accepted forms, with the port defaulting to radiod's
 //! (`DEFAULT_STAT_PORT` 5006 for status, `DEFAULT_RTP_PORT` 5004 for data,
@@ -133,10 +135,45 @@ pub fn channel_status_addr(data: SocketAddr) -> SocketAddr {
     SocketAddr::new(data.ip(), port)
 }
 
+/// The local slots a station gives its receivers: 0 to 15, one radiod each
+/// (station protocol §7, §9).
+pub const SLOTS: std::ops::RangeInclusive<u8> = 0..=15;
+
+/// The multicast groups of the radiod in receiver slot `slot` (station
+/// protocol §9): status `239.77.<slot>.6:5006` and data
+/// `239.77.<slot>.4:5004`, on the loopback interface with TTL 0. Each slot's
+/// groups are distinct, so receivers never hear each other's radiod.
+pub fn slot_groups(slot: u8) -> (SocketAddr, SocketAddr) {
+    (
+        SocketAddr::from((Ipv4Addr::new(239, 77, slot, 6), DEFAULT_STATUS_PORT)),
+        SocketAddr::from((Ipv4Addr::new(239, 77, slot, 4), DEFAULT_DATA_PORT)),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn slot_groups_are_distinct() {
+        let (status, data) = slot_groups(0);
+        assert_eq!(status.to_string(), "239.77.0.6:5006");
+        assert_eq!(data.to_string(), "239.77.0.4:5004");
+        let (status, data) = slot_groups(12);
+        assert_eq!(status.to_string(), "239.77.12.6:5006");
+        assert_eq!(data.to_string(), "239.77.12.4:5004");
+        assert_eq!(channel_status_addr(data).to_string(), "239.77.12.4:5006");
+        let mut all: Vec<_> = SLOTS
+            .flat_map(|s| {
+                let (a, b) = slot_groups(s);
+                [a, b, channel_status_addr(b)]
+            })
+            .collect();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), 3 * SLOTS.count());
+    }
 
     #[test]
     fn numeric_forms() {

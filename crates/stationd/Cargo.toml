@@ -1,6 +1,6 @@
 [package]
 name = "stationd"
-description = "CoaxHub station daemon: outbound mTLS gRPC tunnel to the hub (station-protocol v1)"
+description = "CoaxHub station daemon: outbound mTLS gRPC tunnel to the hub, and the station's receivers (station protocol 2.0)"
 version = "0.1.1"
 edition.workspace = true
 license.workspace = true
@@ -21,11 +21,12 @@ path = "src/main.rs"
 [features]
 # Release (packaged) build: the CoaxHub domain and root certificate are
 # compiled in from the build-time environment (`COAXHUB_DOMAIN`, and
-# `COAXHUB_ROOT_CA` naming a PEM file; see build.rs), and every test-only
-# setting of stationd.toml is rejected.
+# `COAXHUB_ROOT_CA` naming a PEM file; see build.rs), and stationd reads no
+# settings file: no `--config`, no `check-config`.
 packaged = []
 
 [dependencies]
+async-trait = "0.1.92"
 backend-ka9q = { path = "../backend-ka9q" }
 clap = { version = "4.6.7", features = ["derive"] }
 coaxhub-station-proto = { path = "../station-proto" }
@@ -44,7 +45,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 station-backend = { path = "../station-backend" }
 thiserror = "2.0.21"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "time", "net", "sync"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "time", "net", "sync", "process"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"] }
 tokio-util = "0.7.19"
 toml = "0.9"
@@ -58,7 +59,6 @@ x509-parser = "0.18.1"
 zeroize = "1.9.0"
 
 [dev-dependencies]
-async-trait = "0.1.92"
 proptest = "1.11.0"
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }
 # A pseudo-terminal for the hidden token prompt test.

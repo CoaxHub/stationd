@@ -2,7 +2,7 @@
 //! `stationd enroll` against an in-test `Enrollment` server over TLS 1.3 on
 //! loopback, with certificates generated in-test: success (and the enrolled
 //! station then connects to its assigned hub), refusals, TLS failures,
-//! unusable responses, and no token in any log line.
+//! unusable responses (no token in any log line: `enroll_logs.rs`).
 //!
 //! These use the library with a development-flavour config, so they also
 //! run in packaged builds.
@@ -12,15 +12,13 @@ mod enroll_support;
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::Duration;
 
 use enroll_support::{Behaviour, EnrollServer, TOKEN, TestCa, write_config};
-use station_backend::FakeBackend;
 use stationd::config::Config;
 use stationd::credentials;
 use stationd::enroll::{self, EnrollError, EnrollOptions, Token, TokenProblem};
-use stationd::flavour::Flavour;
 use stationd::local_status;
 use stationd::state::{self, StateDir};
 use tonic::Status;
@@ -62,7 +60,7 @@ impl Setup {
         let dir = tempfile::tempdir().expect("tmp");
         let root = ca.write_root(dir.path());
         let path = write_config(dir.path(), &server.url(), &root);
-        let config = Config::load_as(&path, Flavour::development()).expect("config");
+        let config = Config::load(&path).expect("config");
         Self {
             ca,
             server,
@@ -127,12 +125,8 @@ async fn enrolls_then_connects_to_the_assigned_hub() {
 
     // The enrolled station connects to the assigned hub with its new
     // certificate (leaf + station intermediate, verified against the root).
-    let mut handle = stationd::spawn(
-        &s.config,
-        Arc::new(FakeBackend::default()),
-        common::fast_options(),
-    )
-    .expect("spawn");
+    let mut handle =
+        stationd::spawn(&s.config, common::fake_driver().0, common::fast_options()).expect("spawn");
     assert_eq!(handle.station_id(), s.server.station_id);
     assert_eq!(handle.gateway_url(), hub.gateway_url());
     let mut conn = hub.accept(WAIT).await.expect("connects");
@@ -278,7 +272,7 @@ async fn unreachable_service_is_a_network_error() {
     };
     let root = s.ca.write_root(s.dir.path());
     let path = write_config(s.dir.path(), &format!("https://127.0.0.1:{port}"), &root);
-    let config = Config::load_as(&path, Flavour::development()).expect("config");
+    let config = Config::load(&path).expect("config");
     let e = enroll::enroll(&config, token(), options(false))
         .await
         .expect_err("closed port");
@@ -289,8 +283,8 @@ async fn unreachable_service_is_a_network_error() {
 fn preflight_rules() {
     let dir = tempfile::tempdir().expect("tmp");
     let p = dir.path().join("stationd.toml");
-    std::fs::write(&p, "[sdr]\nprofile = \"rtlsdr\"\n").expect("write");
-    let c = Config::load_as(&p, Flavour::development()).expect("config");
+    std::fs::write(&p, "").expect("write");
+    let c = Config::load(&p).expect("config");
     assert!(matches!(
         enroll::preflight(&c, false),
         Err(EnrollError::NoEndpoints)
@@ -304,60 +298,7 @@ fn preflight_rules() {
          gateway_ca = \"ca.pem\"\n[backend]\nkind = \"fake\"\n",
     )
     .expect("write");
-    let c = Config::load_as(&p, Flavour::development()).expect("config");
+    let c = Config::load(&p).expect("config");
     let e = enroll::preflight(&c, true).expect_err("static");
     assert!(e.to_string().contains("static [credentials]"), "{e}");
-}
-
-/// A `tracing` writer into a shared buffer.
-#[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for Captured {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// Every log line of every crate at TRACE level, for a successful and a
-/// refused enrollment, and the token is in none of them.
-#[test]
-fn no_token_in_any_log_line() {
-    let captured = Captured::default();
-    let writer = captured.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
-        .with_writer(move || writer.clone())
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
-    // One thread: every task (client and server) logs to this subscriber.
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    rt.block_on(async {
-        let s = Setup::new(sign("https://localhost:7443")).await;
-        enroll::enroll(&s.config, token(), options(false))
-            .await
-            .expect("enrolled");
-        s.server
-            .set(Behaviour::Fail(Status::unauthenticated("token expired")));
-        enroll::enroll(&s.config, token(), options(true))
-            .await
-            .expect_err("refused");
-    });
-    let log = String::from_utf8_lossy(&captured.0.lock().unwrap_or_else(PoisonError::into_inner))
-        .into_owned();
-    assert!(log.contains("enrolling this station"), "{log}");
-    assert!(log.contains("TRACE"), "trace level was captured");
-    assert!(!log.contains(&TOKEN[8..]), "the token reached a log line");
-    assert!(!log.contains(&TOKEN[8..].to_ascii_lowercase()));
-    assert!(!log.contains("PRIVATE KEY"));
 }

@@ -1,0 +1,22 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// stationd runs as the user "coaxhub", with no capability, and starts, restarts
+// and stops the receivers' radiod instances (coaxhub-radiod@<receiver_id>.service)
+// over the system bus. systemd asks polkit to authorize those calls with the
+// action org.freedesktop.systemd1.manage-units and the details "unit" (the unit
+// name) and "verb" (start, stop, restart, ...).
+//
+// This allows the three verbs for that one user on the instances of that one
+// template, and nothing else: every other unit, every other verb, and every
+// other user get no answer from this rule and fall through to polkit's
+// defaults, which refuse a service user. It does not allow enabling or
+// disabling units, changing their files or reloading systemd (those are other
+// actions).
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        subject.user == "coaxhub" &&
+        /^coaxhub-radiod@[0-9]+\.service$/.test(action.lookup("unit")) &&
+        ["start", "stop", "restart"].indexOf(action.lookup("verb")) >= 0) {
+        return polkit.Result.YES;
+    }
+});

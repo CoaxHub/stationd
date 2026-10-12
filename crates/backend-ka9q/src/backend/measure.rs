@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! Measurement channels on radiod (station protocol 1.1, the measurement design §2.2), and
+//! Measurement channels on radiod (station protocol §4.1, §9), and
 //! where radiod places a wideband spectrum.
 //!
 //! A measurement channel is a spectrum2 channel ([`PolledSpectrum`]) of

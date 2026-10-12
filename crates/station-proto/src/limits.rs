@@ -61,9 +61,9 @@ pub const UNSUPPORTED_VERSION_RETRY_INTERVAL: Duration = Duration::from_secs(6 *
 
 // ------------------------------------------------------------------ §3
 
-/// §3: protocol majors the hub accepts. The current major, plus the previous
-/// one during a migration window of at least 6 months (none yet for v1).
-pub const SUPPORTED_MAJORS: &[u32] = &[1];
+/// §3: protocol majors the hub accepts: major 2 only. Once a major 3 exists,
+/// major 2 stays beside it for a migration window of at least 6 months.
+pub const SUPPORTED_MAJORS: &[u32] = &[2];
 
 // ------------------------------------------------------------------ §4
 
@@ -73,32 +73,68 @@ pub const FIRST_REQUEST_ID: u64 = 1;
 /// §4: the hub keeps at most this many outstanding requests per station.
 pub const MAX_OUTSTANDING_REQUESTS: usize = 32;
 
+// ------------------------------------------------------------------ §4.2: hardware and receivers
+
+/// §4.2, §5: the most receivers in a `ConfigureReceivers` set, in
+/// `Capabilities.receivers`, in `StationStatus.receivers` and in
+/// `ReceiversConfigured`.
+pub const MAX_RECEIVERS: usize = 16;
+
+/// §4.2, §5 `Hardware`: the most SDRs in a `Hardware` report.
+pub const MAX_SDRS: usize = 16;
+
+/// §5 Strings: `Sdr.manufacturer`, `Sdr.product` and `Sdr.serial`, in bytes.
+pub const MAX_SDR_STRING_BYTES: usize = 128;
+
+/// §5 Strings: `Sdr.port`, in bytes.
+pub const MAX_SDR_PORT_BYTES: usize = 32;
+
+/// §5.1: the hub's own receiver limit by default (`[limits] max_receivers`).
+/// Receivers beyond it are ignored, highest IDs first
+/// ([`crate::validate::select_receivers`]).
+pub const DEFAULT_HUB_MAX_RECEIVERS: usize = 6;
+
+/// §7: the audio channels `stationd` claims per receiver
+/// (`ReceiverCapabilities.max_channels`; the hub caps it at [`MAX_CHANNELS`]).
+pub const CHANNELS_PER_RECEIVER: u32 = 16;
+
+/// §7: the waterfall subscriptions `stationd` claims per running receiver...
+pub const WATERFALL_SUBSCRIPTIONS_PER_RECEIVER: u32 = 4;
+
+/// §7: `stationd`'s `WaterfallLimits.max_subscriptions` claim with
+/// `running_receivers` receivers running: [`WATERFALL_SUBSCRIPTIONS_PER_RECEIVER`]
+/// each, at most [`MAX_WATERFALL_SUBSCRIPTIONS`] across the station.
+pub fn waterfall_subscriptions_claim(running_receivers: usize) -> u32 {
+    let n = u32::try_from(running_receivers.min(MAX_RECEIVERS)).unwrap_or(0);
+    (n * WATERFALL_SUBSCRIPTIONS_PER_RECEIVER).min(MAX_WATERFALL_SUBSCRIPTIONS)
+}
+
 // ------------------------------------------------------------------ §5
 
 /// §5 Size: largest encoded `StationMessage` the hub accepts, in bytes
 /// (also the gRPC decoder limit and `Welcome.max_message_bytes`).
 pub const MAX_MESSAGE_BYTES: usize = 65_536;
 
-/// §5 Strings: `Result.message` and `Event.detail` (and the hub's own
-/// `Goodbye.message`), in bytes of UTF-8.
+/// §5 Strings: `Result.message`, `Event.detail` and a receiver's `detail`
+/// (`ReceiverStatus`, `ReceiverHealth`), and the hub's own
+/// `Goodbye.message`, in bytes of UTF-8.
 pub const MAX_DETAIL_BYTES: usize = 256;
 
-/// §5 Strings: `Capabilities.sdr_model`, in bytes.
+/// §5 Strings: `ReceiverCapabilities.sdr_model`, in bytes.
 pub const MAX_SDR_MODEL_BYTES: usize = 64;
 
 /// §5 Strings: at most this many `FrontendControls.antenna_ports` entries.
 pub const MAX_ANTENNA_PORTS: usize = 8;
 
 /// §5 Strings: each antenna port label, in bytes. Also applied to
-/// `FrontendState.antenna_port` (implementation choice: same label).
+/// `FrontendState.antenna_port` (§5.1).
 pub const MAX_ANTENNA_PORT_BYTES: usize = 16;
 
 /// §5 Strings: version strings (`Hello.daemon_version`,
 /// `BackendInfo.version`, `BackendHealth.version`), in bytes.
 pub const MAX_VERSION_BYTES: usize = 64;
 
-/// `Hello.platform`, in bytes. Implementation choice: §5 does not list it;
-/// it is capped like the version strings it sits next to.
+/// §5.1: `Hello.platform`, in bytes.
 pub const MAX_PLATFORM_BYTES: usize = 64;
 
 /// §5 `AudioFrame`: smallest Opus packet.
@@ -142,10 +178,11 @@ pub const EVENT_RATE_PER_SECOND: u32 = 10;
 pub const EVENT_BURST: u32 = 50;
 
 /// §5 `Event` (and media in flight): IDs closed less than this long ago are
-/// still "just closed".
+/// still "just closed". Receiver IDs a later set left out get the same grace
+/// (§5.1).
 pub const ID_CLOSE_GRACE: Duration = Duration::from_secs(5);
 
-/// §5 `Capabilities`: hub cap on `max_channels`.
+/// §5 `Capabilities`: hub cap on a receiver's `max_channels`.
 pub const MAX_CHANNELS: u32 = 64;
 
 /// §5 `Capabilities`: hub cap on `WaterfallLimits.max_bins` (also the largest
@@ -155,19 +192,35 @@ pub const MAX_BINS: u32 = 16_384;
 /// control.proto `SubscribeWaterfall.bins`: fewest bins per row.
 pub const MIN_BINS: u32 = 64;
 
-/// Hub cap on `WaterfallLimits.max_subscriptions`. Implementation choice:
-/// §5 says "clamp to hub limits" without a number; stationd's default local
-/// cap is 4 (§7).
+/// §5.1: hub cap on `WaterfallLimits.max_subscriptions`, across receivers.
 pub const MAX_WATERFALL_SUBSCRIPTIONS: u32 = 16;
 
-/// §5 `Capabilities`: frequency ranges end at or below 6 GHz.
+/// §5 `Capabilities`, `Hardware`: frequency ranges end at or below 6 GHz.
 pub const MAX_FREQUENCY_HZ: u64 = 6_000_000_000;
 
-/// §5 Bandwidth: per-station sustained ingress quota, bits per second.
-pub const INGRESS_RATE_BITS_PER_SECOND: u64 = 2_000_000;
+/// §5 Bandwidth: the per-station ingress quota is this much...
+pub const INGRESS_BASE_BITS_PER_SECOND: u64 = 1_000_000;
 
-/// §5 Bandwidth: token-bucket burst, bits.
-pub const INGRESS_BURST_BITS: u64 = 4_000_000;
+/// §5 Bandwidth: ...plus this much per running receiver, sustained...
+pub const INGRESS_PER_RECEIVER_BITS_PER_SECOND: u64 = 1_000_000;
+
+/// §5 Bandwidth: ...with a token-bucket burst of this many seconds at that
+/// rate (twice the rate).
+pub const INGRESS_BURST_FACTOR: u64 = 2;
+
+/// §5 Bandwidth: the sustained ingress quota with `running_receivers`
+/// receivers running, bits per second (2 Mbit/s with one). The count is
+/// capped at [`MAX_RECEIVERS`].
+pub fn ingress_rate_bits_per_second(running_receivers: usize) -> u64 {
+    let n = u64::try_from(running_receivers.min(MAX_RECEIVERS)).unwrap_or(0);
+    INGRESS_BASE_BITS_PER_SECOND + n * INGRESS_PER_RECEIVER_BITS_PER_SECOND
+}
+
+/// §5 Bandwidth: the token-bucket burst with `running_receivers` receivers
+/// running, bits.
+pub fn ingress_burst_bits(running_receivers: usize) -> u64 {
+    INGRESS_BURST_FACTOR * ingress_rate_bits_per_second(running_receivers)
+}
 
 /// §5 Bandwidth: throttling sustained this long ends the session with
 /// `Goodbye{QUOTA_EXCEEDED}`.
@@ -184,13 +237,10 @@ pub const STRIKE_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 /// [`crate::validate::Session::expire_requests`]).
 pub const TIMED_OUT_REQUESTS_REMEMBERED: usize = 64;
 
-// ------------------------------------------------------------------ §4.1, §5.2: measurements (1.1)
+// ------------------------------------------------------------------ §4.1, §5.2: measurements
 
-/// §3: the first minor with measurements (measure.proto).
-pub const MEASUREMENTS_MINOR: u32 = 1;
-
-/// §5.2: hub cap on `MeasurementLimits.max_noise_bands`, and the most bands in
-/// a plan or a report.
+/// §5.2: hub cap on `MeasurementLimits.max_noise_bands` (across receivers),
+/// and the most bands in a plan or a report. Also `stationd`'s claim (§7).
 pub const MAX_NOISE_BANDS: u32 = 32;
 
 /// §5.2: the most ranges in one `NoiseBand`.
@@ -199,10 +249,12 @@ pub const MAX_BAND_RANGES: usize = 8;
 /// §5.2: `NoiseBand.key`, in bytes of `[a-z0-9]`.
 pub const MAX_BAND_KEY_BYTES: usize = 8;
 
-/// §4.1: the report cadence the hub asks for: one report per measured minute.
+/// §4.1: the report cadence the hub asks for: one report per receiver per
+/// measured minute.
 pub const NOISE_INTERVAL_MS: u32 = 60_000;
 
-/// §4.1: the cadences a station may run (a cycle stretched over 2 or 5 minutes).
+/// §4.1: the cadences a station may run for a receiver (a cycle stretched
+/// over 2 or 5 minutes).
 pub const NOISE_INTERVALS_MS: &[u32] = &[60_000, 120_000, 300_000];
 
 /// §4.1: the length of a measured window (one UTC minute).
@@ -352,7 +404,21 @@ mod tests {
         assert_eq!(MAX_WATERFALL_COMPRESSED, 16_384);
         assert_eq!(STRIKES_TO_QUARANTINE, 3);
         assert_eq!(STRIKE_WINDOW, Duration::from_secs(86_400));
-        assert_eq!(INGRESS_BURST_BITS, 2 * INGRESS_RATE_BITS_PER_SECOND);
+        assert_eq!(ingress_rate_bits_per_second(0), 1_000_000);
+        assert_eq!(ingress_rate_bits_per_second(1), 2_000_000);
+        assert_eq!(ingress_burst_bits(1), 4_000_000);
+        assert_eq!(ingress_rate_bits_per_second(6), 7_000_000);
+        assert_eq!(ingress_burst_bits(6), 14_000_000);
+        assert_eq!(ingress_rate_bits_per_second(usize::MAX), 17_000_000);
+        assert_eq!(waterfall_subscriptions_claim(0), 0);
+        assert_eq!(waterfall_subscriptions_claim(1), 4);
+        assert_eq!(waterfall_subscriptions_claim(3), 12);
+        assert_eq!(waterfall_subscriptions_claim(4), 16);
+        assert_eq!(waterfall_subscriptions_claim(16), 16);
+        assert_eq!(waterfall_subscriptions_claim(usize::MAX), 16);
+        assert_eq!(MAX_RECEIVERS, 16);
+        assert_eq!(MAX_SDRS, 16);
+        assert_eq!(DEFAULT_HUB_MAX_RECEIVERS, 6);
         assert_eq!(
             BACKOFF_INITIAL * BACKOFF_FACTOR.pow(6),
             Duration::from_secs(64)

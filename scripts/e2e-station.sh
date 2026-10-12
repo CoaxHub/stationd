@@ -9,10 +9,14 @@
 #   1. build-radiod.sh   build/install radiod if needed, set lo MULTICAST
 #   2. run-radiod-siggen.sh     radiod with the signal generator (testdata/radiod-siggen.conf)
 #   3. crates/stationd/tests/e2e_ka9q.rs (release, COAXHUB_E2E=1): capabilities, a
-#      channel at 50 frames/s, retunes with a continuous sequence, WFM at 48 kHz,
-#      waterfall rows at 10/s with the 10 MHz carrier in the right bin, health;
-#      then, with the signal generator, crates/backend-ka9q/tests/e2e_waterfall.rs:
-#      the carrier in the bin its label says, across ranges and bin counts
+#      channel at 50 frames/s, channel retunes (UpdateChannel) with a continuous
+#      sequence, WFM at 48 kHz, waterfall rows at 10/s with the 10 MHz carrier in the
+#      right bin, health, and the measurement scenarios; then, with the signal
+#      generator, crates/backend-ka9q/tests/e2e_waterfall.rs: the carrier in the bin
+#      its label says, across ranges and bin counts. The signal generator (the
+#      development-only siggen profile) has its LO fixed at 0 Hz: 0 to 12 MHz, no
+#      centre range, and its front end can't retune, so SetFrontend and the
+#      measurement stop it causes are covered by the conformance suite instead
 #   4. if an RTL-SDR is plugged in (USB 0bda:2838 or 0bda:2832) and radiod has the
 #      rtlsdr driver: the same test against testdata/radiod-rtlsdr.conf (98 MHz).
 #      Skipped, not failed, when absent; RTLSDR=0 skips it, RTLSDR=1 makes it required.

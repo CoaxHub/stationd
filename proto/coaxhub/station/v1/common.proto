@@ -24,7 +24,9 @@ message ProtocolVersion {
   uint32 minor = 2;
 }
 
-// Closed interval [start_hz, end_hz]. start_hz <= end_hz.
+// Closed interval [start_hz, end_hz]. start_hz <= end_hz. Two receivers'
+// tunable ranges that only touch (one ends where the other starts) don't
+// overlap (station protocol §5.1).
 message FrequencyRange {
   uint64 start_hz = 1;
   uint64 end_hz = 2;
@@ -84,8 +86,8 @@ enum ResultCode {
   RESULT_CODE_OUT_OF_RANGE = 3;        // frequency outside the tunable range
   RESULT_CODE_RESOURCE_EXHAUSTED = 4;  // no free channel / subscription slot
   RESULT_CODE_UNSUPPORTED = 5;         // mode, codec or feature not supported
-  RESULT_CODE_PERMISSION_DENIED = 6;   // refused by the owner's local config
-  RESULT_CODE_NOT_FOUND = 7;           // unknown channel_id / subscription_id
+  RESULT_CODE_PERMISSION_DENIED = 6;   // refused by the station's own rules (its package's SDR table)
+  RESULT_CODE_NOT_FOUND = 7;           // unknown channel_id / subscription_id / receiver_id
   RESULT_CODE_ALREADY_EXISTS = 8;      // id already in use on this connection
   RESULT_CODE_BACKEND_ERROR = 9;       // DSP backend failed; see message
 }

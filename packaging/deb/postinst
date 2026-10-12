@@ -3,15 +3,19 @@
 #
 # coaxhub-stationd postinst.
 # - Creates the system users coaxhub (stationd) and coaxhub-radiod (radiod)
-#   and their state directories.
+#   and their state directories, including receivers/, where stationd keeps
+#   the applied receiver set for the radiod instances to render their
+#   configuration from.
 # - Enables systemd-time-wait-sync.service, which stationd.service waits for.
 # - Applies the udev rule to RTL-SDR dongles already plugged in.
-# - On upgrade, restarts the units that were running. On a fresh install it
-#   starts nothing: the station is not enrolled yet, and stationd would exit
-#   3. The installer (or the owner) enrolls it and starts the services.
+# - On upgrade, restarts the units that were running (stationd and the
+#   coaxhub-radiod@ instances). On a fresh install it starts and enables
+#   nothing: the station is not enrolled yet, and stationd would exit 3. The
+#   installer (or the owner) enrolls it and enables stationd.service; stationd
+#   starts the instances.
 set -e
 
-UNITS="coaxhub-radiod.service stationd.service"
+UNITS="stationd.service coaxhub-radiod@*.service"
 TIME_WAIT_MARKER=/var/lib/coaxhub/.enabled-time-wait-sync
 
 systemd_running() { [ -d /run/systemd/system ]; }
@@ -41,6 +45,10 @@ configure)
 
 	make_dir /var/lib/coaxhub 0755 root:root
 	make_dir /var/lib/coaxhub/stationd 0700 coaxhub:coaxhub
+	# Set-group-ID: receivers.json, which stationd writes there, takes the
+	# directory's group, so the radiod instances can read it. stationd
+	# can't chown (stationd.service filters @privileged).
+	make_dir /var/lib/coaxhub/receivers 2750 coaxhub:coaxhub-radiod
 	make_dir /var/lib/coaxhub-radiod 0755 coaxhub-radiod:coaxhub-radiod
 
 	# Remember whether we enabled systemd-time-wait-sync, so purge only
@@ -66,9 +74,14 @@ configure)
 	if systemd_running; then
 		systemctl daemon-reload || true
 		if [ -n "$2" ]; then
-			# Upgrade: restart what was running, nothing else.
+			# Upgrade: restart what was running, nothing else. UNITS is a
+			# list with a pattern: systemctl matches it against the loaded
+			# units, so the shell splits the list but must not expand it
+			# against files (set -f).
+			set -f
 			# shellcheck disable=SC2086 # UNITS is a list
 			systemctl try-restart $UNITS || true
+			set +f
 		fi
 	fi
 	;;

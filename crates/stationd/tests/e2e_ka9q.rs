@@ -11,15 +11,17 @@
 //! - `rtlsdr` (`testdata/radiod-rtlsdr.conf`): an RTL-SDR at 98 MHz,
 //!   2.048 MS/s; no known signal, so only rates and plumbing are checked.
 //!
-//! Checks: sane capabilities; a channel opens and Opus frames arrive at
-//! 50/s; a retune keeps the sequence continuous; waterfall rows arrive at
-//! the requested rate (and, with the signal generator, the carrier is in
-//! the right bin); broadcast FM reports radiod's 48 kHz; health in
-//! `StationStatus`. Timings are printed as `E2E key=value` lines.
+//! The radiod is the backend of the station's one receiver (receiver 1, on
+//! a simulated RTL-SDR). Checks: sane capabilities; a channel opens and
+//! Opus frames arrive at 50/s; a retune keeps the sequence continuous;
+//! waterfall rows arrive at the requested rate (and, with the signal
+//! generator, the carrier is in the right bin); broadcast FM reports
+//! radiod's 48 kHz; the receiver's health in `StationStatus`. Timings are
+//! printed as `E2E key=value` lines.
 //!
 //! With the signal generator, the station-conformance measurement scenarios
-//! also run against it (station protocol 1.1), on a measuring
-//! clock 10 times as fast (a minute in 6 s).
+//! also run against it (station protocol §4.1), its two receivers both on
+//! this radiod, on a measuring clock 10 times as fast (a minute in 6 s).
 //!
 //! `COAXHUB_E2E_STATUS_GROUP` overrides radiod's status group (default
 //! `239.77.0.6:5006`), for a radiod on groups of its own.
@@ -37,8 +39,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use backend_ka9q::backend::{Ka9qBackend, Ka9qConfig};
-use station_conformance::LocalPolicy;
-use station_conformance::scenarios::{After, Harness, ScenarioConfig, run_scenario};
+use station_conformance::scenarios::{After, Harness, ScenarioConfig, receiver, run_scenario};
 use station_conformance::{ConformanceError, StationConn};
 use station_proto::v1;
 use station_proto::v1::request::Command;
@@ -133,29 +134,53 @@ async fn stationd_with_a_real_radiod() {
     let backend = Arc::new(Ka9qBackend::new(config).expect("backend"));
     let mut station = common::InProcess::with_backend(backend);
     let cfg = ScenarioConfig::fast();
-    let harness = Harness::new(LocalPolicy::default()).await;
+    let harness = Harness::new().await;
+    // Receiver 1 on the simulated generic RTL-SDR; its profile's centre is
+    // what the radiod runs at.
+    let set = v1::ConfigureReceivers {
+        receivers: vec![match which {
+            Radiod::SigGen => receiver(
+                1,
+                "CH000001",
+                v1::SdrModel::RtlsdrDirectSampling,
+                v1::SdrProfile::RtlsdrHf,
+                6_000_000,
+            ),
+            Radiod::RtlSdr => receiver(
+                1,
+                "CH000001",
+                v1::SdrModel::RtlsdrOther,
+                v1::SdrProfile::Rtlsdr,
+                98_000_000,
+            ),
+        }],
+    };
     let result = run_scenario(&mut station, &cfg, harness, async |h, _sut| {
-        let mut conn = h.connect(cfg.connect_within, &cfg).await?;
+        let started = Instant::now();
+        let (mut conn, caps) = h.connect_with(cfg.connect_within, &set, &cfg).await?;
+        println!("E2E receiver_running_ms={}", started.elapsed().as_millis());
+        let rx = caps
+            .receivers
+            .first()
+            .ok_or_else(|| fail("no running receiver".into()))?
+            .clone();
 
         // Capabilities.
-        let (r, rtt) = timed(&mut conn, Command::GetCapabilities(v1::GetCapabilities {})).await?;
+        let (_, rtt) = timed(&mut conn, Command::GetCapabilities(v1::GetCapabilities {})).await?;
         println!("E2E get_capabilities_ms={}", rtt.as_millis());
-        let Some(Payload::Capabilities(caps)) = r.payload else {
-            return Err(fail(format!("no capabilities: {r:?}")));
-        };
-        let range = caps
+        let range = rx
             .tunable_range
             .ok_or_else(|| fail("no tunable range".into()))?;
         println!(
             "E2E tunable_range={}..{} sample_rate={} sdr_model={:?}",
-            range.start_hz, range.end_hz, caps.sample_rate_hz, caps.sdr_model
+            range.start_hz, range.end_hz, rx.sample_rate_hz, rx.sdr_model
         );
         let (center, mode) = match which {
             Radiod::SigGen => {
                 check(range.start_hz == 0 && range.end_hz == 12_000_000, || {
                     format!("signal generator range {range:?}")
                 })?;
-                check(caps.sample_rate_hz == 24_000_000, || "sample rate".into())?;
+                check(rx.sample_rate_hz == 24_000_000, || "sample rate".into())?;
                 (10_000_000, v1::Mode::Am)
             }
             Radiod::RtlSdr => {
@@ -171,6 +196,7 @@ async fn stationd_with_a_real_radiod() {
         // A channel at 50 frames/s.
         let open = Command::OpenChannel(v1::OpenChannel {
             channel_id: 1,
+            receiver_id: 1,
             frequency_hz: center,
             mode: mode as i32,
             low_cut_hz: -5000,
@@ -247,6 +273,7 @@ async fn stationd_with_a_real_radiod() {
         // squelch off keeps its (always squelched) demodulator open.
         let wfm = Command::OpenChannel(v1::OpenChannel {
             channel_id: 2,
+            receiver_id: 1,
             frequency_hz: center,
             mode: v1::Mode::Fm as i32,
             low_cut_hz: 0,
@@ -277,6 +304,7 @@ async fn stationd_with_a_real_radiod() {
         let bins = 1024;
         let sub = Command::SubscribeWaterfall(v1::SubscribeWaterfall {
             subscription_id: 7,
+            receiver_id: 1,
             range: Some(range),
             bins,
             row_interval_ms: 100,
@@ -358,12 +386,20 @@ async fn stationd_with_a_real_radiod() {
             })
             .ok_or_else(|| fail("no StationStatus".into()))?;
         println!("E2E station_status={status:?}");
+        let health = status
+            .receivers
+            .iter()
+            .find(|r| r.receiver_id == 1)
+            .ok_or_else(|| fail("no health for receiver 1".into()))?;
+        check(health.state == v1::ReceiverState::Running as i32, || {
+            "receiver not RUNNING".into()
+        })?;
         check(
-            status.backend.as_ref().map(|b| b.state)
+            health.backend.as_ref().map(|b| b.state)
                 == Some(v1::backend_health::State::Running as i32),
             || "backend not RUNNING".into(),
         )?;
-        check(status.frontend.is_some(), || "no front-end health".into())?;
+        check(health.frontend.is_some(), || "no front-end health".into())?;
         Ok(After::Stop(Some(Box::new(conn))))
     })
     .await;
@@ -373,9 +409,11 @@ async fn stationd_with_a_real_radiod() {
 }
 
 /// The measurement scenarios of station-conformance against radiod on the
-/// signal generator: a plan, idle-duty reports for measuring minutes only, the
-/// duty following a listener, the stop on `SetFrontend`, one plan per
-/// connection, the local switch.
+/// signal generator, both receivers of the scenarios on it: a plan over
+/// them, idle-duty reports for measuring minutes only, each receiver's duty
+/// following its own listener, one plan per connection. (The stop on
+/// `SetFrontend` needs a front end that retunes; the signal generator's LO
+/// is fixed.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn measurement_scenarios_with_a_real_radiod() {
     if !enabled() || radiod() != Radiod::SigGen {
@@ -389,9 +427,7 @@ async fn measurement_scenarios_with_a_real_radiod() {
     for name in [
         "measures_when_asked",
         "duty_follows_listeners",
-        "stops_measuring_on_frontend_change",
         "one_plan_per_connection",
-        "refuses_measurements_when_disabled",
     ] {
         let scenario = station_conformance::scenarios::by_name(name).expect("scenario");
         let config = Ka9qConfig::new(status_group(), None);

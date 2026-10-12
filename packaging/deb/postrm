@@ -1,11 +1,11 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-only
 #
-# coaxhub-stationd postrm. `remove` keeps the configuration, the station's
-# credentials and the users, so reinstalling needs no new enrollment.
-# `purge` removes all of them: /etc/coaxhub, /var/lib/coaxhub (the station
-# key and certificate), /var/lib/coaxhub-radiod, the users, and the
-# services' enablement.
+# coaxhub-stationd postrm. `remove` keeps the station's credentials, the
+# applied receiver set and the users, so reinstalling needs no new enrollment
+# and the receivers start again. `purge` removes all of them:
+# /var/lib/coaxhub (the station key and certificate, and receivers/),
+# /var/lib/coaxhub-radiod, the users, and stationd's enablement.
 set -e
 
 TIME_WAIT_MARKER=/var/lib/coaxhub/.enabled-time-wait-sync
@@ -34,14 +34,12 @@ remove)
 	fi
 	;;
 purge)
-	for unit in stationd.service coaxhub-radiod.service; do
-		rm -f /etc/systemd/system/*.wants/"$unit"
-	done
+	# Only stationd is ever enabled; the radiod instances are started by it.
+	rm -f /etc/systemd/system/*.wants/stationd.service
 	if [ -e "$TIME_WAIT_MARKER" ] && command -v systemctl >/dev/null 2>&1; then
 		systemctl disable --quiet systemd-time-wait-sync.service 2>/dev/null || true
 	fi
-	rm -rf /var/lib/coaxhub /var/lib/coaxhub-radiod /etc/coaxhub \
-		/run/coaxhub /run/coaxhub-radiod
+	rm -rf /var/lib/coaxhub /var/lib/coaxhub-radiod /run/coaxhub /run/coaxhub-radiod
 	remove_system_user coaxhub
 	remove_system_user coaxhub-radiod
 	if [ -d /run/systemd/system ]; then

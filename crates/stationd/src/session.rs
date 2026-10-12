@@ -1,22 +1,23 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! One tunnel connection (station-protocol §2): dial, `Hello`, `Welcome`,
 //! then answer requests, stream media, send `StationStatus`, and forward
-//! backend events until the stream ends, the hub says `Goodbye`, or a
-//! shutdown is requested.
+//! the receivers' events until the stream ends, the hub says `Goodbye`, or
+//! a shutdown is requested.
 //!
 //! On any end, every channel and subscription of the connection is closed
-//! in the backend (§2.3), and its measurement plan stops: nothing survives
-//! into the next connection, and nothing measured is buffered for it.
+//! in its receiver's backend (§2.3), and its measurement plan stops: nothing
+//! survives into the next connection, and nothing measured is buffered for
+//! it. The receivers themselves keep running.
 
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use futures_util::StreamExt as _;
-use station_backend::{ChannelOutput, EventStream};
+use station_backend::ChannelOutput;
 use station_proto::v1::station_gateway_client::StationGatewayClient;
 use station_proto::validate::negotiate_welcome;
 use station_proto::{limits, v1};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
@@ -25,8 +26,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::daemon::{ConnectionState, Ctx, Link};
 use crate::dispatch::{self, Media, RequestContext, Tables, truncate_utf8};
-use crate::measure::{self, MeasureDeps, Measurer, StopReason};
+use crate::measure::{self, MeasureDeps, Measurer};
 use crate::outbound::Outbound;
+use crate::receivers::RxEvent;
 use crate::renew::Signal;
 use crate::status;
 
@@ -122,7 +124,10 @@ pub(crate) async fn run(
     // hyper polls it from a background task, and an unfinished request
     // stream would keep the HTTP/2 stream and the connection alive.
     let _close_outbound = CloseOnDrop(Arc::clone(&outbound));
-    outbound.push_body(Body::Hello(status::hello(&ctx.backend.info(), ctx.boot_id)));
+    outbound.push_body(Body::Hello(status::hello(
+        &ctx.receivers.backend_info(),
+        ctx.boot_id,
+    )));
     let mut client = StationGatewayClient::new(channel)
         .max_decoding_message_size(limits::MAX_MESSAGE_BYTES)
         .max_encoding_message_size(limits::MAX_MESSAGE_BYTES);
@@ -169,32 +174,38 @@ pub(crate) async fn run(
         0 => limits::DEFAULT_STATUS_INTERVAL,
         ms => Duration::from_millis(u64::from(ms)),
     };
+    // The receivers' events from now on: a set the hub sends next gets its
+    // RECEIVER_STATE events on this connection.
+    let events = ctx.receivers.subscribe();
     let tables: Arc<std::sync::Mutex<Tables>> = Arc::default();
-    let measurer = (version.minor >= limits::MEASUREMENTS_MINOR).then(|| {
-        Measurer::new(MeasureDeps {
-            backend: Arc::clone(&ctx.backend),
-            outbound: Arc::clone(&outbound),
-            tables: Arc::clone(&tables),
-            drops: Arc::clone(&ctx.drops),
-            clock: Arc::clone(&ctx.measure_clock),
-            load: Arc::clone(&ctx.measure_load),
-            clock_state: Arc::new(measure::clock::clock_state),
-            enabled: ctx.policy.measurements,
-        })
+    let measurer = Measurer::new(MeasureDeps {
+        receivers: ctx.receivers.clone(),
+        outbound: Arc::clone(&outbound),
+        tables: Arc::clone(&tables),
+        drops: Arc::clone(&ctx.drops),
+        clock: Arc::clone(&ctx.measure_clock),
+        load: Arc::clone(&ctx.measure_load),
+        clock_state: Arc::new(measure::clock::clock_state),
     });
     let session = Session {
         ctx: Arc::clone(ctx),
         outbound,
         requests: RequestContext {
-            backend: Arc::clone(&ctx.backend),
-            policy: Arc::clone(&ctx.policy),
+            receivers: ctx.receivers.clone(),
             minor: version.minor,
             tables,
-            measurer,
+            measurer: Some(measurer),
         },
     };
     let end = session
-        .serve(inbound, status_interval, shutdown, signals, &link.serial)
+        .serve(
+            inbound,
+            events,
+            status_interval,
+            shutdown,
+            signals,
+            &link.serial,
+        )
         .await;
     Outcome {
         end,
@@ -272,6 +283,7 @@ impl Session {
     async fn serve(
         self,
         mut inbound: tonic::Streaming<v1::HubMessage>,
+        mut events: broadcast::Receiver<RxEvent>,
         status_interval: Duration,
         shutdown: &CancellationToken,
         signals: &mut mpsc::Receiver<Signal>,
@@ -280,7 +292,7 @@ impl Session {
         let mut tasks = JoinSet::new();
         let mut status_tick = tokio::time::interval(status_interval);
         status_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut events: EventStream = self.ctx.backend.events();
+        let mut events_open = true;
         let end = loop {
             tokio::select! {
                 biased;
@@ -316,14 +328,14 @@ impl Session {
                     }
                     Signal::Revoked { serial } => break End::Revoked(serial),
                 },
-                event = events.next() => {
-                    if let Some(event) = event {
-                        self.forward_event(event);
-                    } else {
-                        warn!("backend event stream ended");
-                        events = Box::pin(futures_util::stream::pending());
+                event = events.recv(), if events_open => match event {
+                    Ok(event) => self.forward_event(event),
+                    Err(broadcast::error::RecvError::Lagged(missed)) => {
+                        warn!(missed, "receiver events were lost: the connection lagged");
                     }
-                }
+                    // The receivers live as long as the daemon.
+                    Err(broadcast::error::RecvError::Closed) => events_open = false,
+                },
                 Some(joined) = tasks.join_next(), if !tasks.is_empty() => {
                     if let Err(e) = joined {
                         if e.is_panic() {
@@ -341,16 +353,17 @@ impl Session {
     }
 
     fn status(&self) -> v1::StationStatus {
+        let tables = &self.requests.tables;
         let (channels, subscriptions) = {
-            let t = self
-                .requests
-                .tables
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let t = tables.lock().unwrap_or_else(PoisonError::into_inner);
             (t.open_channels(), t.open_subscriptions())
         };
+        let receivers = self.ctx.receivers.health(|id| {
+            let t = tables.lock().unwrap_or_else(PoisonError::into_inner);
+            u32::try_from(t.open_channels_on(id)).unwrap_or(u32::MAX)
+        });
         status::station_status(
-            &self.ctx.backend.health(),
+            receivers,
             status::host_health(),
             status::Counters {
                 uptime_s: self.ctx.started.elapsed().as_secs(),
@@ -363,16 +376,11 @@ impl Session {
         )
     }
 
-    fn forward_event(&self, mut event: v1::Event) {
+    fn forward_event(&self, RxEvent { mut event, stop }: RxEvent) {
         use v1::event::Kind;
         // A measurement never straddles a change of settings or coverage: the
         // plan stops first, so the hub sees MEASUREMENT_STOPPED before the
         // event that made it stop.
-        let stop = match Kind::try_from(event.kind) {
-            Ok(Kind::FrontendChanged) => Some(StopReason::FrontendChanged),
-            Ok(Kind::BackendRestarted) => Some(StopReason::BackendRestarted),
-            _ => None,
-        };
         if let (Some(reason), Some(m)) = (stop, &self.requests.measurer) {
             m.stop_for(reason);
         }
@@ -394,8 +402,11 @@ impl Session {
                     }
                 }
                 Ok(Kind::BackendRestarted) => {
-                    // All channels and subscriptions are gone (event docs).
-                    let _ = t.take_all();
+                    // The receiver's channels and subscriptions are gone
+                    // (event docs).
+                    if let Some(id) = event.receiver_id {
+                        t.receiver_gone(id);
+                    }
                 }
                 _ => {}
             }
@@ -448,16 +459,7 @@ impl Session {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take_all();
-        for id in channels {
-            if let Err(e) = self.ctx.backend.close_channel(id).await {
-                debug!(channel_id = id, error = %e, "closing channel after disconnect");
-            }
-        }
-        for id in subscriptions {
-            if let Err(e) = self.ctx.backend.unsubscribe_waterfall(id).await {
-                debug!(subscription_id = id, error = %e, "closing subscription after disconnect");
-            }
-        }
+        dispatch::close_in_backends(&self.ctx.receivers, channels, subscriptions).await;
     }
 }
 

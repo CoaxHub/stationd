@@ -13,6 +13,48 @@ stationd is the station daemon of [CoaxHub](https://coaxhub.com). It connects an
 - `scripts/`: radiod built at its pinned commit, the end-to-end runs, fuzzing and the license-boundary check;
 - `testdata/`: radiod configs (a signal generator, so that everything can be tested without SDR hardware, and the three RTL-SDR profiles: VHF/UHF, HF by direct sampling, and the RTL-SDR Blog V4).
 
+## Installing a station
+
+A station is a Debian or Raspberry Pi OS computer (bookworm or trixie, amd64 or arm64) with one or more RTL-SDRs on USB. The installer adds the signed CoaxHub APT repository, installs the `coaxhub-stationd` package, asks for the enrollment token from the web app (with the input hidden) and starts `stationd.service`:
+
+```sh
+curl -fsSL https://get.coaxhub.com/station | sudo sh
+```
+
+It asks nothing about the SDRs. [coaxhub.com/docs/station](https://coaxhub.com/docs/station) is the owner's guide; [docs/packaging.md](docs/packaging.md) describes the package and every step of the installer.
+
+## Receivers
+
+A station serves one **receiver** per SDR it uses, up to 16. stationd reports the SDRs plugged in, each with the models its package offers for it, and every profile the package has. The owner sets up the receivers in the web app (which SDR, its model, the band), and the hub sends the whole set to the station as `ConfigureReceivers` ([station protocol §4.2](docs/station-protocol.md#42-hardware-and-receivers)). stationd checks the set against fixed rules (the SDR table, the profiles' centre ranges and gains, no overlapping receivers), keeps it, and runs one radiod per receiver, `coaxhub-radiod@<receiver_id>.service`, each rendered from its profile's template. A receiver whose SDR is unplugged waits for it (`NO_DEVICE`) and starts when it is plugged in.
+
+| Profile | For | Centre |
+|---|---|---|
+| `rtlsdr` | an RTL-SDR on VHF/UHF, through its tuner | 24–1766 MHz |
+| `rtlsdr-hf` | an RTL-SDR with direct sampling (such as a Blog V3) on HF | 0.5–28.8 MHz |
+| `rtlsdr-v4` | an RTL-SDR Blog V4, on HF through its upconverter and on VHF/UHF | 0.5–1766 MHz |
+
+## What a station keeps
+
+A packaged station has no settings file: everything the owner chooses lives in the web app ([station protocol §7](docs/station-protocol.md#7-what-the-station-keeps)). On the station there is:
+
+- `/var/lib/coaxhub/stationd/` (mode 0700, user `coaxhub`): the station's key, which never leaves it, its certificate, the gateway's CA bundle, its home hub and its id;
+- `/var/lib/coaxhub/receivers/receivers.json` (mode 0640, group `coaxhub-radiod`): the receiver set the hub last applied, so the receivers run while the tunnel is down and after a reboot;
+- `/run/coaxhub-radiod/<receiver_id>/radiod.conf`: each receiver's radiod config, rendered again before every start.
+
+## The commands
+
+```text
+stationd run                       the daemon (stationd.service runs it)
+stationd enroll [--force]          enroll with a one-time token from the web app
+stationd status [--json]           enrollment, certificate, home hub, receivers
+stationd doctor                    checks the enrollment, the SDRs, the receivers, the network and the clock
+stationd unenroll                  deletes the credentials, keeps the receivers
+stationd backend-config --receiver ID
+                                   renders a receiver's radiod config (its unit runs it)
+```
+
+[docs/architecture.md](docs/architecture.md#the-stationd-commands) has the options and the exit codes.
+
 ## Building
 
 Run every command from the repository root. You need the Rust release in `rust-toolchain.toml` (rustup installs it on the first `cargo` call), `protoc`, `jq`, `cargo-nextest` and `cargo-deny`; Docker with BuildKit for the packages; and ka9q-radio's build dependencies for the end-to-end tests. On Debian:
@@ -37,7 +79,7 @@ Tests, fuzzing, the end-to-end runs against radiod and the package tests: [CONTR
 
 ## Running a development build
 
-A development build accepts, in `stationd.toml`, settings a packaged build refuses (station protocol §7 has the owner's part of the file):
+A development build reads `stationd.toml` (`--config`, default `/etc/coaxhub/stationd.toml`) for the settings tests and LAN setups need; a packaged build reads no file. Every key is optional, and unknown keys are errors:
 
 ```toml
 state_dir = "/tmp/stationd-state"               # default /var/lib/coaxhub/stationd
@@ -51,8 +93,10 @@ cert = "/path/station.pem"                      # client certificate (URI SAN ur
 key = "/path/station.key"                       # warns if group or world readable
 gateway_ca = "/path/ca.pem"                     # the ONLY roots trusted for the gateway
 [backend]
-kind = "ka9q"                                   # radiod; or "fake" (synthetic media, no radio)
-[backend.ka9q]                                  # required with kind = "ka9q", refused otherwise
+kind = "fake"                                   # synthetic media, no radio; or "ka9q" (the default)
+usb_devices = "usb"                             # where SDRs are read from (default /sys/bus/usb/devices);
+                                                # simulated SDRs are directories laid out like it
+[backend.ka9q]                                  # one radiod of your own for every receiver; stationd starts no unit
 status_group = "239.77.0.6:5006"                # radiod's `status =` group
 data_group = "239.77.0.4:5004"                  # optional: radiod's `data =` group; default: asked from radiod
 [measurements]
@@ -60,7 +104,9 @@ ignore_host_load = true                         # measuring never pauses for the
 ```
 
 - Without `[credentials]`, stationd runs on the credentials in the state directory, which `stationd enroll` gets from `[endpoints]`.
-- Without `[backend]`, stationd drives the bundled radiod on the package's fixed groups, `239.77.0.6:5006` and `239.77.0.4:5004`, and `[sdr]` is required.
+- Without `[backend]`, or with `kind = "ka9q"` and no `[backend.ka9q]`, each receiver runs the bundled radiod on its slot's groups, started through systemd, as on a packaged station. With `kind = "fake"`, each receiver is a fake backend and no unit is started.
+- With `state_dir`, the applied receivers live in `<state_dir>/receivers/receivers.json`.
+- `stationd check-config` (development builds only) validates the file, the credentials and the applied receivers.
 - `[credentials]` takes PEM files of the shape `crates/station-conformance/src/pki.rs` generates in memory: a P-256 key readable only by stationd's user, a client certificate whose only URI SAN is `urn:coaxhub:station:<uuid>` (followed by its intermediate, if any), and the root that signed the gateway's certificate, the only trust anchor used for it.
 
 ## Documents

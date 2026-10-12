@@ -48,10 +48,11 @@ pub enum RequestError {
     /// `StartMeasurements` for a plan that is already open.
     #[error("measurement {0} is already open")]
     MeasurementInUse(u32),
-    /// A command the negotiated minor does not have (`StartMeasurements` on a
-    /// 1.0 session).
-    #[error("{0} is not part of the negotiated minor")]
-    NotInMinor(CommandKind),
+    /// A `ConfigureReceivers` with more than [`limits::MAX_RECEIVERS`]
+    /// receivers, a `receiver_id` of 0, or one twice (§4.2). Check a set with
+    /// [`super::check_receiver_set`] before sending it.
+    #[error("the receiver set is invalid")]
+    InvalidReceiverSet,
 }
 
 /// Requests whose deadline passed, from [`Session::expire_requests`].
@@ -65,19 +66,23 @@ pub struct ExpiredRequests {
     pub violation: Option<ViolationKind>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum Pending {
     GetCapabilities,
     OpenChannel {
         channel_id: u32,
+        receiver_id: u32,
     },
     UpdateChannel {
         channel_id: u32,
     },
     CloseChannel,
-    SetFrontend,
+    SetFrontend {
+        receiver_id: u32,
+    },
     SubscribeWaterfall {
         subscription_id: u32,
+        receiver_id: u32,
         bins: u32,
         row_interval_ms: u32,
     },
@@ -90,54 +95,38 @@ enum Pending {
         measurement_id: u32,
     },
     StopMeasurements,
+    GetHardware,
+    ConfigureReceivers {
+        /// The set's receiver IDs.
+        receivers: Vec<u32>,
+        /// IDs this set configured that were not configured before.
+        added: Vec<u32>,
+        /// Configured IDs this set leaves out.
+        dropped: Vec<u32>,
+    },
 }
 
 impl Pending {
-    fn from_command(c: &v1::request::Command) -> Self {
-        use v1::request::Command;
-        match c {
-            Command::GetCapabilities(_) => Self::GetCapabilities,
-            Command::OpenChannel(o) => Self::OpenChannel {
-                channel_id: o.channel_id,
-            },
-            Command::UpdateChannel(u) => Self::UpdateChannel {
-                channel_id: u.channel_id,
-            },
-            Command::CloseChannel(_) => Self::CloseChannel,
-            Command::SetFrontend(_) => Self::SetFrontend,
-            Command::SubscribeWaterfall(s) => Self::SubscribeWaterfall {
-                subscription_id: s.subscription_id,
-                bins: s.bins,
-                row_interval_ms: s.row_interval_ms,
-            },
-            Command::UnsubscribeWaterfall(_) => Self::UnsubscribeWaterfall,
-            Command::Ping(p) => Self::Ping { nonce: p.nonce },
-            Command::AdminOp(_) => Self::AdminOp,
-            Command::StartMeasurements(m) => Self::StartMeasurements {
-                measurement_id: m.measurement_id,
-            },
-            Command::StopMeasurements(_) => Self::StopMeasurements,
-        }
-    }
-
-    fn kind(self) -> CommandKind {
+    fn kind(&self) -> CommandKind {
         match self {
             Self::GetCapabilities => CommandKind::GetCapabilities,
             Self::OpenChannel { .. } => CommandKind::OpenChannel,
             Self::UpdateChannel { .. } => CommandKind::UpdateChannel,
             Self::CloseChannel => CommandKind::CloseChannel,
-            Self::SetFrontend => CommandKind::SetFrontend,
+            Self::SetFrontend { .. } => CommandKind::SetFrontend,
             Self::SubscribeWaterfall { .. } => CommandKind::SubscribeWaterfall,
             Self::UnsubscribeWaterfall => CommandKind::UnsubscribeWaterfall,
             Self::Ping { .. } => CommandKind::Ping,
             Self::AdminOp => CommandKind::AdminOp,
             Self::StartMeasurements { .. } => CommandKind::StartMeasurements,
             Self::StopMeasurements => CommandKind::StopMeasurements,
+            Self::GetHardware => CommandKind::GetHardware,
+            Self::ConfigureReceivers { .. } => CommandKind::ConfigureReceivers,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Outstanding {
     pending: Pending,
     deadline: Instant,
@@ -145,6 +134,7 @@ struct Outstanding {
 
 #[derive(Debug, Clone)]
 struct Channel {
+    receiver_id: u32,
     closed_at: Option<Instant>,
     audio: TokenBucket,
     audio_excess: Sustained,
@@ -152,8 +142,9 @@ struct Channel {
 }
 
 impl Channel {
-    fn open(frame_duration_ms: u32, now: Instant) -> Self {
+    fn open(receiver_id: u32, frame_duration_ms: u32, now: Instant) -> Self {
         Self {
+            receiver_id,
             closed_at: None,
             audio: audio_bucket(frame_duration_ms, now),
             audio_excess: Sustained::default(),
@@ -190,6 +181,7 @@ struct RowParams {
 
 #[derive(Debug, Clone)]
 struct Subscription {
+    receiver_id: u32,
     closed_at: Option<Instant>,
     /// From `WaterfallSubscribed`; rows before it are dropped.
     params: Option<RowParams>,
@@ -201,6 +193,21 @@ enum IdState {
     Open,
     Grace,
     Unknown,
+}
+
+/// A receiver ID as the session sees it (§5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiverState {
+    /// Configured: named by a set the hub sent and not left out by a later
+    /// accepted one.
+    Configured,
+    /// Left out by a later set less than the grace period ago.
+    Grace,
+    /// Never configured on this connection, or left out longer ago.
+    Unknown,
+    /// No set of the hub's was accepted yet on this connection: the station
+    /// runs the set it kept, which the hub hasn't seen.
+    Unsettled,
 }
 
 fn id_state(closed_at: Option<Instant>, now: Instant) -> IdState {
@@ -217,8 +224,8 @@ fn id_state(closed_at: Option<Instant>, now: Instant) -> IdState {
 /// - [`check`](Self::check) for every message the station sends;
 /// - [`on_welcome_sent`](Self::on_welcome_sent) after it sends `Welcome`;
 /// - [`on_request_sent`](Self::on_request_sent) for every request it sends,
-///   which records the request and the channel or subscription IDs it opens
-///   or closes (closing starts a 5 s grace period);
+///   which records the request and the channel, subscription, plan or
+///   receiver IDs it opens or closes (closing starts a 5 s grace period);
 /// - [`expire_requests`](Self::expire_requests),
 ///   [`hello_timed_out`](Self::hello_timed_out) and
 ///   [`idle_timed_out`](Self::idle_timed_out), woken at
@@ -229,6 +236,19 @@ fn id_state(closed_at: Option<Instant>, now: Instant) -> IdState {
 /// panics, whatever the station sends. IDs open as soon as the hub sends the
 /// request (media may race the response); a non-`OK` response to
 /// `OpenChannel`/`SubscribeWaterfall` removes them again.
+///
+/// **Receivers** (§4.2, §5.1). A receiver ID is configured from the
+/// `ConfigureReceivers` that names it. A set leaves receivers out once the
+/// station accepts it (`OK`): a refused set changes nothing at the station,
+/// so the receivers it would have dropped stay configured, and the ones it
+/// added are forgotten; a set whose answer times out leaves both configured.
+/// A receiver left out gets the 5 s grace of closed IDs,
+/// and so do its channels and subscriptions. Until the station accepts the
+/// hub's first set on the connection it runs the set it kept (§2.3), which
+/// the hub hasn't seen: a status or event naming an unknown receiver is
+/// then dropped, and a `Hardware` or `Capabilities` naming one is accepted.
+/// After that, an unknown receiver in a status, `Hardware` or `Capabilities`
+/// is a violation, and an event naming one is dropped.
 #[derive(Debug)]
 pub struct Session {
     started_at: Instant,
@@ -242,6 +262,12 @@ pub struct Session {
     consecutive_timeouts: u32,
     channels: HashMap<u32, Channel>,
     subscriptions: HashMap<u32, Subscription>,
+    /// Configured receivers, with the time a set left them out.
+    receivers: HashMap<u32, Option<Instant>>,
+    /// Whether the station accepted a receiver set on this connection.
+    receivers_settled: bool,
+    /// The receivers of the last accepted `Capabilities`.
+    running: Vec<u32>,
     plans: Plans,
     status: TokenBucket,
     events: TokenBucket,
@@ -264,6 +290,9 @@ impl Session {
             consecutive_timeouts: 0,
             channels: HashMap::new(),
             subscriptions: HashMap::new(),
+            receivers: HashMap::new(),
+            receivers_settled: false,
+            running: Vec::new(),
             plans: Plans::default(),
             status: status_bucket(limits::DEFAULT_STATUS_INTERVAL, now),
             events: TokenBucket::new(
@@ -318,27 +347,25 @@ impl Session {
             return Err(RequestError::TooManyOutstanding(self.outstanding.len()));
         }
         let command = req.command.as_ref().ok_or(RequestError::MissingCommand)?;
-        let minor = self.version.map_or(0, |v| v.minor);
-        if matches!(
-            command,
-            Command::StartMeasurements(_) | Command::StopMeasurements(_)
-        ) && minor < limits::MEASUREMENTS_MINOR
-        {
-            return Err(RequestError::NotInMinor(CommandKind::of(command)));
-        }
         self.collect_garbage(now);
-        match command {
+        let pending = match command {
             Command::OpenChannel(o) => {
                 if self.channel_state(o.channel_id, now) == IdState::Open {
                     return Err(RequestError::ChannelInUse(o.channel_id));
                 }
                 let fd = o.audio.as_ref().map_or(0, |a| a.frame_duration_ms);
-                self.channels.insert(o.channel_id, Channel::open(fd, now));
+                self.channels
+                    .insert(o.channel_id, Channel::open(o.receiver_id, fd, now));
+                Pending::OpenChannel {
+                    channel_id: o.channel_id,
+                    receiver_id: o.receiver_id,
+                }
             }
             Command::CloseChannel(c) => {
                 if let Some(ch) = self.channels.get_mut(&c.channel_id) {
                     ch.closed_at.get_or_insert(now);
                 }
+                Pending::CloseChannel
             }
             Command::SubscribeWaterfall(s) => {
                 if self.subscription_state(s.subscription_id, now) == IdState::Open {
@@ -347,30 +374,49 @@ impl Session {
                 self.subscriptions.insert(
                     s.subscription_id,
                     Subscription {
+                        receiver_id: s.receiver_id,
                         closed_at: None,
                         params: None,
                         rows: None,
                     },
                 );
+                Pending::SubscribeWaterfall {
+                    subscription_id: s.subscription_id,
+                    receiver_id: s.receiver_id,
+                    bins: s.bins,
+                    row_interval_ms: s.row_interval_ms,
+                }
             }
             Command::UnsubscribeWaterfall(u) => {
                 if let Some(sub) = self.subscriptions.get_mut(&u.subscription_id) {
                     sub.closed_at.get_or_insert(now);
                 }
+                Pending::UnsubscribeWaterfall
             }
             Command::StartMeasurements(m) => {
                 self.plans
                     .on_start_sent(m, now)
                     .map_err(|e| RequestError::MeasurementInUse(e.0))?;
+                Pending::StartMeasurements {
+                    measurement_id: m.measurement_id,
+                }
             }
-            Command::StopMeasurements(m) => self.plans.on_stop_sent(m.measurement_id, now),
-            Command::GetCapabilities(_)
-            | Command::UpdateChannel(_)
-            | Command::SetFrontend(_)
-            | Command::Ping(_)
-            | Command::AdminOp(_) => {}
-        }
-        let pending = Pending::from_command(command);
+            Command::StopMeasurements(m) => {
+                self.plans.on_stop_sent(m.measurement_id, now);
+                Pending::StopMeasurements
+            }
+            Command::ConfigureReceivers(c) => self.on_configure_sent(c)?,
+            Command::UpdateChannel(u) => Pending::UpdateChannel {
+                channel_id: u.channel_id,
+            },
+            Command::SetFrontend(f) => Pending::SetFrontend {
+                receiver_id: f.receiver_id,
+            },
+            Command::Ping(p) => Pending::Ping { nonce: p.nonce },
+            Command::GetCapabilities(_) => Pending::GetCapabilities,
+            Command::GetHardware(_) => Pending::GetHardware,
+            Command::AdminOp(_) => Pending::AdminOp,
+        };
         let deadline = now.checked_add(pending.kind().timeout()).unwrap_or(now);
         self.outstanding
             .insert(req.request_id, Outstanding { pending, deadline });
@@ -378,9 +424,81 @@ impl Session {
         Ok(())
     }
 
+    /// `ConfigureReceivers`: the set's receivers are configured from now on;
+    /// the ones it leaves out stay configured until the station accepts it.
+    fn on_configure_sent(&mut self, c: &v1::ConfigureReceivers) -> Result<Pending, RequestError> {
+        if c.receivers.len() > limits::MAX_RECEIVERS {
+            return Err(RequestError::InvalidReceiverSet);
+        }
+        let mut receivers = Vec::with_capacity(c.receivers.len());
+        for rx in &c.receivers {
+            if rx.receiver_id == 0 || receivers.contains(&rx.receiver_id) {
+                return Err(RequestError::InvalidReceiverSet);
+            }
+            receivers.push(rx.receiver_id);
+        }
+        let mut added = Vec::new();
+        for &id in &receivers {
+            if self.receivers.get(&id) != Some(&None) {
+                self.receivers.insert(id, None);
+                added.push(id);
+            }
+        }
+        let mut dropped: Vec<u32> = self
+            .receivers
+            .iter()
+            .filter(|(id, closed_at)| closed_at.is_none() && !receivers.contains(id))
+            .map(|(id, _)| *id)
+            .collect();
+        dropped.sort_unstable();
+        Ok(Pending::ConfigureReceivers {
+            receivers,
+            added,
+            dropped,
+        })
+    }
+
+    /// A set the station accepted left `receiver_id` out: it, its channels
+    /// and its subscriptions close, with the grace.
+    fn drop_receiver(&mut self, receiver_id: u32, now: Instant) {
+        if let Some(closed_at) = self.receivers.get_mut(&receiver_id) {
+            closed_at.get_or_insert(now);
+        }
+        self.close_on_receiver(receiver_id, now);
+    }
+
+    /// Closes the channels and subscriptions of `receiver_id`, with the grace.
+    fn close_on_receiver(&mut self, receiver_id: u32, now: Instant) {
+        for ch in self.channels.values_mut() {
+            if ch.receiver_id == receiver_id {
+                ch.closed_at.get_or_insert(now);
+            }
+        }
+        for sub in self.subscriptions.values_mut() {
+            if sub.receiver_id == receiver_id {
+                sub.closed_at.get_or_insert(now);
+            }
+        }
+    }
+
     /// Number of requests awaiting a response.
     pub fn outstanding_requests(&self) -> usize {
         self.outstanding.len()
+    }
+
+    /// Whether `receiver_id` is configured (§5.1): named by a set the hub
+    /// sent and not left out by a later set the station accepted (nor in the
+    /// grace period after that).
+    pub fn is_receiver_configured(&self, receiver_id: u32, now: Instant) -> bool {
+        self.receiver_state(receiver_id, now) == ReceiverState::Configured
+    }
+
+    /// The receivers of the last `Capabilities` accepted on this connection,
+    /// in its order: the running receivers, before the hub's own selection
+    /// ([`super::select_receivers`]). Empty before the first. Scale the
+    /// ingress quota with it ([`super::IngressQuota::set_running_receivers`]).
+    pub fn running_receivers(&self) -> &[u32] {
+        &self.running
     }
 
     /// Whether `channel_id` is open (not closed, not in its grace period).
@@ -388,7 +506,7 @@ impl Session {
         self.channel_state(channel_id, now) == IdState::Open
     }
 
-    /// Whether the plan `measurement_id` is open (1.1).
+    /// Whether the plan `measurement_id` is open.
     pub fn is_measurement_open(&self, measurement_id: u32, now: Instant) -> bool {
         self.plans.is_open(measurement_id, now)
     }
@@ -539,13 +657,7 @@ impl Session {
             Body::Audio(a) => self.check_audio(a, now),
             Body::Waterfall(w) => self.check_waterfall(w, now),
             Body::Signal(s) => self.check_signal(s, now),
-            Body::Status(_) => Ok(if self.status.try_take(now) {
-                None
-            } else {
-                Some(DropReason::RateLimited {
-                    kind: MessageKind::Status,
-                })
-            }),
+            Body::Status(s) => self.check_status(s, now),
             Body::Event(e) => self.check_event(e, now, unix_ms),
             Body::Noise(n) => self.plans.check_noise(n, now, unix_ms),
         }
@@ -586,16 +698,25 @@ impl Session {
             field,
         };
         match (out.pending, &r.payload) {
-            (Pending::OpenChannel { channel_id }, Some(Payload::ChannelOpened(c))) => {
+            (
+                Pending::OpenChannel {
+                    channel_id,
+                    receiver_id,
+                },
+                Some(Payload::ChannelOpened(c)),
+            ) => {
                 if c.channel_id != channel_id {
                     return Err(mismatch("channel_opened.channel_id"));
+                }
+                if c.receiver_id != receiver_id {
+                    return Err(mismatch("channel_opened.receiver_id"));
                 }
                 let fd = c.audio.as_ref().map_or(0, |a| a.frame_duration_ms);
                 if let Some(ch) = self.channels.get_mut(&channel_id) {
                     ch.audio = audio_bucket(fd, now);
                 }
             }
-            (Pending::OpenChannel { channel_id }, None) => {
+            (Pending::OpenChannel { channel_id, .. }, None) => {
                 // Not OK: the station has no such channel.
                 self.channels.remove(&channel_id);
             }
@@ -604,33 +725,16 @@ impl Session {
                     return Err(mismatch("channel_updated.channel_id"));
                 }
             }
+            (Pending::SetFrontend { receiver_id }, Some(Payload::FrontendState(f))) => {
+                if f.receiver_id != receiver_id {
+                    return Err(mismatch("frontend_state.receiver_id"));
+                }
+            }
             (
-                Pending::SubscribeWaterfall {
-                    subscription_id,
-                    bins,
-                    row_interval_ms,
-                },
+                pending @ Pending::SubscribeWaterfall { .. },
                 Some(Payload::WaterfallSubscribed(w)),
             ) => {
-                if w.subscription_id != subscription_id {
-                    return Err(mismatch("waterfall_subscribed.subscription_id"));
-                }
-                // The station may give less than asked, never more.
-                if w.bins > bins {
-                    return Err(mismatch("waterfall_subscribed.bins"));
-                }
-                if w.row_interval_ms < row_interval_ms {
-                    return Err(mismatch("waterfall_subscribed.row_interval_ms"));
-                }
-                if let Some(sub) = self.subscriptions.get_mut(&subscription_id) {
-                    let per_sec =
-                        limits::MEDIA_RATE_TOLERANCE * 1000.0 / f64::from(w.row_interval_ms.max(1));
-                    sub.params = Some(RowParams {
-                        bins: w.bins,
-                        compression: w.compression,
-                    });
-                    sub.rows = Some(TokenBucket::new(per_sec, media_capacity(per_sec), now));
-                }
+                self.on_subscribed(&pending, w, now, &mismatch)?;
             }
             (
                 Pending::SubscribeWaterfall {
@@ -654,9 +758,156 @@ impl Session {
             (Pending::StartMeasurements { measurement_id }, None) => {
                 self.plans.on_refused(measurement_id);
             }
+            (
+                pending @ (Pending::ConfigureReceivers { .. }
+                | Pending::GetCapabilities
+                | Pending::GetHardware),
+                payload,
+            ) => self.on_receivers_response(pending, payload.as_ref(), now, &mismatch)?,
             _ => {}
         }
         Ok(None)
+    }
+
+    /// `WaterfallSubscribed` must echo the request: the station may give
+    /// fewer bins or slower rows than asked, never more (§5.1).
+    fn on_subscribed(
+        &mut self,
+        pending: &Pending,
+        w: &v1::WaterfallSubscribed,
+        now: Instant,
+        mismatch: &dyn Fn(&'static str) -> ViolationKind,
+    ) -> Result<(), ViolationKind> {
+        let &Pending::SubscribeWaterfall {
+            subscription_id,
+            receiver_id,
+            bins,
+            row_interval_ms,
+        } = pending
+        else {
+            return Ok(());
+        };
+        if w.subscription_id != subscription_id {
+            return Err(mismatch("waterfall_subscribed.subscription_id"));
+        }
+        if w.receiver_id != receiver_id {
+            return Err(mismatch("waterfall_subscribed.receiver_id"));
+        }
+        if w.bins > bins {
+            return Err(mismatch("waterfall_subscribed.bins"));
+        }
+        if w.row_interval_ms < row_interval_ms {
+            return Err(mismatch("waterfall_subscribed.row_interval_ms"));
+        }
+        if let Some(sub) = self.subscriptions.get_mut(&subscription_id) {
+            let per_sec =
+                limits::MEDIA_RATE_TOLERANCE * 1000.0 / f64::from(w.row_interval_ms.max(1));
+            sub.params = Some(RowParams {
+                bins: w.bins,
+                compression: w.compression,
+            });
+            sub.rows = Some(TokenBucket::new(per_sec, media_capacity(per_sec), now));
+        }
+        Ok(())
+    }
+
+    /// The responses about receivers: `ReceiversConfigured`, `Capabilities`
+    /// and `Hardware` (§5, §5.1), or a refused `ConfigureReceivers`.
+    fn on_receivers_response(
+        &mut self,
+        pending: Pending,
+        payload: Option<&v1::response::Payload>,
+        now: Instant,
+        mismatch: &dyn Fn(&'static str) -> ViolationKind,
+    ) -> Result<(), ViolationKind> {
+        use v1::response::Payload;
+        match (pending, payload) {
+            (
+                Pending::ConfigureReceivers {
+                    receivers, dropped, ..
+                },
+                Some(Payload::ReceiversConfigured(c)),
+            ) => {
+                // Each receiver of the set once, and nothing else.
+                let mut seen = Vec::with_capacity(c.receivers.len());
+                for rx in &c.receivers {
+                    if !receivers.contains(&rx.receiver_id) || seen.contains(&rx.receiver_id) {
+                        return Err(mismatch("receivers_configured.receivers.receiver_id"));
+                    }
+                    seen.push(rx.receiver_id);
+                }
+                if seen.len() != receivers.len() {
+                    return Err(mismatch("receivers_configured.receivers"));
+                }
+                self.receivers_settled = true;
+                for id in dropped {
+                    self.drop_receiver(id, now);
+                }
+            }
+            (Pending::ConfigureReceivers { added, .. }, None) => {
+                // Refused: nothing changed at the station.
+                for id in added {
+                    if self.receivers.get(&id) == Some(&None) {
+                        self.receivers.remove(&id);
+                    }
+                }
+            }
+            (Pending::GetCapabilities, Some(Payload::Capabilities(c))) => {
+                for rx in &c.receivers {
+                    self.check_named_receiver(rx.receiver_id, now)?;
+                }
+                self.running = c.receivers.iter().map(|rx| rx.receiver_id).collect();
+            }
+            (Pending::GetHardware, Some(Payload::Hardware(h))) => {
+                for id in h.sdrs.iter().filter_map(|s| s.receiver_id) {
+                    self.check_named_receiver(id, now)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// §5 `Capabilities`, `Hardware`: a receiver a response names must be
+    /// configured, just left out, or named before the first accepted set.
+    fn check_named_receiver(&self, receiver_id: u32, now: Instant) -> Result<(), ViolationKind> {
+        if self.receiver_state(receiver_id, now) == ReceiverState::Unknown {
+            return Err(ViolationKind::UnknownReceiver {
+                kind: MessageKind::Response,
+                receiver_id,
+            });
+        }
+        Ok(())
+    }
+
+    /// §5 `StationStatus`: every receiver configured (a receiver just left
+    /// out, or before the first accepted set: dropped), then the rate.
+    fn check_status(
+        &mut self,
+        s: &v1::StationStatus,
+        now: Instant,
+    ) -> Result<Option<DropReason>, ViolationKind> {
+        let kind = MessageKind::Status;
+        let mut drop = None;
+        for rx in &s.receivers {
+            let receiver_id = rx.receiver_id;
+            match self.receiver_state(receiver_id, now) {
+                ReceiverState::Configured => {}
+                ReceiverState::Unknown => {
+                    return Err(ViolationKind::UnknownReceiver { kind, receiver_id });
+                }
+                ReceiverState::Grace => {
+                    drop.get_or_insert(DropReason::ReceiverRemoved { kind, receiver_id });
+                }
+                ReceiverState::Unsettled => {
+                    drop.get_or_insert(DropReason::AwaitingReceivers { kind });
+                }
+            }
+        }
+        if drop.is_some() {
+            return Ok(drop);
+        }
+        Ok((!self.status.try_take(now)).then_some(DropReason::RateLimited { kind }))
     }
 
     fn check_audio(
@@ -784,14 +1035,24 @@ impl Session {
                 return Ok(Some(DropReason::UnknownEventTarget));
             }
         }
-        // 1.1: measurement events (`check_message` dropped the fields' meaning
-        // on a 1.0 session, whose kinds can't be measurement kinds).
+        // Measurement events name the plan's receivers (§5.2).
         let measurement_kind = matches!(
             Kind::try_from(e.kind),
             Ok(Kind::MeasurementStopped | Kind::MeasurementDuty)
         );
         if measurement_kind {
             return self.plans.check_event(e, now, unix_ms);
+        }
+        if let Some(id) = e.receiver_id {
+            match self.receiver_state(id, now) {
+                ReceiverState::Configured | ReceiverState::Grace => {}
+                ReceiverState::Unknown => return Ok(Some(DropReason::UnknownEventTarget)),
+                ReceiverState::Unsettled => {
+                    return Ok(Some(DropReason::AwaitingReceivers {
+                        kind: MessageKind::Event,
+                    }));
+                }
+            }
         }
         match Kind::try_from(e.kind) {
             Ok(Kind::ChannelClosed) => {
@@ -808,16 +1069,25 @@ impl Session {
                 }
             }
             Ok(Kind::BackendRestarted) => {
-                for ch in self.channels.values_mut() {
-                    ch.closed_at.get_or_insert(now);
-                }
-                for sub in self.subscriptions.values_mut() {
-                    sub.closed_at.get_or_insert(now);
+                // `check_message` guarantees the receiver.
+                if let Some(id) = e.receiver_id {
+                    self.close_on_receiver(id, now);
                 }
             }
             _ => {}
         }
         Ok(None)
+    }
+
+    fn receiver_state(&self, id: u32, now: Instant) -> ReceiverState {
+        match self.receivers.get(&id) {
+            Some(None) => ReceiverState::Configured,
+            Some(Some(t)) if now.saturating_duration_since(*t) <= limits::ID_CLOSE_GRACE => {
+                ReceiverState::Grace
+            }
+            _ if !self.receivers_settled => ReceiverState::Unsettled,
+            _ => ReceiverState::Unknown,
+        }
     }
 
     fn channel_state(&self, id: u32, now: Instant) -> IdState {
@@ -838,6 +1108,8 @@ impl Session {
             .retain(|_, c| id_state(c.closed_at, now) != IdState::Unknown);
         self.subscriptions
             .retain(|_, s| id_state(s.closed_at, now) != IdState::Unknown);
+        self.receivers
+            .retain(|_, closed_at| id_state(*closed_at, now) != IdState::Unknown);
     }
 }
 

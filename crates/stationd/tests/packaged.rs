@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! A packaged build (`--features packaged`): the domain
-//! and root are built in, and every test-only setting is refused, by the
-//! library and by the binary.
+//! A packaged build (`--features packaged`): the domain and root are built
+//! in, and it reads no settings file: no `--config`, no `check-config`.
 //!
 //! ```sh
 //! openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
@@ -14,8 +13,8 @@
 use std::path::Path;
 use std::process::Command;
 
-use stationd::config::{Config, ConfigError, TrustAnchor};
-use stationd::flavour::{Flavour, PACKAGED_RUNTIME_DIR};
+use stationd::config::{BackendConfig, Config, TrustAnchor};
+use stationd::flavour::{Flavour, PACKAGED_RUNTIME_DIR, RECEIVERS_DIR};
 use stationd::tls;
 
 const BIN: &str = env!("CARGO_BIN_EXE_stationd");
@@ -38,107 +37,48 @@ fn domain_and_root_are_built_in() {
 }
 
 #[test]
-fn owner_config_uses_the_built_in_endpoints() {
-    let dir = tempfile::tempdir().expect("tmp");
-    let c = Config::parse("[sdr]\nprofile = \"rtlsdr-hf\"\n", dir.path()).expect("valid");
+fn the_built_in_settings() {
+    let c = Config::built_in(Flavour::current().built_in.expect("built in")).expect("config");
     let e = c.endpoints.clone().expect("endpoints");
     assert_eq!(e.enroll.url, format!("https://enroll.{DOMAIN}"));
     assert_eq!(e.station_api.url, format!("https://station-api.{DOMAIN}"));
     assert!(matches!(e.root, TrustAnchor::BuiltIn(_)));
     assert_eq!(c.state_dir, Path::new("/var/lib/coaxhub/stationd"));
     assert_eq!(c.runtime_dir, Path::new(PACKAGED_RUNTIME_DIR));
-    for profile in ["rtlsdr", "rtlsdr-v4"] {
-        let text = format!("[sdr]\nprofile = \"{profile}\"\n");
-        let c = Config::parse(&text, dir.path()).expect(profile);
-        assert_eq!(c.sdr.expect("sdr").profile.name, profile);
-    }
+    assert_eq!(c.receivers_dir, Path::new(RECEIVERS_DIR));
+    assert_eq!(c.backend, BackendConfig::Bundled);
+    assert_eq!(c.usb_devices, Path::new("/sys/bus/usb/devices"));
 }
 
-#[test]
-fn test_only_settings_are_refused() {
-    let dir = tempfile::tempdir().expect("tmp");
-    for f in ["c.pem", "k.pem", "ca.pem"] {
-        std::fs::write(dir.path().join(f), "x").expect("write");
-    }
-    let cases = [
-        (
-            "state_dir = \"/tmp/x\"\n[sdr]\nprofile = \"rtlsdr\"\n",
-            "state_dir",
-        ),
-        (
-            "[sdr]\nprofile = \"rtlsdr\"\n[endpoints]\nenroll_url = \"https://localhost:1\"\n\
-             station_api_url = \"https://localhost:2\"\nroot_ca = \"ca.pem\"\n",
-            "endpoints",
-        ),
-        (
-            "[credentials]\ngateway_url = \"https://localhost:1\"\ncert = \"c.pem\"\n\
-             key = \"k.pem\"\ngateway_ca = \"ca.pem\"\n[sdr]\nprofile = \"rtlsdr\"\n",
-            "credentials",
-        ),
-        ("[backend]\nkind = \"fake\"\n", "backend"),
-    ];
-    for (text, field) in cases {
-        match Config::parse(text, dir.path()) {
-            Err(ConfigError::DevelopmentOnly { field: f }) => assert_eq!(f, field),
-            other => panic!("{field}: {other:?}"),
-        }
-        // The same file is fine for a development build.
-        assert!(
-            Config::parse_as(text, dir.path(), Flavour::development()).is_ok(),
-            "{field}"
-        );
-    }
-    let e = Config::parse("[sdr]\nprofile = \"siggen\"\n", dir.path()).expect_err("dev only");
-    assert!(
-        e.to_string()
-            .contains("supported: rtlsdr, rtlsdr-hf, rtlsdr-v4"),
-        "{e}"
-    );
+fn run(args: &[&str]) -> std::process::Output {
+    Command::new(BIN).args(args).output().expect("run")
 }
 
-#[test]
-fn the_binary_refuses_them_too() {
-    let dir = tempfile::tempdir().expect("tmp");
-    let config = dir.path().join("stationd.toml");
-    std::fs::write(&config, "[backend]\nkind = \"fake\"\n").expect("write");
-    let out = Command::new(BIN)
-        .args(["check-config", "--config"])
-        .arg(&config)
-        .output()
-        .expect("run");
-    assert_eq!(out.status.code(), Some(2));
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        err.contains("packaged builds of stationd do not accept it"),
-        "{err}"
-    );
-
-    // An owner's config renders radiod's config from the templates.
-    std::fs::write(&config, "[sdr]\nprofile = \"rtlsdr\"\n").expect("write");
-    let templates = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/radiod-templates");
-    let out = Command::new(BIN)
-        .args(["backend-config", "--out", "-", "--templates"])
-        .arg(&templates)
-        .arg("--config")
-        .arg(&config)
-        .output()
-        .expect("run");
-    assert!(
-        out.status.success(),
-        "{}",
+fn text(out: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(String::from_utf8_lossy(&out.stdout).contains("frequency = 98000000"));
-    // Not enrolled: run exits 3.
-    let out = Command::new(BIN)
-        .args(["check-config", "--config"])
-        .arg(&config)
-        .output()
-        .expect("run");
-    assert!(out.status.success());
-    let text = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        text.contains("config OK (packaged build): not enrolled yet"),
-        "{text}"
-    );
+    )
+}
+
+#[test]
+fn the_binary_takes_no_settings_file() {
+    // No check-config, no --config: usage errors.
+    let out = run(&["check-config"]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    let out = run(&["--config", "/nonexistent", "status"]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    let out = run(&["status", "--config", "/nonexistent"]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    // backend-config refuses receiver 0, and one the applied set lacks.
+    for id in ["0", "99"] {
+        let out = run(&["backend-config", "--receiver", id, "--out", "-"]);
+        assert_eq!(out.status.code(), Some(2), "{id}: {}", text(&out));
+    }
+    // Doctor explains a station that isn't enrolled.
+    let out = run(&["doctor"]);
+    let t = text(&out).to_lowercase();
+    assert!(t.contains("packaged build: built-in settings"), "{t}");
+    assert!(t.contains("not enrolled"), "{t}");
 }

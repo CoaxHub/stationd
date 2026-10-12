@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! [`FakeBackend`]: a deterministic in-memory [`Backend`] for `stationd`
-//! tests and the conformance suite (`[backend] kind = "fake"`).
+//! [`FakeBackend`]: a deterministic in-memory [`Backend`] of one receiver,
+//! for `stationd`'s tests, the conformance suite and development stations
+//! (`[backend] kind = "fake"`: one per receiver, with simulated SDRs).
 //!
 //! It keeps the same bookkeeping a real backend must keep and answers every
 //! command with the result codes of station-protocol §4, but produces
@@ -16,7 +17,7 @@
 //!   moves the tunable range (center ± sample rate / 2, inside the hardware
 //!   range), closes channels that fall outside it with
 //!   `Event{CHANNEL_CLOSED}` and sends `Event{FRONTEND_CHANGED}`.
-//! - **Measurement channels** (station protocol 1.1): each poll returns a
+//! - **Measurement channels** (station protocol §4.1): each poll returns a
 //!   spectrum of a noise floor around −125 dB/Hz that drifts by ±3 dB over
 //!   the UTC day, with deterministic per-bin scatter and a few steady
 //!   carriers ([`FAKE_CARRIERS_HZ`]). Opens, retunes and closes are logged
@@ -39,8 +40,8 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    AudioStream, Backend, BackendError, ChannelId, ChannelOutput, EventStream, Health,
-    MeasurementChannel, MeasurementId, RowStream, Spectrum, SubscriptionId,
+    AudioStream, Backend, BackendCapabilities, BackendError, ChannelId, ChannelOutput, EventStream,
+    Health, MeasurementChannel, MeasurementId, RowStream, Spectrum, SubscriptionId,
 };
 
 /// The steady carriers in the fake measurement spectra, Hz: FT8 and CW on
@@ -126,9 +127,9 @@ pub struct FakeConfig {
     /// so the default claims `BACKEND_KIND_KA9Q_RADIO` with version
     /// `"fake-<crate version>"` (the hub rejects `UNSPECIFIED`).
     pub info: v1::BackendInfo,
-    /// The capabilities before `stationd` applies local caps. The tunable
-    /// range is recomputed on retune; everything else is returned as is.
-    pub capabilities: v1::Capabilities,
+    /// The capabilities. The tunable range is recomputed on retune;
+    /// everything else is returned as is.
+    pub capabilities: BackendCapabilities,
     /// The initial front-end state.
     pub frontend: v1::FrontendState,
     /// The initial health (see [`FakeBackend::set_health`]).
@@ -138,23 +139,55 @@ pub struct FakeConfig {
 impl Default for FakeConfig {
     /// An RTL-SDR-like receiver tuned to 7.1 MHz at 2.048 MS/s.
     fn default() -> Self {
-        let sample_rate_hz = 2_048_000;
-        let center = 7_100_000;
-        let hardware = v1::FrequencyRange {
-            start_hz: 500_000,
-            end_hz: 1_766_000_000,
-        };
+        Self::receiver(
+            7_100_000,
+            2_048_000,
+            v1::FrequencyRange {
+                start_hz: 500_000,
+                end_hz: 1_766_000_000,
+            },
+            "CoaxHub fake SDR",
+        )
+    }
+}
+
+impl FakeConfig {
+    /// An RTL-SDR-like receiver centred on `center_hz`, sampling at
+    /// `sample_rate_hz` (its passband is the centre ± half of it), which can
+    /// be retuned inside `hardware`; gain (0 to 49.6 dB) and hardware AGC are
+    /// modelled. `sdr_model` is what its capabilities report.
+    pub fn receiver(
+        center_hz: u64,
+        sample_rate_hz: u32,
+        hardware: v1::FrequencyRange,
+        sdr_model: &str,
+    ) -> Self {
+        let center = center_hz;
         let tunable = passband(center, sample_rate_hz, &hardware);
         Self {
             info: v1::BackendInfo {
                 kind: v1::BackendKind::Ka9qRadio as i32,
                 version: concat!("fake-", env!("CARGO_PKG_VERSION")).to_owned(),
             },
-            capabilities: v1::Capabilities {
-                tunable_range: Some(tunable),
-                hardware_range: Some(hardware),
-                sample_rate_hz,
-                max_channels: 16,
+            capabilities: BackendCapabilities {
+                receiver: v1::ReceiverCapabilities {
+                    receiver_id: 0,
+                    tunable_range: Some(tunable),
+                    hardware_range: Some(hardware),
+                    sample_rate_hz,
+                    max_channels: 16,
+                    frontend: Some(v1::FrontendControls {
+                        has_gain: true,
+                        min_gain_db: 0.0,
+                        max_gain_db: 49.6,
+                        has_hardware_agc: true,
+                        has_attenuator: false,
+                        max_attenuation_db: 0.0,
+                        antenna_ports: Vec::new(),
+                        can_retune: true,
+                    }),
+                    sdr_model: sdr_model.to_owned(),
+                },
                 modes: [
                     v1::Mode::Am,
                     v1::Mode::Fm,
@@ -172,23 +205,9 @@ impl Default for FakeConfig {
                     min_row_interval_ms: 50,
                     max_subscriptions: 4,
                 }),
-                frontend: Some(v1::FrontendControls {
-                    has_gain: true,
-                    min_gain_db: 0.0,
-                    max_gain_db: 49.6,
-                    has_hardware_agc: true,
-                    has_attenuator: false,
-                    max_attenuation_db: 0.0,
-                    antenna_ports: Vec::new(),
-                    can_retune: true,
-                }),
-                allowed_admin_ops: Vec::new(),
-                frontend_control_allowed: false,
-                sdr_model: "CoaxHub fake SDR".to_owned(),
-                // stationd fills this from its local policy (it measures, the backend doesn't decide).
-                measurements: None,
             },
             frontend: v1::FrontendState {
+                receiver_id: 0,
                 gain_db: 20.0,
                 hardware_agc: false,
                 attenuation_db: 0.0,
@@ -235,7 +254,7 @@ struct OpenChannel {
 
 #[derive(Debug)]
 struct State {
-    capabilities: v1::Capabilities,
+    capabilities: BackendCapabilities,
     frontend: v1::FrontendState,
     health: Health,
     channels: BTreeMap<ChannelId, OpenChannel>,
@@ -355,10 +374,10 @@ impl FakeBackend {
                 req.channel_id
             )));
         }
-        if state.channels.len() >= usize::try_from(caps.max_channels).unwrap_or(usize::MAX) {
+        let max_channels = caps.receiver.max_channels;
+        if state.channels.len() >= usize::try_from(max_channels).unwrap_or(usize::MAX) {
             return Err(BackendError::resource_exhausted(format!(
-                "all {} channels are in use",
-                caps.max_channels
+                "all {max_channels} channels are in use"
             )));
         }
         check_mode(caps, req.mode)?;
@@ -381,7 +400,7 @@ impl FakeBackend {
                 "low_cut_hz is above high_cut_hz",
             ));
         }
-        if !contains(caps.tunable_range.as_ref(), req.frequency_hz) {
+        if !contains(caps.receiver.tunable_range.as_ref(), req.frequency_hz) {
             return Err(BackendError::out_of_range(
                 "frequency outside the tunable range",
             ));
@@ -424,9 +443,8 @@ impl FakeBackend {
         if range.start_hz >= range.end_hz {
             return Err(BackendError::invalid_argument("range is empty or reversed"));
         }
-        if !contains(caps.tunable_range.as_ref(), range.start_hz)
-            || !contains(caps.tunable_range.as_ref(), range.end_hz)
-        {
+        let tunable = caps.receiver.tunable_range.as_ref();
+        if !contains(tunable, range.start_hz) || !contains(tunable, range.end_hz) {
             return Err(BackendError::out_of_range(
                 "range outside the tunable range",
             ));
@@ -452,6 +470,7 @@ impl FakeBackend {
         }
         Ok(v1::WaterfallSubscribed {
             subscription_id: req.subscription_id,
+            receiver_id: req.receiver_id,
             range: Some(range),
             bins: req.bins,
             row_interval_ms: req.row_interval_ms.max(limits_.min_row_interval_ms).max(1),
@@ -461,7 +480,7 @@ impl FakeBackend {
     }
 }
 
-fn check_mode(caps: &v1::Capabilities, mode: i32) -> Result<(), BackendError> {
+fn check_mode(caps: &BackendCapabilities, mode: i32) -> Result<(), BackendError> {
     if mode == v1::Mode::Unspecified as i32 {
         return Err(BackendError::invalid_argument("mode is unspecified"));
     }
@@ -477,7 +496,7 @@ impl Backend for FakeBackend {
         self.info.clone()
     }
 
-    async fn capabilities(&self) -> Result<v1::Capabilities, BackendError> {
+    async fn capabilities(&self) -> Result<BackendCapabilities, BackendError> {
         Ok(self.state().capabilities.clone())
     }
 
@@ -489,6 +508,7 @@ impl Backend for FakeBackend {
         let audio = Self::check_channel_request(&state, &req)?;
         let opened = v1::ChannelOpened {
             channel_id: req.channel_id,
+            receiver_id: req.receiver_id,
             frequency_hz: req.frequency_hz,
             mode: req.mode,
             low_cut_hz: req.low_cut_hz,
@@ -525,7 +545,7 @@ impl Backend for FakeBackend {
         };
         let mut next = channel.params;
         if let Some(hz) = req.frequency_hz {
-            if !contains(capabilities.tunable_range.as_ref(), hz) {
+            if !contains(capabilities.receiver.tunable_range.as_ref(), hz) {
                 return Err(BackendError::out_of_range(
                     "frequency outside the tunable range",
                 ));
@@ -571,8 +591,14 @@ impl Backend for FakeBackend {
         let mut closed = Vec::new();
         let (reply, retuned) = {
             let mut state = self.state();
-            let controls = state.capabilities.frontend.clone().unwrap_or_default();
+            let controls = state
+                .capabilities
+                .receiver
+                .frontend
+                .clone()
+                .unwrap_or_default();
             let mut next = state.frontend.clone();
+            next.receiver_id = req.receiver_id;
             if let Some(gain) = req.gain_db {
                 if !controls.has_gain {
                     return Err(BackendError::unsupported("gain is not adjustable"));
@@ -610,16 +636,17 @@ impl Backend for FakeBackend {
                 if !controls.can_retune {
                     return Err(BackendError::unsupported("the front end cannot retune"));
                 }
-                let hardware = state.capabilities.hardware_range.unwrap_or_default();
+                let receiver = &mut state.capabilities.receiver;
+                let hardware = receiver.hardware_range.unwrap_or_default();
                 if !contains(Some(&hardware), center) {
                     return Err(BackendError::out_of_range(
                         "center frequency outside the hardware range",
                     ));
                 }
-                let tunable = passband(center, state.capabilities.sample_rate_hz, &hardware);
+                let tunable = passband(center, receiver.sample_rate_hz, &hardware);
                 next.center_frequency_hz = center;
                 next.tunable_range = Some(tunable);
-                state.capabilities.tunable_range = Some(tunable);
+                receiver.tunable_range = Some(tunable);
                 retuned = true;
                 state.channels.retain(|id, ch| {
                     let keep = contains(Some(&tunable), ch.params.frequency_hz);
@@ -719,7 +746,10 @@ impl Backend for FakeBackend {
                 "bin count or resolution not allowed",
             ));
         }
-        if !contains(state.capabilities.tunable_range.as_ref(), channel.center_hz) {
+        if !contains(
+            state.capabilities.receiver.tunable_range.as_ref(),
+            channel.center_hz,
+        ) {
             return Err(BackendError::out_of_range(
                 "centre outside the tunable range",
             ));
@@ -756,7 +786,10 @@ impl Backend for FakeBackend {
         if state.measurement_failure {
             return Err(BackendError::backend("measurement channels are failing"));
         }
-        if !contains(state.capabilities.tunable_range.as_ref(), center_hz) {
+        if !contains(
+            state.capabilities.receiver.tunable_range.as_ref(),
+            center_hz,
+        ) {
             return Err(BackendError::out_of_range(
                 "centre outside the tunable range",
             ));
@@ -1034,6 +1067,7 @@ mod tests {
     fn open_req(channel_id: u32, frequency_hz: u64) -> v1::OpenChannel {
         v1::OpenChannel {
             channel_id,
+            receiver_id: 3,
             frequency_hz,
             mode: v1::Mode::Lsb as i32,
             low_cut_hz: -2800,
@@ -1049,6 +1083,7 @@ mod tests {
     ) -> v1::SubscribeWaterfall {
         v1::SubscribeWaterfall {
             subscription_id,
+            receiver_id: 3,
             range: Some(v1::FrequencyRange {
                 start_hz: 7_000_000,
                 end_hz: 7_200_000,
@@ -1161,10 +1196,21 @@ mod tests {
     async fn default_capabilities_pass_hub_validation() {
         let b = FakeBackend::default();
         let caps = b.capabilities().await.expect("caps");
-        let sanitized = sanitize_capabilities(&caps, 0).expect("valid capabilities");
+        // As one receiver of a station's capabilities.
+        let station = v1::Capabilities {
+            receivers: vec![v1::ReceiverCapabilities {
+                receiver_id: 1,
+                ..caps.receiver.clone()
+            }],
+            modes: caps.modes.clone(),
+            codecs: caps.codecs.clone(),
+            waterfall: caps.waterfall,
+            measurements: None,
+        };
+        let sanitized = sanitize_capabilities(&station, 0).expect("valid capabilities");
         assert!(sanitized.clamped.is_empty());
         assert_eq!(
-            caps.tunable_range,
+            caps.receiver.tunable_range,
             Some(v1::FrequencyRange {
                 start_hz: 6_076_000,
                 end_hz: 8_124_000
@@ -1279,7 +1325,7 @@ mod tests {
     #[tokio::test]
     async fn channel_capacity_is_enforced() {
         let mut config = FakeConfig::default();
-        config.capabilities.max_channels = 2;
+        config.capabilities.receiver.max_channels = 2;
         let b = FakeBackend::new(config);
         let _a = b.open_channel(open_req(1, 7_100_000)).await.expect("1");
         let _c = b.open_channel(open_req(2, 7_100_000)).await.expect("2");
@@ -1517,7 +1563,7 @@ mod tests {
         };
         assert_eq!(state.tunable_range, Some(tunable));
         assert_eq!(
-            b.capabilities().await.expect("caps").tunable_range,
+            b.capabilities().await.expect("caps").receiver.tunable_range,
             Some(tunable)
         );
         assert_eq!(b.channel_ids(), vec![1]);
@@ -1569,7 +1615,7 @@ mod tests {
         );
 
         let mut config = FakeConfig::default();
-        config.capabilities.frontend = Some(v1::FrontendControls {
+        config.capabilities.receiver.frontend = Some(v1::FrontendControls {
             has_attenuator: true,
             max_attenuation_db: 20.0,
             antenna_ports: vec!["A".into(), "B".into()],

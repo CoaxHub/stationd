@@ -5,23 +5,22 @@
 //! (`/run/coaxhub/stationd/` in packaged builds, the state directory in
 //! development builds) whenever the tunnel state or what the daemon
 //! observed changes, and every [`STATUS_WRITE_INTERVAL`]: tunnel state,
-//! backend state, last error, clock skew against the hub, and certificate
-//! renewal. It holds nothing secret. `stationd status` combines it with the
-//! enrollment state.
+//! each receiver's state, last error, clock skew against the hub, and
+//! certificate renewal. It holds nothing secret. `stationd status` combines
+//! it with the enrollment state and the applied receivers.
 
 use std::fmt::Write as _;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use station_backend::Backend;
-use station_proto::v1;
 use tokio::sync::watch;
 use tracing::warn;
 
 use crate::config::{Config, CredentialsMode};
 use crate::credentials::{self, CredentialsError};
 use crate::daemon::{ConnectionState, Observed, StopReason};
+use crate::receivers::{ReceiverSummary, Receivers, StoredSet};
 use crate::renew::RenewalStatus;
 use crate::state::{self, StateDir};
 
@@ -111,36 +110,25 @@ pub struct RuntimeStatus {
     pub connection_id: Option<String>,
     /// The next retry delay while in backoff, milliseconds.
     pub backoff_ms: Option<u64>,
-    /// The backend state (`running`, `degraded`, `down`, `unspecified`).
-    pub backend: String,
-    /// The backend version (e.g. the radiod commit).
+    /// The backend kind and version (e.g. the radiod commit).
     pub backend_version: String,
+    /// The receivers and their states.
+    pub receivers: Vec<ReceiverSummary>,
     /// Why the last attempt or session failed.
     pub last_error: Option<String>,
     /// Hub time minus local time at the last `Welcome`, milliseconds.
-    #[serde(default)]
     pub clock_skew_ms: Option<i64>,
     /// Certificate renewal.
-    #[serde(default)]
     pub renewal: RenewalStatus,
 }
 
-fn backend_state(state: v1::backend_health::State) -> &'static str {
-    match state {
-        v1::backend_health::State::Running => "running",
-        v1::backend_health::State::Degraded => "degraded",
-        v1::backend_health::State::Down => "down",
-        v1::backend_health::State::Unspecified => "unspecified",
-    }
-}
-
 impl RuntimeStatus {
-    /// The status for `state`, `observed`, `backend` and `last_error`.
+    /// The status for `state`, `observed`, `receivers` and `last_error`.
     pub fn new(
         station_id: &str,
         state: &ConnectionState,
         observed: &Observed,
-        backend: &dyn Backend,
+        receivers: &Receivers,
         last_error: Option<String>,
     ) -> Self {
         let (tunnel, connection_id, backoff_ms) = match state {
@@ -156,7 +144,6 @@ impl RuntimeStatus {
             ConnectionState::Stopped(StopReason::Shutdown) => (Tunnel::Stopped, None, None),
             ConnectionState::Stopped(StopReason::Revoked) => (Tunnel::Revoked, None, None),
         };
-        let health = backend.health();
         Self {
             pid: std::process::id(),
             updated_unix_s: unix_now(),
@@ -165,8 +152,8 @@ impl RuntimeStatus {
             tunnel,
             connection_id,
             backoff_ms,
-            backend: backend_state(health.backend.state()).to_owned(),
-            backend_version: backend.info().version,
+            backend_version: receivers.backend_info().version,
+            receivers: receivers.summaries(),
             last_error,
             clock_skew_ms: observed.clock_skew_ms,
             renewal: observed.renewal.clone(),
@@ -194,17 +181,20 @@ pub fn process_alive(pid: u32) -> bool {
 }
 
 /// Keeps `status.json` up to date until `state` reports `Stopped` or its
-/// sender goes away. Write failures are logged once.
+/// sender goes away; a receiver's event writes it again too. Write failures
+/// are logged once.
 pub async fn keep_written(
     path: std::path::PathBuf,
     station_id: String,
     mut state: watch::Receiver<ConnectionState>,
     mut observed: watch::Receiver<Observed>,
     last_error: watch::Receiver<Option<String>>,
-    backend: std::sync::Arc<dyn Backend>,
+    receivers: Receivers,
 ) {
     let mut warned = false;
     let mut observing = true;
+    let mut events = receivers.subscribe();
+    let mut listening = true;
     let mut tick = tokio::time::interval(STATUS_WRITE_INTERVAL);
     loop {
         let current = state.borrow_and_update().clone();
@@ -213,7 +203,7 @@ pub async fn keep_written(
             &station_id,
             &current,
             &seen,
-            backend.as_ref(),
+            &receivers,
             last_error.borrow().clone(),
         );
         match status.write(&path) {
@@ -230,6 +220,9 @@ pub async fn keep_written(
         tokio::select! {
             r = state.changed() => if r.is_err() { return },
             r = observed.changed(), if observing => observing = r.is_ok(),
+            r = events.recv(), if listening => {
+                listening = !matches!(r, Err(tokio::sync::broadcast::error::RecvError::Closed));
+            }
             _ = tick.tick() => {}
         }
     }
@@ -259,12 +252,49 @@ pub struct StatusReport {
     pub hub_id: Option<String>,
     /// The gateway.
     pub gateway_url: Option<String>,
-    /// The SDR profile.
-    pub sdr_profile: Option<&'static str>,
+    /// The applied receivers: their states from the running daemon, else
+    /// as `receivers.json` keeps them (state `applied`).
+    pub receivers: Vec<ReceiverSummary>,
+    /// Why `receivers.json` can't be used, when it can't.
+    pub receivers_problem: Option<String>,
     /// Whether a daemon is running (its `status.json` names a live process).
     pub daemon_running: bool,
     /// The daemon's last written status.
     pub daemon: Option<RuntimeStatus>,
+}
+
+/// The receivers of `set` as applied, while no daemon reports their state.
+pub fn applied(set: &StoredSet) -> Vec<ReceiverSummary> {
+    set.receivers
+        .iter()
+        .map(|r| ReceiverSummary {
+            receiver_id: r.receiver_id,
+            state: "applied".to_owned(),
+            detail: String::new(),
+            profile: r.profile.to_string(),
+            sdr_serial: r.sdr_serial.clone(),
+            center_frequency_hz: r.center_frequency_hz,
+            slot: r.slot,
+        })
+        .collect()
+}
+
+/// One receiver in one line: `running, rtlsdr-v4 at 14200000 Hz on SDR
+/// A0000011 (slot 3)`, with the detail of a failure.
+pub fn describe_receiver(r: &ReceiverSummary) -> String {
+    let sdr = if r.sdr_serial.is_empty() {
+        "the only RTL-SDR".to_owned()
+    } else {
+        format!("SDR {}", r.sdr_serial)
+    };
+    let mut text = format!(
+        "{}, {} at {} Hz on {sdr} (slot {})",
+        r.state, r.profile, r.center_frequency_hz, r.slot
+    );
+    if !r.detail.is_empty() {
+        let _ = write!(text, ": {:?}", r.detail);
+    }
+    text
 }
 
 /// Builds the status report for `config` at `now`.
@@ -275,6 +305,13 @@ pub fn report(config: &Config, now: i64) -> StatusReport {
     };
     let daemon = RuntimeStatus::read(&config.status_path());
     let daemon_running = daemon.as_ref().is_some_and(|d| process_alive(d.pid));
+    let (receivers, receivers_problem) = match (&daemon, daemon_running) {
+        (Some(d), true) => (d.receivers.clone(), None),
+        _ => match StoredSet::load(&config.receivers_path()) {
+            Ok(set) => (applied(&set), None),
+            Err(e) => (Vec::new(), Some(e.to_string())),
+        },
+    };
     let mut r = StatusReport {
         credentials: mode,
         enrolled: false,
@@ -286,7 +323,8 @@ pub fn report(config: &Config, now: i64) -> StatusReport {
         cert_renew_at_unix_s: None,
         hub_id: None,
         gateway_url: None,
-        sdr_profile: config.sdr.map(|s| s.profile.name),
+        receivers,
+        receivers_problem,
         daemon_running,
         daemon,
     };
@@ -359,8 +397,20 @@ impl StatusReport {
         if let Some(g) = &self.gateway_url {
             line("gateway", g);
         }
-        if let Some(p) = self.sdr_profile {
-            line("sdr profile", p);
+        match (&self.receivers_problem, self.receivers.is_empty()) {
+            (Some(p), _) => line("receivers", &format!("unusable: {p}")),
+            (None, true) => line(
+                "receivers",
+                "none applied yet (set them up on the station's page in the web app)",
+            ),
+            (None, false) => {
+                for r in &self.receivers {
+                    line(
+                        &format!("receiver {}", r.receiver_id),
+                        &describe_receiver(r),
+                    );
+                }
+            }
         }
         match (&self.daemon, self.daemon_running) {
             (None, _) => line("daemon", "no status (not running?)"),
@@ -388,7 +438,7 @@ impl StatusReport {
                     line("daemon", &format!("not running (last status {as_of})"));
                 }
                 line("tunnel", &tunnel);
-                line("backend", &format!("{} ({})", d.backend, d.backend_version));
+                line("backend", &d.backend_version);
                 if let Some(e) = &d.last_error {
                     line("last error", &format!("{e:?}"));
                 }
@@ -427,7 +477,7 @@ pub fn describe_skew(skew_ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use station_backend::FakeBackend;
+    use station_proto::v1;
 
     #[test]
     fn utc_and_durations() {
@@ -447,7 +497,15 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let path = tmp.path().join("status.json");
         assert_eq!(RuntimeStatus::read(&path), None);
-        let backend = FakeBackend::default();
+        let receivers = Receivers::new(
+            crate::receivers::ReceiverPaths {
+                store: tmp.path().join("receivers.json"),
+                usb_devices: tmp.path().join("usb"),
+                packaged: false,
+            },
+            crate::receivers::Driver::fake(),
+            crate::receivers::ReceiverOptions::default(),
+        );
         let states = [
             (
                 ConnectionState::Connecting { attempt: 1 },
@@ -481,10 +539,12 @@ mod tests {
             ..Observed::default()
         };
         for (state, tunnel) in states {
-            let s = RuntimeStatus::new("id", &state, &observed, &backend, Some("boom".into()));
+            let s = RuntimeStatus::new("id", &state, &observed, &receivers, Some("boom".into()));
             assert_eq!(s.tunnel, tunnel);
             assert_eq!(s.gateway_url, "https://gw");
             assert_eq!(s.clock_skew_ms, Some(-1500));
+            assert!(s.backend_version.starts_with("fake-"));
+            assert!(s.receivers.is_empty());
             s.write(&path).expect("write");
             assert_eq!(RuntimeStatus::read(&path), Some(s));
         }
@@ -495,20 +555,38 @@ mod tests {
                 "id",
                 &ConnectionState::Connecting { attempt: 1 },
                 &Observed::default(),
-                &backend,
+                &receivers,
                 None
             )
             .write(&tmp.path().join("no/dir/status.json"))
             .is_err()
         );
-        for s in [
-            v1::backend_health::State::Running,
-            v1::backend_health::State::Degraded,
-            v1::backend_health::State::Down,
-            v1::backend_health::State::Unspecified,
-        ] {
-            assert!(!backend_state(s).is_empty());
-        }
+    }
+
+    #[test]
+    fn receivers_in_words() {
+        let mut r = ReceiverSummary {
+            receiver_id: 11,
+            state: "running".into(),
+            detail: String::new(),
+            profile: "rtlsdr-v4".into(),
+            sdr_serial: "A0000011".into(),
+            center_frequency_hz: 14_200_000,
+            slot: 3,
+        };
+        assert_eq!(
+            describe_receiver(&r),
+            "running, rtlsdr-v4 at 14200000 Hz on SDR A0000011 (slot 3)"
+        );
+        r.state = "no_device".into();
+        r.detail = "no SDR with serial A0000011 is plugged in".into();
+        r.sdr_serial = String::new();
+        let text = describe_receiver(&r);
+        assert!(text.contains("on the only RTL-SDR"), "{text}");
+        assert!(
+            text.ends_with(": \"no SDR with serial A0000011 is plugged in\""),
+            "{text}"
+        );
     }
 
     #[test]
@@ -524,22 +602,6 @@ mod tests {
     }
 
     #[test]
-    fn old_status_files_still_parse() {
-        let tmp = tempfile::tempdir().expect("tmp");
-        let path = tmp.path().join("status.json");
-        std::fs::write(
-            &path,
-            r#"{"pid":1,"updated_unix_s":0,"station_id":"s","gateway_url":"g","tunnel":"connected",
-               "connection_id":null,"backoff_ms":null,"backend":"running","backend_version":"v",
-               "last_error":null}"#,
-        )
-        .expect("write");
-        let s = RuntimeStatus::read(&path).expect("parses");
-        assert_eq!(s.clock_skew_ms, None);
-        assert_eq!(s.renewal, RenewalStatus::default());
-    }
-
-    #[test]
     fn render_every_tunnel_state() {
         let base = StatusReport {
             credentials: "enrolled",
@@ -552,7 +614,8 @@ mod tests {
             cert_renew_at_unix_s: Some(1_789_000_000),
             hub_id: Some("sa1".into()),
             gateway_url: Some("https://gw".into()),
-            sdr_profile: Some("rtlsdr"),
+            receivers: Vec::new(),
+            receivers_problem: None,
             daemon_running: false,
             daemon: None,
         };
@@ -560,6 +623,29 @@ mod tests {
         assert!(text.contains("enrolled     yes\n"), "{text}");
         assert!(text.contains("in 20d 0h"), "{text}");
         assert!(text.contains("not running?"), "{text}");
+        assert!(text.contains("receivers    none applied yet"), "{text}");
+        let broken = StatusReport {
+            receivers_problem: Some("invalid receivers.json".into()),
+            ..base.clone()
+        };
+        assert!(broken.render().contains("receivers    unusable: invalid"));
+        let one = StatusReport {
+            receivers: vec![ReceiverSummary {
+                receiver_id: 2,
+                state: "applied".into(),
+                detail: String::new(),
+                profile: "rtlsdr".into(),
+                sdr_serial: "S".into(),
+                center_frequency_hz: 98_000_000,
+                slot: 0,
+            }],
+            ..base.clone()
+        };
+        let text = one.render();
+        assert!(
+            text.contains("receiver 2   applied, rtlsdr at 98000000 Hz"),
+            "{text}"
+        );
         let expired = StatusReport {
             cert_expires_in_s: Some(-60),
             credentials: "static",
@@ -591,8 +677,8 @@ mod tests {
                     tunnel,
                     connection_id: Some("c9".into()),
                     backoff_ms: Some(10),
-                    backend: "running".into(),
                     backend_version: "fake-1".into(),
+                    receivers: Vec::new(),
                     last_error: Some("x\ny".into()),
                     clock_skew_ms: Some(45_000),
                     renewal: RenewalStatus {

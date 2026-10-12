@@ -1,16 +1,17 @@
 # SPDX-License-Identifier: GPL-3.0-only
 #
-# stationd: the CoaxHub station daemon. It holds the
-# station key, dials out to the home hub and drives the bundled radiod. It
-# has no device access and no capabilities.
+# stationd: the CoaxHub station daemon. It holds the station key, dials out to
+# the home hub and drives the receivers' radiod instances: it starts and stops
+# coaxhub-radiod@<receiver_id>.service over the system bus, which the polkit
+# rule allows. It has no device access and no capabilities.
 
 [Unit]
 Description=CoaxHub station daemon
 Documentation=https://github.com/CoaxHub/stationd/blob/main/docs/packaging.md
 # A Pi has no clock battery: TLS and enrollment need NTP time first.
 # The package enables systemd-time-wait-sync.
-Wants=coaxhub-radiod.service network-online.target time-sync.target systemd-time-wait-sync.service
-After=coaxhub-radiod.service network-online.target time-sync.target systemd-time-wait-sync.service
+Wants=network-online.target time-sync.target systemd-time-wait-sync.service
+After=network-online.target time-sync.target systemd-time-wait-sync.service
 
 [Service]
 Type=simple
@@ -34,6 +35,9 @@ ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
 ReadWritePaths=/var/lib/coaxhub
+# AF_UNIX: the system bus socket (/run/dbus/system_bus_socket), through which
+# stationd starts the receivers' units. PrivateTmp, PrivateDevices and
+# ProtectSystem leave /run readable, so the socket is reachable.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 ProtectKernelTunables=yes
 ProtectKernelModules=yes

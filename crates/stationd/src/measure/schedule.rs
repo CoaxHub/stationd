@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! The duty, the idle schedule and the pause rules (the measurement design §4, §4.1).
-//! Pure functions over Unix milliseconds.
+//! The duty, the idle schedule and the pause rules (station protocol §4.1),
+//! each per receiver. Pure functions over Unix milliseconds.
 //!
-//! - **Continuous** while the station has any listener channel or waterfall
+//! - **Continuous** while the receiver has any listener channel or waterfall
 //!   subscription open (the hub's lingering ones included): every minute is
 //!   measured. **Idle** otherwise: only the measuring minutes (hh:00, hh:05,
 //!   …). The duty is decided at each UTC minute boundary and changes at most
 //!   once a minute.
 //! - **Paused** (nothing measured, nothing reported) while the 1-minute load
-//!   average is at least 0.75 × the CPU count, the outbound queue dropped
-//!   audio or waterfall since the last check (a minute ago), or the backend
-//!   reports a degraded state; it resumes after 5 minutes without any of them.
+//!   average is at least 0.75 × the CPU count or the outbound queue dropped
+//!   audio or waterfall since the last check (a minute ago), which pause
+//!   every receiver, or while the receiver's own backend reports a degraded
+//!   state, which pauses it alone; it resumes after 5 minutes without any of
+//!   them.
 
 use station_proto::limits;
 use station_proto::v1::MeasurementDuty;

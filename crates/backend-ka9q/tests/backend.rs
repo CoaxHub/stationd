@@ -53,6 +53,7 @@ fn opus(sample_rate_hz: u32) -> v1::AudioParams {
 fn open_req(channel_id: u32, frequency_hz: u64, mode: v1::Mode) -> v1::OpenChannel {
     v1::OpenChannel {
         channel_id,
+        receiver_id: 1,
         frequency_hz,
         mode: mode as i32,
         low_cut_hz: -3000,
@@ -92,17 +93,27 @@ async fn capabilities_and_health_from_radiod_status() {
     assert!(h.frontend.is_none());
 
     let caps = backend.capabilities().await.unwrap();
-    let sanitized = sanitize_capabilities(&caps, 0).unwrap();
+    let station = v1::Capabilities {
+        receivers: vec![v1::ReceiverCapabilities {
+            receiver_id: 1,
+            ..caps.receiver.clone()
+        }],
+        modes: caps.modes.clone(),
+        codecs: caps.codecs.clone(),
+        waterfall: caps.waterfall,
+        measurements: None,
+    };
+    let sanitized = sanitize_capabilities(&station, 0).unwrap();
     assert!(sanitized.clamped.is_empty(), "{:?}", sanitized.clamped);
     assert_eq!(
-        caps.tunable_range,
+        caps.receiver.tunable_range,
         Some(v1::FrequencyRange {
             start_hz: 0,
             end_hz: 12_000_000
         })
     );
-    assert_eq!(caps.sample_rate_hz, 24_000_000);
-    assert_eq!(caps.sdr_model, "fake radiod");
+    assert_eq!(caps.receiver.sample_rate_hz, 24_000_000);
+    assert_eq!(caps.receiver.sdr_model, "fake radiod");
     assert_eq!(caps.modes.len(), 6);
     assert_eq!(caps.codecs, vec![v1::AudioCodec::Opus as i32]);
 
@@ -144,6 +155,7 @@ async fn audio_channel_lifecycle() {
         opened,
         v1::ChannelOpened {
             channel_id: 1,
+            receiver_id: 1,
             frequency_hz: 10_000_000,
             mode: v1::Mode::Am as i32,
             low_cut_hz: -3000,
@@ -415,6 +427,7 @@ async fn waterfall_rows_are_decodable_and_paced() {
     };
     let req = v1::SubscribeWaterfall {
         subscription_id: 5,
+        receiver_id: 1,
         range: Some(range),
         bins: 256,
         row_interval_ms: 100,
@@ -491,6 +504,7 @@ async fn waterfall_request_checks() {
     let (_fake, backend) = setup().await;
     let base = v1::SubscribeWaterfall {
         subscription_id: 1,
+        receiver_id: 1,
         range: Some(v1::FrequencyRange {
             start_hz: 9_000_000,
             end_hz: 11_000_000,
@@ -750,7 +764,7 @@ async fn measurement_channels_hop_poll_and_close() {
     let (fake, backend) = setup().await;
     assert!(backend.can_measure());
     let caps = backend.capabilities().await.unwrap();
-    let tunable = caps.tunable_range.unwrap();
+    let tunable = caps.receiver.tunable_range.unwrap();
     let mid = tunable.start_hz / 2 + tunable.end_hz / 2;
     let ch = MeasurementChannel {
         center_hz: mid,

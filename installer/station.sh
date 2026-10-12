@@ -8,32 +8,31 @@
 # What it does, in order:
 #   1. checks that it runs as root on Debian or Raspberry Pi OS (bookworm or
 #      trixie), on amd64 or arm64;
-#   2. looks for an RTL-SDR on USB and asks which SDR profile to use:
-#      VHF/UHF (rtlsdr) or HF by direct sampling (rtlsdr-hf); an RTL-SDR
-#      Blog V4 gets its own, HF and VHF/UHF (rtlsdr-v4), without asking;
+#   2. lists the SDRs it sees on USB, as information: it asks nothing about
+#      them. The owner sets up each receiver (its SDR, model and band) in the
+#      web app, from the list the station reports;
 #   3. downloads the CoaxHub APT repository key, checks its fingerprint
 #      against the one pinned below, and adds the repository;
-#   4. installs (or upgrades) the coaxhub-stationd package and writes the
-#      SDR profile into /etc/coaxhub/stationd.toml;
+#   4. installs (or upgrades) the coaxhub-stationd package;
 #   5. waits for the clock to be synchronised by NTP (TLS needs it);
 #   6. enrolls the station: stationd asks for the enrollment token on the
 #      terminal, with the input hidden. The token is never a command-line
 #      argument, so it stays out of sudo's log, the process list and your
 #      shell history;
-#   7. enables and starts the two services and shows `stationd status`.
+#   7. enables and starts stationd.service and shows `stationd status`.
+#      stationd starts the receivers' radiod services itself.
 #
-# Running it again upgrades the package and keeps the enrollment.
+# Running it again upgrades the package and keeps the enrollment and the
+# receivers.
 #
 # Options:
-#   --profile rtlsdr|rtlsdr-hf|rtlsdr-v4
-#                               the SDR profile, without asking
 #   --token-file PATH           read the enrollment token from PATH
 #                               (scripted installs) instead of the terminal
 #   --reenroll                  enroll again even if already enrolled
-#   --no-start                  do not enable or start the services
+#   --no-start                  do not enable or start stationd
 #   --skip-time-sync            do not wait for NTP (containers without systemd)
-#   -y, --yes                   continue without an SDR, and take the default
-#                               profile when there is no terminal to ask on
+#   -y, --yes                   take the default of any confirmation the
+#                               installer asks (scripted installs)
 #   -h, --help                  this help
 
 set -eu
@@ -44,24 +43,18 @@ KEY_FINGERPRINT='@COAXHUB_KEY_FINGERPRINT@'
 
 KEYRING=/usr/share/keyrings/coaxhub-archive-keyring.gpg
 SOURCES=/etc/apt/sources.list.d/coaxhub.sources
-CONFIG=/etc/coaxhub/stationd.toml
 PACKAGE=coaxhub-stationd
 # RTL2832U dongles (vendor:product).
 RTLSDR_IDS="0bda:2838 0bda:2832"
-# The USB product string of an RTL-SDR Blog V4 (same IDs as the others).
-BLOG_V4_PRODUCT="Blog V4"
 # Where USB devices are listed (overridable for tests only).
 USB_DEVICES="${COAXHUB_INSTALL_USB_DEVICES:-/sys/bus/usb/devices}"
 TIME_SYNC_TIMEOUT=120
 TOKEN_ATTEMPTS=3
 
-profile=""
-sdr_product=""
 token_file=""
 reenroll=false
 start=true
 wait_time_sync=true
-assume_yes=false
 tmp=""
 tty_state=""
 
@@ -73,23 +66,18 @@ die() {
 }
 usage() {
 	cat <<-'USAGE'
-		CoaxHub station installer: installs coaxhub-stationd, sets the SDR profile,
-		enrolls the station and starts it.
+		CoaxHub station installer: installs coaxhub-stationd, enrolls the station
+		and starts it. You set up its receivers in the CoaxHub web app.
 
 		  curl -fsSL https://get.<domain>/station | sudo sh
 		  curl -fsSL https://get.<domain>/station | sudo sh -s -- [options]
 
 		Options:
-		  --profile rtlsdr|rtlsdr-hf|rtlsdr-v4
-		                              the SDR profile, without asking: rtlsdr (VHF/UHF),
-		                              rtlsdr-hf (HF by direct sampling, e.g. Blog V3),
-		                              rtlsdr-v4 (RTL-SDR Blog V4: HF and VHF/UHF)
 		  --token-file PATH           read the enrollment token from PATH
 		  --reenroll                  enroll again even if already enrolled
-		  --no-start                  do not enable or start the services
+		  --no-start                  do not enable or start stationd
 		  --skip-time-sync            do not wait for NTP (containers without systemd)
-		  -y, --yes                   continue without an SDR; default profile if no terminal
-		                              (an RTL-SDR Blog V4 always gets rtlsdr-v4)
+		  -y, --yes                   take the default of any confirmation
 	USAGE
 }
 
@@ -104,11 +92,6 @@ trap 'exit 130' INT TERM
 # ---------------------------------------------------------------- arguments
 while [ $# -gt 0 ]; do
 	case "$1" in
-	--profile)
-		[ $# -ge 2 ] || die "--profile needs a value"
-		profile="$2"
-		shift 2
-		;;
 	--token-file)
 		[ $# -ge 2 ] || die "--token-file needs a path"
 		token_file="$2"
@@ -117,7 +100,7 @@ while [ $# -gt 0 ]; do
 	--reenroll) reenroll=true && shift ;;
 	--no-start) start=false && shift ;;
 	--skip-time-sync) wait_time_sync=false && shift ;;
-	-y | --yes) assume_yes=true && shift ;;
+	-y | --yes) shift ;; # no step asks a yes/no question; accepted for scripts that pass it
 	-h | --help)
 		usage
 		exit 0
@@ -127,26 +110,13 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
-case "$profile" in
-"" | rtlsdr | rtlsdr-hf | rtlsdr-v4) ;;
-*) die "--profile must be rtlsdr (VHF/UHF), rtlsdr-hf (HF by direct sampling) or rtlsdr-v4 (RTL-SDR Blog V4)" ;;
-esac
 if [ -n "$token_file" ] && [ ! -r "$token_file" ]; then
 	die "cannot read the token file $token_file"
 fi
 
 # ---------------------------------------------------------------- terminal
-# stdin is this script when piped from curl, so questions go to /dev/tty.
+# stdin is this script when piped from curl, so the token prompt uses /dev/tty.
 have_tty() { (: </dev/tty) 2>/dev/null; }
-
-# ask QUESTION DEFAULT: prints the answer (DEFAULT on an empty line).
-ask() {
-	printf '%s ' "$1" >/dev/tty
-	answer=""
-	IFS= read -r answer </dev/tty || answer=""
-	[ -n "$answer" ] || answer="$2"
-	printf '%s' "$answer"
-}
 
 # ---------------------------------------------------------------- checks
 check_placeholders() {
@@ -187,7 +157,8 @@ check_system() {
 }
 
 # ---------------------------------------------------------------- SDR
-detect_sdr() {
+list_sdrs() {
+	found=0
 	for dir in "$USB_DEVICES"/*; do
 		if [ ! -r "$dir/idVendor" ] || [ ! -r "$dir/idProduct" ]; then
 			continue
@@ -195,55 +166,16 @@ detect_sdr() {
 		id="$(cat "$dir/idVendor"):$(cat "$dir/idProduct")"
 		for want in $RTLSDR_IDS; do
 			if [ "$id" = "$want" ]; then
-				sdr_product=$(cat "$dir/product" 2>/dev/null || true)
-				say "Found an RTL-SDR ($id${sdr_product:+, $sdr_product})."
-				return 0
+				product=$(cat "$dir/product" 2>/dev/null || true)
+				say "Found an RTL-SDR ($id${product:+, $product})."
+				found=$((found + 1))
 			fi
 		done
 	done
-	return 1
-}
-
-choose_profile() {
-	if ! detect_sdr; then
-		say "No RTL-SDR found on USB (looked for $RTLSDR_IDS)."
-		say "The station needs one to receive; you can plug it in later."
-		if [ "$assume_yes" = false ]; then
-			have_tty || die "no SDR found; plug it in, or pass --yes to install anyway"
-			case "$(ask 'Continue anyway? [y/N]' n)" in
-			y | Y | yes | YES) ;;
-			*) die "stopped: plug in the SDR and run the installer again" ;;
-			esac
-		fi
+	if [ "$found" -eq 0 ]; then
+		say "No RTL-SDR found on USB (looked for $RTLSDR_IDS); you can plug it in later."
 	fi
-	if [ -n "$profile" ]; then
-		if [ "$profile" = rtlsdr-hf ] && [ "$sdr_product" = "$BLOG_V4_PRODUCT" ]; then
-			warn "direct sampling (rtlsdr-hf) receives nothing on an RTL-SDR Blog V4; its profile is rtlsdr-v4"
-		fi
-		return 0
-	fi
-	# An RTL-SDR Blog V4 receives HF through its built-in upconverter, which
-	# the package's librtlsdr switches in: its own profile covers HF and
-	# VHF/UHF, so there is nothing to ask (the centre frequency picks the band).
-	if [ "$sdr_product" = "$BLOG_V4_PRODUCT" ]; then
-		profile=rtlsdr-v4
-		say "Using the rtlsdr-v4 profile (RTL-SDR Blog V4: HF and VHF/UHF, 0.5 MHz to 1.7 GHz)."
-		return 0
-	fi
-	if [ "$assume_yes" = true ] || ! have_tty; then
-		[ "$assume_yes" = true ] || die "no terminal to ask on; pass --profile rtlsdr or --profile rtlsdr-hf"
-		profile=rtlsdr
-		say "Using the rtlsdr profile (VHF/UHF)."
-		return 0
-	fi
-	say "Which bands will this receiver cover?"
-	say "  1) VHF/UHF, 24 MHz to 1.7 GHz (profile rtlsdr)"
-	say "  2) HF by direct sampling, 0.5 to 28.8 MHz (profile rtlsdr-hf; e.g. RTL-SDR Blog V3)"
-	case "$(ask 'Choose [1]:' 1)" in
-	1 | rtlsdr) profile=rtlsdr ;;
-	2 | rtlsdr-hf) profile=rtlsdr-hf ;;
-	*) die "please answer 1 or 2" ;;
-	esac
+	say "You choose each receiver's SDR and band in the CoaxHub web app, after the station is enrolled."
 }
 
 # ---------------------------------------------------------------- repository
@@ -302,10 +234,8 @@ add_repository() {
 install_package() {
 	say "Installing $PACKAGE."
 	apt-get update -q >/dev/null || die "apt-get update failed"
-	# --force-confold keeps an owner's edited stationd.toml on upgrades.
-	DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
-		-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
-		"$PACKAGE" || die "installing $PACKAGE failed"
+	DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$PACKAGE" ||
+		die "installing $PACKAGE failed"
 	command -v stationd >/dev/null 2>&1 || die "$PACKAGE is installed but stationd is missing"
 }
 
@@ -318,32 +248,6 @@ release_dvb_driver() {
 	else
 		warn "the kernel's DVB driver (dvb_usb_rtl28xxu) holds the RTL-SDR; reboot to release it"
 	fi
-}
-
-# ---------------------------------------------------------------- config
-# Sets [sdr] profile in stationd.toml, keeping everything else.
-write_profile() {
-	[ -f "$CONFIG" ] || die "$CONFIG is missing; reinstall $PACKAGE"
-	awk -v profile="$profile" '
-		function emit() { print "profile = \"" profile "\""; done = 1 }
-		/^[ \t]*\[/ {
-			if (in_sdr && !done) emit()
-			in_sdr = ($0 ~ /^[ \t]*\[sdr\][ \t]*(#.*)?$/)
-			seen = seen || in_sdr
-		}
-		in_sdr && /^[ \t]*profile[ \t]*=/ {
-			if (!done) emit()
-			next
-		}
-		{ print }
-		END {
-			if (in_sdr && !done) emit()
-			if (!seen) { print ""; print "[sdr]"; emit() }
-		}
-	' "$CONFIG" >"$tmp/stationd.toml"
-	cat "$tmp/stationd.toml" >"$CONFIG"
-	say "SDR profile: $profile ($CONFIG)."
-	stationd check-config >/dev/null || die "$CONFIG is not valid; see the message above"
 }
 
 # ---------------------------------------------------------------- clock
@@ -419,16 +323,18 @@ enroll() {
 }
 
 # ---------------------------------------------------------------- services
+# Only stationd is enabled: it starts the receivers' radiod instances
+# (coaxhub-radiod@<receiver_id>.service) itself.
 start_services() {
 	if [ "$start" = false ]; then
-		say "Not starting the services (--no-start). Start them with:"
-		say "  sudo systemctl enable --now coaxhub-radiod.service stationd.service"
+		say "Not starting stationd (--no-start). Start it with:"
+		say "  sudo systemctl enable --now stationd.service"
 		return 0
 	fi
-	systemctl enable --quiet coaxhub-radiod.service stationd.service
-	# restart: a changed profile needs a fresh radiod config.
-	if ! systemctl restart coaxhub-radiod.service stationd.service; then
-		warn "a service did not start; see: journalctl -u coaxhub-radiod -u stationd"
+	systemctl enable --quiet stationd.service
+	# restart: a station that is already running picks up a new package.
+	if ! systemctl restart stationd.service; then
+		warn "stationd did not start; see: journalctl -u stationd"
 	fi
 	sleep 3
 }
@@ -439,13 +345,12 @@ main() {
 	exec </dev/null
 	check_placeholders
 	check_system
-	choose_profile
+	list_sdrs
 	tmp=$(mktemp -d)
 	install_prerequisites
 	add_repository
 	install_package
 	release_dvb_driver
-	write_profile
 	wait_for_time_sync
 	enroll
 	start_services

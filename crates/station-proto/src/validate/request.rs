@@ -49,10 +49,12 @@ impl RequestRejection {
 /// `request_id` 0, a missing command-specific sub-message or `UNSPECIFIED`
 /// where a value is required → [`RequestRejection::InvalidArgument`].
 ///
-/// `StartMeasurements` and `StopMeasurements` on a 1.0 session are
-/// [`RequestRejection::Unsupported`]; a plan with `measurement_id` 0 is
-/// invalid. Range and capacity checks (tunable range, `max_channels`, the
-/// plan's bands, ...) are the station's own business and not done here.
+/// A plan with `measurement_id` 0 is invalid. In `ConfigureReceivers`, every
+/// `model` and `profile` must be a known, specified value; the set's rules
+/// against the hardware are [`super::check_receiver_set`]. Range, receiver
+/// and capacity checks (a running receiver, its tunable range,
+/// `max_channels`, the plan's bands, ...) are the station's own business and
+/// not done here.
 pub fn check_request(req: &v1::Request, minor: u32) -> Result<CommandKind, RequestRejection> {
     use v1::request::Command;
     let command = req.command.as_ref().ok_or(RequestRejection::Unsupported {
@@ -89,13 +91,6 @@ pub fn check_request(req: &v1::Request, minor: u32) -> Result<CommandKind, Reque
             }
         }
         Command::AdminOp(a) => required::<v1::AdminOpKind>("admin_op.kind", a.kind, minor)?,
-        Command::StartMeasurements(_) | Command::StopMeasurements(_)
-            if minor < crate::limits::MEASUREMENTS_MINOR =>
-        {
-            return Err(RequestRejection::Unsupported {
-                field: "request.command",
-            });
-        }
         Command::StartMeasurements(m) => {
             if m.measurement_id == 0 {
                 return Err(RequestRejection::InvalidArgument {
@@ -103,8 +98,19 @@ pub fn check_request(req: &v1::Request, minor: u32) -> Result<CommandKind, Reque
                 });
             }
         }
+        Command::ConfigureReceivers(c) => {
+            for rx in &c.receivers {
+                required::<v1::SdrModel>("configure_receivers.receivers.model", rx.model, minor)?;
+                required::<v1::SdrProfile>(
+                    "configure_receivers.receivers.profile",
+                    rx.profile,
+                    minor,
+                )?;
+            }
+        }
         Command::StopMeasurements(_)
         | Command::GetCapabilities(_)
+        | Command::GetHardware(_)
         | Command::CloseChannel(_)
         | Command::SetFrontend(_)
         | Command::UnsubscribeWaterfall(_)
@@ -116,9 +122,9 @@ pub fn check_request(req: &v1::Request, minor: u32) -> Result<CommandKind, Reque
 fn required<E: TryFrom<i32>>(
     field: &'static str,
     value: i32,
-    minor: u32,
+    _minor: u32,
 ) -> Result<(), RequestRejection> {
-    if !enum_known::<E>(field, value, minor) {
+    if !enum_known::<E>(value) {
         return Err(RequestRejection::Unsupported { field });
     }
     if value == 0 {
@@ -188,8 +194,72 @@ mod tests {
             Ok(CommandKind::SubscribeWaterfall)
         );
         assert_eq!(
-            check_request(&req(Command::AdminOp(v1::AdminOp { kind: 3 })), 0),
+            check_request(
+                &req(Command::AdminOp(v1::AdminOp {
+                    kind: 2,
+                    receiver_id: Some(3)
+                })),
+                0
+            ),
             Ok(CommandKind::AdminOp)
+        );
+        assert_eq!(
+            check_request(&req(Command::GetHardware(v1::GetHardware {})), 0),
+            Ok(CommandKind::GetHardware)
+        );
+        assert_eq!(
+            check_request(&req(configure(1, 2)), 0),
+            Ok(CommandKind::ConfigureReceivers)
+        );
+        // An empty set stops every receiver.
+        assert_eq!(
+            check_request(
+                &req(Command::ConfigureReceivers(
+                    v1::ConfigureReceivers::default()
+                )),
+                0
+            ),
+            Ok(CommandKind::ConfigureReceivers)
+        );
+    }
+
+    fn configure(model: i32, profile: i32) -> Command {
+        Command::ConfigureReceivers(v1::ConfigureReceivers {
+            receivers: vec![v1::ReceiverConfig {
+                receiver_id: 1,
+                model,
+                profile,
+                center_frequency_hz: 7_100_000,
+                ..Default::default()
+            }],
+        })
+    }
+
+    #[test]
+    fn receiver_set_enums() {
+        assert_eq!(
+            check_request(&req(configure(9, 2)), 0),
+            Err(RequestRejection::Unsupported {
+                field: "configure_receivers.receivers.model"
+            })
+        );
+        assert_eq!(
+            check_request(&req(configure(1, 9)), 0),
+            Err(RequestRejection::Unsupported {
+                field: "configure_receivers.receivers.profile"
+            })
+        );
+        assert_eq!(
+            check_request(&req(configure(0, 2)), 0),
+            Err(RequestRejection::InvalidArgument {
+                field: "configure_receivers.receivers.model"
+            })
+        );
+        assert_eq!(
+            check_request(&req(configure(1, 0)), 0),
+            Err(RequestRejection::InvalidArgument {
+                field: "configure_receivers.receivers.profile"
+            })
         );
     }
 
@@ -199,7 +269,16 @@ mod tests {
         assert_eq!(r.result_code(), v1::ResultCode::Unsupported);
         assert_eq!(r.to_result().code, v1::ResultCode::Unsupported as i32);
         assert!(check_request(&req(open(1, 7)), 0).is_err());
-        assert!(check_request(&req(Command::AdminOp(v1::AdminOp { kind: 42 })), 0).is_err());
+        assert!(
+            check_request(
+                &req(Command::AdminOp(v1::AdminOp {
+                    kind: 42,
+                    receiver_id: None
+                })),
+                0
+            )
+            .is_err()
+        );
         assert!(
             check_request(
                 &req(Command::UpdateChannel(v1::UpdateChannel {

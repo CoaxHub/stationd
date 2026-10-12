@@ -59,8 +59,8 @@ highlight = "all"
 workspace-default-features = "allow"
 external-default-features = "allow"
 allow-workspace = true
-# stationd trusts only the gateway_ca bundle from stationd.toml (station-protocol §8),
-# never the WebPKI or OS roots. Ban the crates that would bring those roots in.
+# stationd trusts only the gateway CA bundle enrollment stored (gateway-ca.pem) and the
+# root built into release builds (station-protocol §8), never the WebPKI or OS roots. Ban the crates that would bring those roots in.
 deny = [
     { crate = "webpki-roots", reason = "stationd trusts only gateway_ca, not WebPKI roots" },
     { crate = "rustls-native-certs", reason = "stationd trusts only gateway_ca, not OS roots" },

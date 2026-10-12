@@ -4,7 +4,7 @@
 //! waterfall ranges to spectrum2 geometry, channel status to S-meter
 //! readings. No I/O; every function is total on untrusted input.
 
-use station_backend::BackendError;
+use station_backend::{BackendCapabilities, BackendError};
 use station_proto::{limits, v1};
 
 use super::placement::{self, FrontEnd, Placement};
@@ -22,8 +22,9 @@ pub const MODES: [v1::Mode; 6] = [
     v1::Mode::Cw,
 ];
 
-/// Most simultaneous audio channels offered (the protocol cap; the owner's
-/// `max_channels` in `stationd.toml` usually limits it further).
+/// Most simultaneous audio channels offered on one radiod (the protocol
+/// cap; stationd's claim per receiver, station protocol §7, limits it
+/// further).
 pub const MAX_CHANNELS: u32 = limits::MAX_CHANNELS;
 /// Most bins per waterfall row. A noisy row of 8192 bins still compresses
 /// well below the 16 KiB row limit (§5).
@@ -227,20 +228,29 @@ pub fn contains(range: &v1::FrequencyRange, hz: u64) -> bool {
     (range.start_hz..=range.end_hz).contains(&hz)
 }
 
-/// The backend's capabilities from a radiod status (§9 `GetCapabilities`).
+/// The receiver's capabilities from its radiod's status (§9
+/// `GetCapabilities`).
 ///
-/// radiod does not report its tuner's full range, whether the tuner is
-/// locked, or whether its driver has runtime gain or attenuation hooks, so
-/// `hardware_range` is the current tunable range and every front-end
-/// control is reported absent (see [`super::Ka9qBackend`] for how
-/// `SetFrontend` still tries a retune).
-pub fn capabilities(st: &ChannelStatus) -> Option<v1::Capabilities> {
+/// radiod does not report its tuner's full range or whether its driver has
+/// runtime gain or attenuation hooks, so `hardware_range` is the current
+/// tunable range (stationd widens it to the receiver's profile) and the
+/// front-end controls offer only a retune, the one change the pinned
+/// `rtlsdr` and `sig_gen` drivers take live (§9 `SetFrontend`).
+pub fn capabilities(st: &ChannelStatus) -> Option<BackendCapabilities> {
     let tunable = tunable_range(st)?;
-    Some(v1::Capabilities {
-        tunable_range: Some(tunable),
-        hardware_range: Some(tunable),
-        sample_rate_hz: st.input_samprate.unwrap_or(0),
-        max_channels: MAX_CHANNELS,
+    Some(BackendCapabilities {
+        receiver: v1::ReceiverCapabilities {
+            receiver_id: 0,
+            tunable_range: Some(tunable),
+            hardware_range: Some(tunable),
+            sample_rate_hz: st.input_samprate.unwrap_or(0),
+            max_channels: MAX_CHANNELS,
+            frontend: Some(v1::FrontendControls {
+                can_retune: true,
+                ..v1::FrontendControls::default()
+            }),
+            sdr_model: sdr_model(st),
+        },
         modes: MODES.iter().map(|m| *m as i32).collect(),
         codecs: vec![v1::AudioCodec::Opus as i32],
         waterfall: Some(v1::WaterfallLimits {
@@ -248,12 +258,6 @@ pub fn capabilities(st: &ChannelStatus) -> Option<v1::Capabilities> {
             min_row_interval_ms: MIN_ROW_INTERVAL_MS,
             max_subscriptions: MAX_SUBSCRIPTIONS,
         }),
-        frontend: Some(v1::FrontendControls::default()),
-        allowed_admin_ops: Vec::new(),
-        frontend_control_allowed: false,
-        sdr_model: sdr_model(st),
-        // stationd's own claim (station protocol 1.1).
-        measurements: None,
     })
 }
 
@@ -277,12 +281,14 @@ pub fn sdr_model(st: &ChannelStatus) -> String {
     out
 }
 
-/// The front-end state for `SetFrontend` replies.
+/// The front-end state for `SetFrontend` replies (`receiver_id` 0:
+/// stationd sets it).
 #[allow(clippy::cast_possible_truncation, reason = "gains are small dB values")]
 pub fn frontend_state(st: &ChannelStatus) -> v1::FrontendState {
     let tunable = tunable_range(st);
     let finite = |v: Option<f64>| v.filter(|x| x.is_finite()).unwrap_or(0.0) as f32;
     v1::FrontendState {
+        receiver_id: 0,
         gain_db: finite(st.rf_gain_db),
         hardware_agc: st.rf_agc.unwrap_or(false),
         attenuation_db: finite(st.rf_atten_db),
@@ -619,10 +625,25 @@ mod tests {
     #[test]
     fn capabilities_from_the_signal_generator_pass_hub_validation() {
         let caps = capabilities(&siggen()).unwrap();
-        let sanitized = station_proto::validate::sanitize_capabilities(&caps, 0).unwrap();
+        let station = v1::Capabilities {
+            receivers: vec![v1::ReceiverCapabilities {
+                receiver_id: 1,
+                ..caps.receiver.clone()
+            }],
+            modes: caps.modes.clone(),
+            codecs: caps.codecs.clone(),
+            waterfall: caps.waterfall,
+            measurements: None,
+        };
+        let sanitized = station_proto::validate::sanitize_capabilities(&station, 0).unwrap();
         assert!(sanitized.clamped.is_empty(), "{:?}", sanitized.clamped);
-        assert_eq!(caps.sample_rate_hz, 24_000_000);
-        assert_eq!(caps.sdr_model, "coaxhub-test sig_gen");
+        assert_eq!(caps.receiver.sample_rate_hz, 24_000_000);
+        assert_eq!(caps.receiver.sdr_model, "coaxhub-test sig_gen");
+        assert!(
+            caps.receiver
+                .frontend
+                .is_some_and(|f| f.can_retune && !f.has_gain)
+        );
         assert_eq!(caps.modes.len(), 6);
         let fe = frontend_state(&siggen());
         assert_eq!(fe.center_frequency_hz, 6_000_000);

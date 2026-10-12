@@ -1,0 +1,138 @@
+// CoaxHub Stations — the station's SDRs and its receivers.
+//
+// SPDX-License-Identifier: MIT
+// The station protocol is MIT-licensed so any implementation (including the
+// CoaxHub hub) can use it.
+// Semantics, limits and validation rules: docs/station-protocol.md §4.2.
+//
+// A station reports the SDRs plugged into it (GetHardware), each with the
+// models and profiles its package allows for it. The hub sends the station's
+// whole receiver set (ConfigureReceivers): which SDR is which receiver, with
+// which profile, centre and front-end settings. Only enums, numbers and an
+// SDR's serial: the station renders its backend's
+// configuration from templates of its own and never takes configuration text.
+
+syntax = "proto3";
+
+package coaxhub.station.v1;
+
+import "coaxhub/station/v1/common.proto";
+import "coaxhub/station/v1/control.proto";
+
+// What the owner says the SDR is. The station offers, per SDR, only the
+// models its USB identity allows.
+enum SdrModel {
+  SDR_MODEL_UNSPECIFIED = 0;
+  // RTL-SDR Blog V4: HF through its upconverter, and VHF/UHF.
+  SDR_MODEL_RTLSDR_BLOG_V4 = 1;
+  // RTL-SDR Blog V3, or another RTL-SDR with direct sampling.
+  SDR_MODEL_RTLSDR_DIRECT_SAMPLING = 2;
+  // Any other RTL-SDR: VHF/UHF only.
+  SDR_MODEL_RTLSDR_OTHER = 3;
+}
+
+// A profile of the station's package: the backend's template for one way of
+// using an SDR.
+enum SdrProfile {
+  SDR_PROFILE_UNSPECIFIED = 0;
+  SDR_PROFILE_RTLSDR = 1;     // VHF/UHF with the tuner
+  SDR_PROFILE_RTLSDR_HF = 2;  // HF by direct sampling
+  SDR_PROFILE_RTLSDR_V4 = 3;  // the V4: HF through its upconverter, and VHF/UHF
+}
+
+// ------------------------------------------------------------ Hardware
+
+message GetHardware {}
+
+message Hardware {
+  // The SDRs on the station's USB buses, at most 16, in port order.
+  repeated Sdr sdrs = 1;
+  // Every profile of the station's package, once each, whether or not an
+  // SDR above offers it, so the hub can predict the range of a receiver
+  // whose SDR is not plugged in. Every profile an SDR offers is here.
+  repeated ProfileInfo profiles = 2;
+}
+
+message Sdr {
+  uint32 usb_vendor_id = 1;
+  uint32 usb_product_id = 2;
+  // The USB descriptor strings, untrusted and for display only: at most 128
+  // bytes each. serial may be empty.
+  string manufacturer = 3;
+  string product = 4;
+  string serial = 5;
+  // Where it is plugged in ("1-1.3"), at most 32 bytes. Display only: it
+  // changes with the cabling.
+  string port = 6;
+  // The models the owner may pick for it, each with its profiles. Empty: the
+  // station doesn't support this SDR.
+  repeated ModelOption models = 7;
+  // The receiver this SDR serves now, if any.
+  optional uint32 receiver_id = 8;
+}
+
+message ModelOption {
+  SdrModel model = 1;
+  repeated SdrProfile profiles = 2;
+}
+
+// What a profile can do, so the hub can predict a receiver's passband
+// before configuring it.
+message ProfileInfo {
+  SdrProfile profile = 1;
+  // The centre frequencies the profile accepts.
+  FrequencyRange center_range = 2;
+  uint64 default_center_hz = 3;
+  uint32 sample_rate_hz = 4;
+  // The width of the tunable range around the centre.
+  uint32 tunable_span_hz = 5;
+  // The front-end settings the profile accepts.
+  FrontendControls frontend = 6;
+}
+
+// ------------------------------------------------------------ Receivers
+
+// The station's whole receiver set. The station applies the difference with
+// what runs: a receiver not in the list stops.
+message ConfigureReceivers {
+  // At most 16, receiver_id unique.
+  repeated ReceiverConfig receivers = 1;
+}
+
+message ReceiverConfig {
+  // Hub-assigned, never 0, stable for the receiver's life.
+  uint32 receiver_id = 1;
+  // The SDR's serial (Sdr.serial). An SDR the station doesn't report is
+  // accepted: the receiver is NO_DEVICE until it is plugged in. Empty
+  // selects the station's only RTL-SDR, when it has at most one.
+  string sdr_serial = 2;
+  SdrModel model = 3;
+  SdrProfile profile = 4;
+  uint64 center_frequency_hz = 5;
+  // Absent: the profile's default.
+  optional float gain_db = 6;
+  optional bool hardware_agc = 7;
+  optional float attenuation_db = 8;
+}
+
+// Answers ConfigureReceivers with OK: the set was accepted. Each receiver's
+// state follows in RECEIVER_STATE events.
+message ReceiversConfigured {
+  repeated ReceiverStatus receivers = 1;
+}
+
+enum ReceiverState {
+  RECEIVER_STATE_UNSPECIFIED = 0;
+  RECEIVER_STATE_STARTING = 1;  // its backend is starting
+  RECEIVER_STATE_RUNNING = 2;   // in Capabilities.receivers
+  RECEIVER_STATE_FAILED = 3;    // its backend failed, or its SDR doesn't
+                                // offer its model; detail says why
+  RECEIVER_STATE_NO_DEVICE = 4; // its SDR is not plugged in
+}
+
+message ReceiverStatus {
+  uint32 receiver_id = 1;
+  ReceiverState state = 2;
+  // Untrusted detail, at most 256 bytes UTF-8. Displayed escaped.
+  string detail = 3;
+}

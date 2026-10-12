@@ -21,7 +21,7 @@ Supported versions: the latest release.
 
 **The hub is not trusted by the station, and the station is not trusted by the hub.**
 - The hub treats stations as untrusted and validates everything a station sends: sizes, rates, counts and sequence numbers, against the limits in the station protocol. A station that breaks them is throttled, then disconnected.
-- The station answers requests within its own configured limits, whatever the hub asks.
+- The station answers requests within the limits fixed in its package, whatever the hub asks.
 
 **The station trusts only the CoaxHub root.**
 - The gateway and the station-api are verified against the gateway CA bundle that enrollment stored (`gateway-ca.pem`). Enrollment is verified against the root certificate compiled into stationd. No other root is trusted.
@@ -31,8 +31,11 @@ Supported versions: the latest release.
 
 **The hub gets no shell and no configuration push.**
 - The protocol has no request that runs a command or writes a file on the station.
-- The station's configuration, `/etc/coaxhub/stationd.toml`, is changed only by its owner. It holds the limits the hub may ask for, and the hub can ask for less, never more.
-- Administrative requests (restart stationd, restart the backend, update, reboot the host) are refused unless the owner listed them in `allowed_admin_ops`. The default list is empty.
+- A packaged station has no settings file. It keeps its credentials and state in `/var/lib/coaxhub/stationd` and the receiver set the hub last applied in `/var/lib/coaxhub/receivers/receivers.json`; everything the owner chooses lives in the web app and reaches the station as typed requests ([station protocol §7](docs/station-protocol.md#7-what-the-station-keeps)).
+- Those requests carry enums, numbers and an SDR's serial, never configuration text, paths or commands. stationd checks each against rules fixed in the package: the SDR table and the profiles' limits, at most 16 receivers, no overlapping receivers, and its capacity claims (channels per receiver, waterfall subscriptions). A request that breaks one is refused and changes nothing. stationd writes radiod's configuration only from the package's templates, with values it has checked.
+- stationd starts, restarts and stops the receivers' radiod units, `coaxhub-radiod@<number>.service`, through a polkit rule that allows the `coaxhub` user those three verbs on those units and nothing else. It never runs as root.
+- Administrative requests (restart stationd, restart the backend, update, reboot the host) are answered `UNSUPPORTED`: stationd implements none of them.
+- Someone who controls the hub, the control plane or the owner's account can use this interface and no more: retune, reconfigure, stop or restart the station's receivers. [docs/architecture.md](docs/architecture.md#what-the-hub-can-and-cannot-do) lists what the hub can and cannot do.
 - radiod runs as its own user with no access to the station's key, and with the system call, device and network restrictions in [docs/packaging.md](docs/packaging.md).
 
 **Credentials come only from enrollment.**

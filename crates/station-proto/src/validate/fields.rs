@@ -4,8 +4,11 @@
 
 use prost::Message as _;
 
+use std::collections::HashSet;
+
 use super::capabilities::sanitize_capabilities;
 use super::measure::{check_measurements_started, check_noise_report};
+use super::receivers::{check_hardware, check_receivers_configured};
 use super::{MessageKind, ViolationKind};
 use crate::limits;
 use crate::v1;
@@ -31,11 +34,13 @@ pub fn decode_station_message(
 
 /// Checks everything about one message that needs no session state: string
 /// caps, enums known in `minor` and not `UNSPECIFIED` where required, finite
-/// floats, payload sizes, and the sanity of every response payload
-/// (including [`sanitize_capabilities`]).
+/// floats, payload sizes, receiver IDs listed once, the fields each event
+/// kind requires, and the sanity of every response payload (including
+/// [`sanitize_capabilities`]).
 ///
 /// It does not check the size (see [`decode_station_message`]), ordering,
-/// request matching, ID lookups or rates: [`super::Session::check`] does.
+/// request matching, ID lookups (channels, subscriptions, plans, configured
+/// receivers) or rates: [`super::Session::check`] does.
 pub fn check_message(msg: &v1::StationMessage, minor: u32) -> Result<(), ViolationKind> {
     use v1::station_message::Body;
     match &msg.body {
@@ -47,15 +52,7 @@ pub fn check_message(msg: &v1::StationMessage, minor: u32) -> Result<(), Violati
         Some(Body::Signal(s)) => check_signal(s),
         Some(Body::Status(s)) => check_status(s, minor),
         Some(Body::Event(e)) => check_event(e, minor),
-        Some(Body::Noise(n)) => {
-            if minor < limits::MEASUREMENTS_MINOR {
-                return Err(ViolationKind::MessageNotInMinor {
-                    kind: MessageKind::Noise,
-                    minor,
-                });
-            }
-            check_noise_report(n)
-        }
+        Some(Body::Noise(n)) => check_noise_report(n),
     }
 }
 
@@ -103,6 +100,8 @@ fn check_response(r: &v1::Response, minor: u32) -> Result<(), ViolationKind> {
         Some(Payload::FrontendState(f)) => check_frontend_state(f),
         Some(Payload::WaterfallSubscribed(w)) => check_waterfall_subscribed(w, minor),
         Some(Payload::MeasurementsStarted(m)) => check_measurements_started(m, minor),
+        Some(Payload::Hardware(h)) => check_hardware(h, minor),
+        Some(Payload::ReceiversConfigured(r)) => check_receivers_configured(r, minor),
     }
 }
 
@@ -204,6 +203,10 @@ fn check_signal(s: &v1::ChannelSignal) -> Result<(), ViolationKind> {
     check_finite("signal.power_dbfs", s.power_dbfs)
 }
 
+/// §5 `StationStatus`: finite floats, at most [`limits::MAX_RECEIVERS`]
+/// receivers, each once (not 0) with a specified state, and a specified
+/// state in every health sub-message present (§5.1). Whether each receiver is
+/// configured is the session's check.
 fn check_status(s: &v1::StationStatus, minor: u32) -> Result<(), ViolationKind> {
     if let Some(host) = &s.host {
         check_finite("status.host.load_avg_1m", host.load_avg_1m)?;
@@ -211,36 +214,104 @@ fn check_status(s: &v1::StationStatus, minor: u32) -> Result<(), ViolationKind> 
             check_finite("status.host.cpu_temp_c", t)?;
         }
     }
-    if let Some(b) = &s.backend {
-        check_enum::<v1::backend_health::State>("status.backend.state", b.state, minor, true)?;
-        check_len(
-            "status.backend.version",
-            &b.version,
-            limits::MAX_VERSION_BYTES,
-        )?;
+    if s.receivers.len() > limits::MAX_RECEIVERS {
+        return Err(ViolationKind::TooManyEntries {
+            field: "status.receivers",
+            len: s.receivers.len(),
+            max: limits::MAX_RECEIVERS,
+        });
     }
-    if let Some(f) = &s.frontend {
-        check_enum::<v1::frontend_health::State>("status.frontend.state", f.state, minor, true)?;
-        check_finite("status.frontend.gain_db", f.gain_db)?;
-        if let Some(p) = f.input_power_dbfs {
-            check_finite("status.frontend.input_power_dbfs", p)?;
+    let mut ids = HashSet::with_capacity(s.receivers.len());
+    for rx in &s.receivers {
+        if rx.receiver_id == 0 {
+            return Err(ViolationKind::UnknownReceiver {
+                kind: MessageKind::Status,
+                receiver_id: 0,
+            });
         }
+        if !ids.insert(rx.receiver_id) {
+            return Err(ViolationKind::DuplicateReceiver {
+                field: "status.receivers.receiver_id",
+                receiver_id: rx.receiver_id,
+            });
+        }
+        check_receiver_health(rx, minor)?;
     }
     Ok(())
 }
 
+fn check_receiver_health(rx: &v1::ReceiverHealth, minor: u32) -> Result<(), ViolationKind> {
+    check_enum::<v1::ReceiverState>("status.receivers.state", rx.state, minor, true)?;
+    check_len(
+        "status.receivers.detail",
+        &rx.detail,
+        limits::MAX_DETAIL_BYTES,
+    )?;
+    if let Some(b) = &rx.backend {
+        check_enum::<v1::backend_health::State>(
+            "status.receivers.backend.state",
+            b.state,
+            minor,
+            true,
+        )?;
+        check_len(
+            "status.receivers.backend.version",
+            &b.version,
+            limits::MAX_VERSION_BYTES,
+        )?;
+    }
+    if let Some(f) = &rx.frontend {
+        check_enum::<v1::frontend_health::State>(
+            "status.receivers.frontend.state",
+            f.state,
+            minor,
+            true,
+        )?;
+        check_finite("status.receivers.frontend.gain_db", f.gain_db)?;
+        if let Some(p) = f.input_power_dbfs {
+            check_finite("status.receivers.frontend.input_power_dbfs", p)?;
+        }
+    }
+    if let Some(cpu) = rx.backend_cpu {
+        check_finite("status.receivers.backend_cpu", cpu)?;
+    }
+    Ok(())
+}
+
+/// The event kinds that name a receiver and require `receiver_id` (§5.1;
+/// `MEASUREMENT_DUTY` too, §5.2).
+pub(crate) fn kind_requires_receiver(kind: i32) -> bool {
+    use v1::event::Kind;
+    matches!(
+        Kind::try_from(kind),
+        Ok(Kind::ReceiverState
+            | Kind::DeviceLost
+            | Kind::DeviceRestored
+            | Kind::FrontendOverload
+            | Kind::FrontendChanged
+            | Kind::BackendRestarted
+            | Kind::MeasurementDuty)
+    )
+}
+
 fn check_event(e: &v1::Event, minor: u32) -> Result<(), ViolationKind> {
-    check_enum::<v1::event::Kind>("event.kind", e.kind, minor, true)?;
+    use v1::event::Kind;
+    check_enum::<Kind>("event.kind", e.kind, minor, true)?;
     check_len("event.detail", &e.detail, limits::MAX_DETAIL_BYTES)?;
-    if e.kind == v1::event::Kind::ChannelClosed as i32 && e.channel_id.is_none() {
+    let kind = Kind::try_from(e.kind).unwrap_or(Kind::Unspecified);
+    if kind == Kind::ChannelClosed && e.channel_id.is_none() {
         return Err(missing("event.channel_id"));
     }
-    if e.kind == v1::event::Kind::SubscriptionClosed as i32 && e.subscription_id.is_none() {
+    if kind == Kind::SubscriptionClosed && e.subscription_id.is_none() {
         return Err(missing("event.subscription_id"));
     }
-    // 1.1 fields: unknown to a 1.0 session, which ignores them (§3).
-    if minor < limits::MEASUREMENTS_MINOR {
-        return Ok(());
+    if kind_requires_receiver(e.kind) && e.receiver_id.is_none() {
+        return Err(missing("event.receiver_id"));
+    }
+    if let Some(s) = e.receiver_state {
+        check_enum::<v1::ReceiverState>("event.receiver_state", s, minor, true)?;
+    } else if kind == Kind::ReceiverState {
+        return Err(missing("event.receiver_state"));
     }
     if let Some(d) = e.measurement_duty {
         check_enum::<v1::MeasurementDuty>("event.measurement_duty", d, minor, true)?;
@@ -248,10 +319,10 @@ fn check_event(e: &v1::Event, minor: u32) -> Result<(), ViolationKind> {
     if let Some(r) = e.measurement_stop_reason {
         check_enum::<v1::MeasurementStopReason>("event.measurement_stop_reason", r, minor, true)?;
     }
-    if e.kind == v1::event::Kind::MeasurementStopped as i32 && e.measurement_id.is_none() {
+    if kind == Kind::MeasurementStopped && e.measurement_id.is_none() {
         return Err(missing("event.measurement_id"));
     }
-    if e.kind == v1::event::Kind::MeasurementDuty as i32 {
+    if kind == Kind::MeasurementDuty {
         if e.measurement_id.is_none() {
             return Err(missing("event.measurement_id"));
         }
@@ -320,32 +391,17 @@ pub(crate) fn check_range(
     Ok(())
 }
 
-/// The minor in which an enum value was introduced, gated by `(field,
-/// value)`, so a session negotiated at a lower minor rejects it (§3, §5
-/// Enums). Every value of v1.0 was introduced in minor 0; minor 1 added the
-/// measurement events and enums (measure.proto).
-fn introduced_in_minor(field: &'static str, value: i32) -> u32 {
-    use v1::event::Kind;
-    let measurement_kind =
-        value == Kind::MeasurementStopped as i32 || value == Kind::MeasurementDuty as i32;
-    match field {
-        "event.kind" if measurement_kind => limits::MEASUREMENTS_MINOR,
-        "event.measurement_duty"
-        | "event.measurement_stop_reason"
-        | "measurements_started.duty" => limits::MEASUREMENTS_MINOR,
-        _ => 0,
-    }
-}
-
 /// §5 Enums: `value` must be known in the negotiated `minor`, and must not be
-/// `UNSPECIFIED` (0 in every v1 enum) when `required`.
+/// `UNSPECIFIED` (0 in every enum of the package) when `required`. Every
+/// value this crate knows belongs to 2.0, so `minor` only labels the error;
+/// a later minor gates its new values here.
 pub(crate) fn check_enum<E: TryFrom<i32>>(
     field: &'static str,
     value: i32,
     minor: u32,
     required: bool,
 ) -> Result<(), ViolationKind> {
-    if E::try_from(value).is_err() || introduced_in_minor(field, value) > minor {
+    if !enum_known::<E>(value) {
         return Err(ViolationKind::UnknownEnumValue {
             field,
             value,
@@ -358,8 +414,8 @@ pub(crate) fn check_enum<E: TryFrom<i32>>(
     Ok(())
 }
 
-/// Whether `value` is a known value of `E` in `minor` (the station-side
-/// counterpart of [`check_enum`], §3).
-pub(crate) fn enum_known<E: TryFrom<i32>>(field: &'static str, value: i32, minor: u32) -> bool {
-    E::try_from(value).is_ok() && introduced_in_minor(field, value) <= minor
+/// Whether `value` is a known value of `E` (the station-side counterpart of
+/// [`check_enum`], §3).
+pub(crate) fn enum_known<E: TryFrom<i32>>(value: i32) -> bool {
+    E::try_from(value).is_ok()
 }

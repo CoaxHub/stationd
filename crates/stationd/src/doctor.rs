@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! `stationd doctor`: checks an installation and prints one line per check.
+//! `stationd doctor`: checks an installation and prints one line per check,
+//! so a station without its tunnel still explains itself.
 //!
 //! | Check | Fails when |
 //! |---|---|
-//! | `config` | `stationd.toml` is invalid (nothing else runs) |
+//! | `config` | a development build's `stationd.toml` is invalid (nothing else runs) |
 //! | `enrollment` | the credentials are missing or unusable |
-//! | `sdr` | no USB device of the profile (RTL-SDR `0bda:2838`/`0bda:2832`) |
-//! | `radiod` | radiod's status group does not answer within 3 s |
+//! | `sdrs` | never: the SDRs it sees, a warning when there is no RTL-SDR (a station runs without one until it arrives) |
+//! | `receivers` | `receivers.json` is unusable; a warning per receiver whose SDR is missing |
+//! | `radiod` | a receiver's radiod does not answer on its slot's status group within 3 s |
 //! | `enroll` | DNS or the TLS handshake with the enrollment service fails, against the `CoaxHub` root (a warning once enrolled) |
 //! | `station-api` | the mTLS handshake with `StationControl` fails, against the gateway CA bundle (a warning: the station keeps running on its stored assignment, and renewal retries) |
 //! | `gateway` | the mTLS handshake with the home hub's gateway fails, against the gateway CA bundle |
@@ -15,17 +17,21 @@
 
 use std::fmt::{self, Write as _};
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use backend_ka9q::client::{ClientConfig, Ka9qClient};
 
+use crate::cli::ConfigArg;
 use crate::config::{BackendConfig, Config, Endpoint};
 use crate::credentials::{self, Credentials};
 use crate::enroll;
-use crate::local_status::{self, RuntimeStatus, describe_skew, format_duration, format_utc};
-use crate::profile::UsbId;
+use crate::hardware::{self, Hardware};
+use crate::local_status::{
+    self, RuntimeStatus, describe_receiver, describe_skew, format_duration, format_utc,
+};
+use crate::receivers::StoredSet;
 use crate::tls::{self, Connector};
 
 /// The outcome of one check.
@@ -80,8 +86,9 @@ fn check(name: &'static str, level: Level, detail: impl Into<String>) -> Check {
 /// Where the checks look, and how long they wait.
 #[derive(Debug, Clone)]
 pub struct Environment {
-    /// `/sys/bus/usb/devices`.
-    pub usb_devices: PathBuf,
+    /// The USB devices; `None`: the configuration's
+    /// (`/sys/bus/usb/devices`).
+    pub usb_devices: Option<PathBuf>,
     /// Now, Unix seconds.
     pub now_unix_s: i64,
     /// Per network check.
@@ -91,33 +98,30 @@ pub struct Environment {
 impl Default for Environment {
     fn default() -> Self {
         Self {
-            usb_devices: PathBuf::from("/sys/bus/usb/devices"),
+            usb_devices: None,
             now_unix_s: crate::local_status::unix_now(),
             timeout: Duration::from_secs(3),
         }
     }
 }
 
-/// Runs every check for the config at `path`.
-pub async fn run(path: &Path, env: &Environment) -> Vec<Check> {
-    let config = match Config::load(path) {
+/// Runs every check for this build's settings.
+pub async fn run(arg: &ConfigArg, env: &Environment) -> Vec<Check> {
+    let config = match arg.load() {
         Ok(c) => c,
         Err(e) => return vec![check("config", Level::Fail, e.to_string())],
     };
-    run_config(&config, path, env).await
+    run_config(&config, &arg.describe(), env).await
 }
 
-/// Runs every check for a loaded `config`.
-pub async fn run_config(config: &Config, path: &Path, env: &Environment) -> Vec<Check> {
-    let mut out = vec![check(
-        "config",
-        Level::Pass,
-        format!(
-            "{} is valid ({} build)",
-            path.display(),
-            config.flavour.name()
-        ),
-    )];
+/// Runs every check for a loaded `config` (from `source`).
+pub async fn run_config(config: &Config, source: &str, env: &Environment) -> Vec<Check> {
+    let detail = if config.flavour.packaged {
+        "packaged build: built-in settings, no settings file".to_owned()
+    } else {
+        format!("{source} is valid ({} build)", config.flavour.name())
+    };
+    let mut out = vec![check("config", Level::Pass, detail)];
     let creds = credentials::load(config);
     out.push(match &creds {
         Ok(c) => check(
@@ -132,8 +136,18 @@ pub async fn run_config(config: &Config, path: &Path, env: &Environment) -> Vec<
         Err(e) => check("enrollment", Level::Fail, e.to_string()),
     });
     let creds = creds.ok();
-    out.push(sdr(config, &env.usb_devices));
-    out.push(radiod(config, env.timeout).await);
+    let usb = env.usb_devices.as_deref().unwrap_or(&config.usb_devices);
+    let hw = Hardware::scan(usb);
+    out.push(sdrs(&hw));
+    let daemon =
+        RuntimeStatus::read(&config.status_path()).filter(|d| local_status::process_alive(d.pid));
+    match StoredSet::load(&config.receivers_path()) {
+        Ok(set) => {
+            out.extend(receivers(&set, &hw, daemon.as_ref()));
+            out.extend(radiods(config, &set, env.timeout).await);
+        }
+        Err(e) => out.push(check("receivers", Level::Fail, e.to_string())),
+    }
     out.push(enroll_endpoint(config, creds.is_some(), env.timeout).await);
     out.extend(mtls_checks(config, creds.as_ref(), env.timeout).await);
     out.push(clock(creds.as_ref(), env.now_unix_s));
@@ -171,67 +185,100 @@ pub fn failed(checks: &[Check]) -> bool {
     checks.iter().any(|c| c.level == Level::Fail)
 }
 
-/// USB devices present under `devices` (`idVendor`/`idProduct` files).
-pub fn usb_devices(devices: &Path) -> Vec<(String, UsbId)> {
-    let Ok(entries) = std::fs::read_dir(devices) else {
-        return Vec::new();
-    };
-    let hex = |p: PathBuf| -> Option<u16> {
-        u16::from_str_radix(std::fs::read_to_string(p).ok()?.trim(), 16).ok()
-    };
-    let mut found: Vec<(String, UsbId)> = entries
-        .filter_map(Result::ok)
-        .filter_map(|e| {
-            let dir = e.path();
-            let id = UsbId {
-                vendor: hex(dir.join("idVendor"))?,
-                product: hex(dir.join("idProduct"))?,
-            };
-            Some((e.file_name().to_string_lossy().into_owned(), id))
-        })
-        .collect();
-    found.sort();
-    found
+/// The SDRs plugged in: a warning without an RTL-SDR, never a failure (a
+/// station runs without one until it arrives).
+fn sdrs(hw: &Hardware) -> Check {
+    let lines = hw.describe();
+    if hw.devices.iter().any(hardware::UsbDevice::is_rtlsdr) {
+        check("sdrs", Level::Pass, lines.join("; "))
+    } else {
+        let ids: Vec<String> = hardware::RTLSDR_IDS
+            .iter()
+            .map(|(v, p)| format!("{v:04x}:{p:04x}"))
+            .collect();
+        let mut detail = format!(
+            "no RTL-SDR on USB (looked for {}); plug one in, then set the receivers up on \
+             the station's page",
+            ids.join(", ")
+        );
+        if !lines.is_empty() {
+            let _ = write!(detail, "; seen: {}", lines.join("; "));
+        }
+        check("sdrs", Level::Warn, detail)
+    }
 }
 
-fn sdr(config: &Config, devices: &Path) -> Check {
-    let Some(sdr) = config.sdr else {
-        return check(
-            "sdr",
-            Level::Skip,
-            format!("no [sdr] profile ({} backend)", config.backend.kind()),
-        );
-    };
-    let p = sdr.profile;
-    if p.usb_ids.is_empty() {
-        return check(
-            "sdr",
+/// One line per applied receiver: its state from the running daemon, else
+/// whether its SDR is here.
+fn receivers(set: &StoredSet, hw: &Hardware, daemon: Option<&RuntimeStatus>) -> Vec<Check> {
+    if set.receivers.is_empty() {
+        return vec![check(
+            "receivers",
             Level::Pass,
-            format!("profile {} needs no hardware", p.name),
-        );
+            "none applied yet: the hub sends them once the owner sets them up on the \
+             station's page",
+        )];
     }
-    let found: Vec<String> = usb_devices(devices)
-        .into_iter()
-        .filter(|(_, id)| p.usb_ids.contains(id))
-        .map(|(port, id)| format!("{id} at {port}"))
-        .collect();
-    if found.is_empty() {
-        let ids: Vec<String> = p.usb_ids.iter().map(ToString::to_string).collect();
-        check(
-            "sdr",
-            Level::Fail,
-            format!(
-                "no {} found on USB (looked for {}); plug it in, or change [sdr] profile",
-                p.description,
-                ids.join(", ")
-            ),
-        )
-    } else {
-        check(
-            "sdr",
-            Level::Pass,
-            format!("profile {}: {}", p.name, found.join(", ")),
-        )
+    set.receivers
+        .iter()
+        .map(|r| {
+            let running =
+                daemon.and_then(|d| d.receivers.iter().find(|s| s.receiver_id == r.receiver_id));
+            let here = r.profile.profile().dev_only
+                || hardware::device_for(&hw.devices, &r.sdr_serial).is_some();
+            let summary = running.cloned().unwrap_or_else(|| {
+                local_status::applied(&StoredSet {
+                    receivers: vec![r.clone()],
+                })
+                .remove(0)
+            });
+            let mut detail = format!(
+                "receiver {}: {}",
+                r.receiver_id,
+                describe_receiver(&summary)
+            );
+            let level = match (summary.state.as_str(), here) {
+                ("failed" | "no_device", _) | (_, false) => Level::Warn,
+                _ => Level::Pass,
+            };
+            if !here {
+                detail.push_str("; its SDR is not plugged in");
+            }
+            check("receivers", level, detail)
+        })
+        .collect()
+}
+
+/// Probes each receiver's radiod.
+async fn radiods(config: &Config, set: &StoredSet, timeout: Duration) -> Vec<Check> {
+    match config.backend {
+        BackendConfig::Fake => vec![check("radiod", Level::Skip, "fake backend (development)")],
+        _ if set.receivers.is_empty() => {
+            vec![check("radiod", Level::Skip, "no receiver, no radiod")]
+        }
+        BackendConfig::External(k) => vec![match probe_radiod(k.status_group, timeout).await {
+            Ok(d) => check("radiod", Level::Pass, d),
+            Err(e) => check("radiod", Level::Fail, e),
+        }],
+        BackendConfig::Bundled => {
+            let mut out = Vec::new();
+            for r in &set.receivers {
+                let (status, _) = r.groups();
+                out.push(match probe_radiod(status, timeout).await {
+                    Ok(d) => check(
+                        "radiod",
+                        Level::Pass,
+                        format!("receiver {}: {d}", r.receiver_id),
+                    ),
+                    Err(e) => check(
+                        "radiod",
+                        Level::Fail,
+                        format!("receiver {}: {e}", r.receiver_id),
+                    ),
+                });
+            }
+            out
+        }
     }
 }
 
@@ -250,7 +297,7 @@ pub async fn probe_radiod(status_group: SocketAddr, timeout: Duration) -> Result
         .await
         .map_err(|_| {
             format!(
-                "no answer on {status_group} within {} s (is coaxhub-radiod running?)",
+                "no answer on {status_group} within {} s (is its coaxhub-radiod@ unit running?)",
                 timeout.as_secs()
             )
         })?
@@ -266,16 +313,6 @@ pub async fn probe_radiod(status_group: SocketAddr, timeout: Duration) -> Result
         let _ = write!(detail, ", {rate} S/s");
     }
     Ok(detail)
-}
-
-async fn radiod(config: &Config, timeout: Duration) -> Check {
-    match config.backend {
-        BackendConfig::Fake => check("radiod", Level::Skip, "fake backend (development)"),
-        BackendConfig::Ka9q(k) => match probe_radiod(k.status_group, timeout).await {
-            Ok(d) => check("radiod", Level::Pass, d),
-            Err(e) => check("radiod", Level::Fail, e),
-        },
-    }
 }
 
 /// DNS, then a TLS 1.3 handshake with ALPN h2, within `timeout`.
@@ -426,24 +463,55 @@ mod tests {
     use super::*;
     use crate::tls::{ClientTls, Validity};
 
-    fn usb(dir: &Path, port: &str, vendor: &str, product: &str) {
+    fn usb(dir: &std::path::Path, port: &str, ids: (&str, &str), product: &str, serial: &str) {
         let d = dir.join(port);
         std::fs::create_dir_all(&d).expect("mkdir");
-        std::fs::write(d.join("idVendor"), format!("{vendor}\n")).expect("write");
-        std::fs::write(d.join("idProduct"), format!("{product}\n")).expect("write");
+        std::fs::write(d.join("idVendor"), format!("{}\n", ids.0)).expect("write");
+        std::fs::write(d.join("idProduct"), format!("{}\n", ids.1)).expect("write");
+        std::fs::write(d.join("product"), format!("{product}\n")).expect("write");
+        std::fs::write(d.join("serial"), format!("{serial}\n")).expect("write");
     }
 
     #[test]
-    fn usb_scan() {
+    fn sdrs_and_receivers() {
         let tmp = tempfile::tempdir().expect("tmp");
-        usb(tmp.path(), "1-1", "1d6b", "0002");
-        usb(tmp.path(), "1-1.3", "0bda", "2838");
-        std::fs::create_dir(tmp.path().join("usb1")).expect("hub without ids");
-        usb(tmp.path(), "2-1", "zz", "0002");
-        let found = usb_devices(tmp.path());
-        assert_eq!(found.len(), 2);
-        assert_eq!(found[1].0, "1-1.3");
-        assert!(usb_devices(&tmp.path().join("none")).is_empty());
+        usb(tmp.path(), "usb1", ("1d6b", "0002"), "hub", "");
+        let none = sdrs(&Hardware::scan(tmp.path()));
+        assert_eq!(none.level, Level::Warn);
+        assert!(
+            none.detail.to_lowercase().contains("no rtl-sdr"),
+            "{}",
+            none.detail
+        );
+        usb(tmp.path(), "1-1.3", ("0bda", "2838"), "Blog V4", "A1");
+        let hw = Hardware::scan(tmp.path());
+        let some = sdrs(&hw);
+        assert_eq!(some.level, Level::Pass);
+        assert!(some.detail.contains("RTL-SDR Blog V4"), "{}", some.detail);
+        let empty = receivers(&StoredSet::default(), &hw, None);
+        assert_eq!(empty[0].level, Level::Pass);
+        assert!(empty[0].detail.contains("none applied yet"));
+        let set: StoredSet = serde_json::from_str(
+            r#"{"receivers":[
+                {"receiver_id":1,"slot":0,"sdr_serial":"A1","model":"rtlsdr_blog_v4","profile":"rtlsdr_v4","center_frequency_hz":7100000},
+                {"receiver_id":2,"slot":1,"sdr_serial":"B2","model":"rtlsdr_other","profile":"rtlsdr","center_frequency_hz":98000000}]}"#,
+        )
+        .expect("set");
+        let lines = receivers(&set, &hw, None);
+        assert_eq!(lines[0].level, Level::Pass, "{}", lines[0].detail);
+        assert!(
+            lines[0]
+                .detail
+                .starts_with("receiver 1: applied, rtlsdr-v4"),
+            "{}",
+            lines[0].detail
+        );
+        assert_eq!(lines[1].level, Level::Warn);
+        assert!(
+            lines[1].detail.ends_with("its SDR is not plugged in"),
+            "{}",
+            lines[1].detail
+        );
     }
 
     fn creds(not_before: i64, not_after: i64) -> Credentials {
@@ -505,8 +573,8 @@ mod tests {
             tunnel: local_status::Tunnel::Connected,
             connection_id: None,
             backoff_ms: None,
-            backend: "running".into(),
             backend_version: "v".into(),
+            receivers: Vec::new(),
             last_error: None,
             clock_skew_ms: skew,
             renewal: crate::renew::RenewalStatus::default(),
@@ -523,8 +591,8 @@ mod tests {
 
     #[test]
     fn levels_and_lines() {
-        let c = check("sdr", Level::Fail, "gone");
-        assert_eq!(c.to_string(), "FAIL  sdr          gone");
+        let c = check("sdrs", Level::Fail, "gone");
+        assert_eq!(c.to_string(), "FAIL  sdrs         gone");
         assert!(failed(&[check("a", Level::Pass, ""), c.clone()]));
         assert!(!failed(&[
             check("a", Level::Warn, ""),

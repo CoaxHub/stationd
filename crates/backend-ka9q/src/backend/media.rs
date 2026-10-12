@@ -263,6 +263,7 @@ mod tests {
     fn subscribed(bins: u32, compression: v1::WaterfallCompression) -> v1::WaterfallSubscribed {
         v1::WaterfallSubscribed {
             subscription_id: 9,
+            receiver_id: 1,
             range: None,
             bins,
             row_interval_ms: 100,

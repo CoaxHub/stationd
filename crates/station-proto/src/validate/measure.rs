@@ -1,21 +1,24 @@
 // SPDX-License-Identifier: MIT
-//! §5.2: measurements (protocol 1.1, measure.proto).
+//! §5.2: measurements (measure.proto), per receiver.
 //!
 //! - **Stateless** ([`check_noise_report`], [`check_measurements_started`]):
 //!   sizes, finite floats, quantiles in −250…50 dB/Hz and in order, ranges
-//!   sorted and apart, known enums, `frontend` present. Violations.
+//!   sorted and apart, known enums, `frontend` present and of the right
+//!   receiver. Violations.
 //! - **Stateful** ([`Plans`], driven by [`super::Session`]): a plan opens when
 //!   the hub sends `StartMeasurements` and closes (with the 5 s grace of
 //!   channels) on `StopMeasurements` or `Event{MEASUREMENT_STOPPED}`.
-//!   `MeasurementsStarted` must echo the request (ids and ranges ⊆ the
-//!   requested ones, cadence ≥ the requested one); a report may name only
-//!   accepted bands, once each, with `measured` inside the band; reports and
-//!   duty changes are rate-limited (drop first, a violation when sustained).
+//!   `MeasurementsStarted` must echo the request (ids, receivers and ranges
+//!   ⊆ the requested ones; each receiver of the accepted bands once, with a
+//!   cadence ≥ the requested one); a report names one of the plan's
+//!   receivers and only accepted bands of that receiver, once each, with
+//!   `measured` inside the band; reports and duty changes are rate-limited
+//!   per receiver (drop first, a violation when sustained).
 //! - **Plausibility** (dropped and counted, never a strike: an honest station
 //!   can produce it): with the hub's wall clock, a window that does not start
 //!   on a UTC minute or lies outside [now − 15 min, now + 5 s], and a duty
-//!   change outside [now − 60 s, now + 65 s]; and under idle duty, a window
-//!   that is not a measuring minute.
+//!   change outside [now − 60 s, now + 65 s]; and under the receiver's idle
+//!   duty, a window that is not a measuring minute.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -106,21 +109,43 @@ fn check_band_list(field: &'static str, bands: &[v1::NoiseBand]) -> Result<(), V
     Ok(())
 }
 
-/// `MeasurementsStarted`, without the request it answers.
+/// `MeasurementsStarted`, without the request it answers: the bands, and
+/// for each measured receiver (at most [`limits::MAX_RECEIVERS`]) a cadence
+/// of [`limits::NOISE_INTERVALS_MS`], a specified duty and its front end.
 pub(crate) fn check_measurements_started(
     m: &v1::MeasurementsStarted,
     minor: u32,
 ) -> Result<(), ViolationKind> {
-    check_enum::<v1::MeasurementDuty>("measurements_started.duty", m.duty, minor, true)?;
     check_band_list("measurements_started.noise_bands", &m.noise_bands)?;
-    if !limits::NOISE_INTERVALS_MS.contains(&m.noise_interval_ms) {
-        return Err(bounds("measurements_started.noise_interval_ms"));
+    if m.receivers.len() > limits::MAX_RECEIVERS {
+        return Err(ViolationKind::TooManyEntries {
+            field: "measurements_started.receivers",
+            len: m.receivers.len(),
+            max: limits::MAX_RECEIVERS,
+        });
     }
-    let frontend = m
-        .frontend
-        .as_ref()
-        .ok_or(missing("measurements_started.frontend"))?;
-    check_frontend_state(frontend)
+    for r in &m.receivers {
+        check_enum::<v1::MeasurementDuty>(
+            "measurements_started.receivers.duty",
+            r.duty,
+            minor,
+            true,
+        )?;
+        if !limits::NOISE_INTERVALS_MS.contains(&r.noise_interval_ms) {
+            return Err(bounds("measurements_started.receivers.noise_interval_ms"));
+        }
+        let frontend = r
+            .frontend
+            .as_ref()
+            .ok_or(missing("measurements_started.receivers.frontend"))?;
+        check_frontend_state(frontend)?;
+        if frontend.receiver_id != r.receiver_id {
+            return Err(bounds(
+                "measurements_started.receivers.frontend.receiver_id",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `NoiseFloorReport`, without its plan.
@@ -130,6 +155,9 @@ pub(crate) fn check_noise_report(n: &v1::NoiseFloorReport) -> Result<(), Violati
     }
     let frontend = n.frontend.as_ref().ok_or(missing("noise.frontend"))?;
     check_frontend_state(frontend)?;
+    if frontend.receiver_id != n.receiver_id {
+        return Err(bounds("noise.frontend.receiver_id"));
+    }
     if n.clock.is_none() {
         return Err(missing("noise.clock"));
     }
@@ -181,6 +209,7 @@ pub(crate) fn check_noise_report(n: &v1::NoiseFloorReport) -> Result<(), Violati
 /// A band the hub asked for, or the station accepted.
 #[derive(Debug, Clone)]
 struct Band {
+    receiver_id: u32,
     /// `[start, end]` of each range.
     ranges: Vec<(u64, u64)>,
 }
@@ -188,6 +217,7 @@ struct Band {
 impl Band {
     fn from_proto(b: &v1::NoiseBand) -> Self {
         Self {
+            receiver_id: b.receiver_id,
             ranges: b.ranges.iter().map(|r| (r.start_hz, r.end_hz)).collect(),
         }
     }
@@ -203,18 +233,12 @@ impl Band {
     }
 }
 
+/// One receiver of an accepted plan: its cadence, its duty over time and
+/// its rate limits.
 #[derive(Debug)]
-struct Accepted {
-    bands: HashMap<u32, Band>,
-    initial_duty: v1::MeasurementDuty,
-}
-
-#[derive(Debug)]
-struct Plan {
-    closed_at: Option<Instant>,
-    requested: HashMap<u32, Band>,
+struct Measured {
     interval_ms: u32,
-    accepted: Option<Accepted>,
+    initial_duty: v1::MeasurementDuty,
     /// Duty changes, by the UTC minute they apply from (ms).
     duties: Vec<(i64, v1::MeasurementDuty)>,
     noise: TokenBucket,
@@ -223,17 +247,46 @@ struct Plan {
     duty_excess: Sustained,
 }
 
-impl Plan {
-    fn duty_at(&self, unix_ms: i64) -> Option<v1::MeasurementDuty> {
-        let initial = self.accepted.as_ref()?.initial_duty;
-        Some(
-            self.duties
-                .iter()
-                .rev()
-                .find(|(from, _)| *from <= unix_ms)
-                .map_or(initial, |(_, d)| *d),
-        )
+impl Measured {
+    fn new(interval_ms: u32, initial_duty: v1::MeasurementDuty, now: Instant) -> Self {
+        Self {
+            interval_ms,
+            initial_duty,
+            duties: Vec::new(),
+            noise: noise_bucket(interval_ms, now),
+            noise_excess: Sustained::default(),
+            duty: TokenBucket::new(
+                1.0 / limits::DUTY_EVENT_INTERVAL.as_secs_f64(),
+                f64::from(limits::DUTY_EVENT_BURST),
+                now,
+            ),
+            duty_excess: Sustained::default(),
+        }
     }
+
+    /// §5.2: the receiver's latest duty change at or before `unix_ms`, else
+    /// its initial duty.
+    fn duty_at(&self, unix_ms: i64) -> v1::MeasurementDuty {
+        self.duties
+            .iter()
+            .rev()
+            .find(|(from, _)| *from <= unix_ms)
+            .map_or(self.initial_duty, |(_, d)| *d)
+    }
+}
+
+#[derive(Debug)]
+struct Accepted {
+    bands: HashMap<u32, Band>,
+    receivers: HashMap<u32, Measured>,
+}
+
+#[derive(Debug)]
+struct Plan {
+    closed_at: Option<Instant>,
+    requested: HashMap<u32, Band>,
+    requested_interval_ms: u32,
+    accepted: Option<Accepted>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,7 +307,7 @@ pub(crate) struct Plans {
 pub(crate) struct InUse(pub u32);
 
 fn noise_bucket(interval_ms: u32, now: Instant) -> TokenBucket {
-    // §5.2: ≤ 1 per noise_interval_ms / 2, burst 2.
+    // §5.2: ≤ 1 per noise_interval_ms / 2, burst 2, per receiver.
     let per_sec = 2000.0 / f64::from(interval_ms.max(1));
     TokenBucket::new(per_sec, 2.0, now)
 }
@@ -289,7 +342,6 @@ impl Plans {
         if self.state(s.measurement_id, now) == IdState::Open {
             return Err(InUse(s.measurement_id));
         }
-        let interval_ms = s.noise_interval_ms.max(1);
         self.plans.insert(
             s.measurement_id,
             Plan {
@@ -299,17 +351,8 @@ impl Plans {
                     .iter()
                     .map(|b| (b.band_id, Band::from_proto(b)))
                     .collect(),
-                interval_ms,
+                requested_interval_ms: s.noise_interval_ms,
                 accepted: None,
-                duties: Vec::new(),
-                noise: noise_bucket(interval_ms, now),
-                noise_excess: Sustained::default(),
-                duty: TokenBucket::new(
-                    1.0 / limits::DUTY_EVENT_INTERVAL.as_secs_f64(),
-                    f64::from(limits::DUTY_EVENT_BURST),
-                    now,
-                ),
-                duty_excess: Sustained::default(),
             },
         );
         Ok(())
@@ -351,23 +394,37 @@ impl Plans {
             let Some(asked) = plan.requested.get(&b.band_id) else {
                 return Err("measurements_started.noise_bands.band_id");
             };
+            if b.receiver_id != asked.receiver_id {
+                return Err("measurements_started.noise_bands.receiver_id");
+            }
             if !b.ranges.iter().all(|r| asked.holds(r.start_hz, r.end_hz)) {
                 return Err("measurements_started.noise_bands.ranges");
             }
             bands.insert(b.band_id, Band::from_proto(b));
         }
-        if m.noise_interval_ms < plan.interval_ms {
-            return Err("measurements_started.noise_interval_ms");
+        let mut receivers = HashMap::with_capacity(m.receivers.len());
+        for r in &m.receivers {
+            if !bands.values().any(|b| b.receiver_id == r.receiver_id) {
+                return Err("measurements_started.receivers.receiver_id");
+            }
+            if r.noise_interval_ms < plan.requested_interval_ms {
+                return Err("measurements_started.receivers.noise_interval_ms");
+            }
+            let Some(duty) = duty_of(r.duty) else {
+                return Err("measurements_started.receivers.duty");
+            };
+            let measured = Measured::new(r.noise_interval_ms, duty, now);
+            if receivers.insert(r.receiver_id, measured).is_some() {
+                return Err("measurements_started.receivers.receiver_id");
+            }
         }
-        let Some(initial_duty) = duty_of(m.duty) else {
-            return Err("measurements_started.duty");
-        };
-        plan.interval_ms = m.noise_interval_ms;
-        plan.noise = noise_bucket(m.noise_interval_ms, now);
-        plan.accepted = Some(Accepted {
-            bands,
-            initial_duty,
-        });
+        if bands
+            .values()
+            .any(|b| !receivers.contains_key(&b.receiver_id))
+        {
+            return Err("measurements_started.receivers");
+        }
+        plan.accepted = Some(Accepted { bands, receivers });
         Ok(())
     }
 
@@ -396,13 +453,23 @@ impl Plans {
                 measurement_id: id,
             });
         };
-        let Some(accepted) = plan.accepted.as_ref() else {
+        let Some(accepted) = plan.accepted.as_mut() else {
             return Ok(Some(DropReason::AwaitingMeasurements {
                 measurement_id: id,
             }));
         };
+        let Some(rx) = accepted.receivers.get_mut(&n.receiver_id) else {
+            return Err(ViolationKind::UnknownReceiver {
+                kind,
+                receiver_id: n.receiver_id,
+            });
+        };
         for b in &n.bands {
-            let Some(band) = accepted.bands.get(&b.band_id) else {
+            let Some(band) = accepted
+                .bands
+                .get(&b.band_id)
+                .filter(|band| band.receiver_id == n.receiver_id)
+            else {
                 return Err(bounds("noise.bands.band_id"));
             };
             let r = b.measured.unwrap_or_default();
@@ -415,9 +482,9 @@ impl Plans {
                 });
             }
         }
-        if !plan.noise.try_take(now) {
-            let busy = Duration::from_millis(u64::from(plan.interval_ms / 2));
-            if plan.noise_excess.on_excess(
+        if !rx.noise.try_take(now) {
+            let busy = Duration::from_millis(u64::from(rx.interval_ms / 2));
+            if rx.noise_excess.on_excess(
                 now,
                 busy,
                 limits::SUSTAINED_GAP,
@@ -444,7 +511,7 @@ impl Plans {
                 return Ok(Some(DropReason::MeasurementTime { kind }));
             }
         }
-        if plan.duty_at(start) == Some(v1::MeasurementDuty::Idle) && !is_measuring_minute(start) {
+        if rx.duty_at(start) == v1::MeasurementDuty::Idle && !is_measuring_minute(start) {
             return Ok(Some(DropReason::NotScheduled));
         }
         Ok(None)
@@ -478,50 +545,66 @@ impl Plans {
                 self.close(id, now);
                 Ok(None)
             }
-            Ok(Kind::MeasurementDuty) => {
-                let Some(plan) = self.plans.get_mut(&id) else {
-                    return Ok(None);
-                };
-                if !plan.duty.try_take(now) {
-                    if plan.duty_excess.on_excess(
-                        now,
-                        limits::DUTY_EVENT_INTERVAL,
-                        limits::SUSTAINED_GAP,
-                        limits::DUTY_RATE_SUSTAINED,
-                    ) {
-                        return Err(ViolationKind::MeasurementRate {
-                            kind,
-                            measurement_id: id,
-                        });
-                    }
-                    return Ok(Some(DropReason::RateLimited { kind }));
-                }
-                let (Some(from), Some(duty)) =
-                    (e.effective_unix_ms, e.measurement_duty.and_then(duty_of))
-                else {
-                    // `check_message` guarantees both; unreachable.
-                    return Ok(None);
-                };
-                let whole = from.rem_euclid(60_000) == 0;
-                let plausible = unix_ms.is_none_or(|now_ms| {
-                    within(from, now_ms, limits::DUTY_MAX_AGE, limits::DUTY_MAX_LEAD)
-                });
-                if !whole || !plausible {
-                    return Ok(Some(DropReason::MeasurementTime { kind }));
-                }
-                let at = plan.duties.partition_point(|(f, _)| *f <= from);
-                plan.duties.insert(at, (from, duty));
-                // Bounded: a duty changes at most once a minute, and only the
-                // last hour can still matter (15 min of report age).
-                let keep_after = from.saturating_sub(60 * 60_000);
-                if plan.duties.len() > 64 {
-                    plan.duties.retain(|(f, _)| *f >= keep_after);
-                    plan.duties.truncate(64);
-                }
-                Ok(None)
-            }
+            Ok(Kind::MeasurementDuty) => self.check_duty(id, e, now, unix_ms),
             _ => Ok(None),
         }
+    }
+
+    fn check_duty(
+        &mut self,
+        id: u32,
+        e: &v1::Event,
+        now: Instant,
+        unix_ms: Option<i64>,
+    ) -> Result<Option<DropReason>, ViolationKind> {
+        let kind = MessageKind::Event;
+        let Some(plan) = self.plans.get_mut(&id) else {
+            return Ok(None);
+        };
+        let Some(accepted) = plan.accepted.as_mut() else {
+            return Ok(Some(DropReason::AwaitingMeasurements {
+                measurement_id: id,
+            }));
+        };
+        // `check_message` guarantees the receiver, the duty and the minute.
+        let receiver_id = e.receiver_id.unwrap_or(0);
+        let Some(rx) = accepted.receivers.get_mut(&receiver_id) else {
+            return Err(ViolationKind::UnknownReceiver { kind, receiver_id });
+        };
+        if !rx.duty.try_take(now) {
+            if rx.duty_excess.on_excess(
+                now,
+                limits::DUTY_EVENT_INTERVAL,
+                limits::SUSTAINED_GAP,
+                limits::DUTY_RATE_SUSTAINED,
+            ) {
+                return Err(ViolationKind::MeasurementRate {
+                    kind,
+                    measurement_id: id,
+                });
+            }
+            return Ok(Some(DropReason::RateLimited { kind }));
+        }
+        let (Some(from), Some(duty)) = (e.effective_unix_ms, e.measurement_duty.and_then(duty_of))
+        else {
+            return Ok(None);
+        };
+        let whole = from.rem_euclid(60_000) == 0;
+        let plausible = unix_ms
+            .is_none_or(|now_ms| within(from, now_ms, limits::DUTY_MAX_AGE, limits::DUTY_MAX_LEAD));
+        if !whole || !plausible {
+            return Ok(Some(DropReason::MeasurementTime { kind }));
+        }
+        let at = rx.duties.partition_point(|(f, _)| *f <= from);
+        rx.duties.insert(at, (from, duty));
+        // Bounded: a duty changes at most once a minute, and only the last
+        // hour can still matter (15 min of report age).
+        let keep_after = from.saturating_sub(60 * 60_000);
+        if rx.duties.len() > 64 {
+            rx.duties.retain(|(f, _)| *f >= keep_after);
+            rx.duties.truncate(64);
+        }
+        Ok(None)
     }
 
     fn collect_garbage(&mut self, now: Instant) {

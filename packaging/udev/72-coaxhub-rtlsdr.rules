@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: GPL-3.0-only
 #
 # RTL-SDR dongles (RTL2832U, 0bda:2838 and 0bda:2832, the RTL-SDR Blog V4
-# included) belong to the bundled radiod (coaxhub-radiod.service) and to
-# nobody else.
+# included) belong to the bundled radiod (the coaxhub-radiod@.service instances) and
+# to nobody else.
 #
 # The package bundles its own librtlsdr and needs no rule from the system's
 # librtlsdr packages. Numbered 72 so it runs after the rules that may be

@@ -96,7 +96,7 @@ async fn waterfall_labels_match_radiod() {
     }
     let backend = Ka9qBackend::new(Ka9qConfig::new(status_group(), None)).expect("backend");
     let caps = backend.capabilities().await.expect("capabilities");
-    let tunable = caps.tunable_range.expect("tunable range");
+    let tunable = caps.receiver.tunable_range.expect("tunable range");
     let carrier = carrier_hz();
     let mut failures = Vec::new();
     let mut strict = 0;
@@ -104,6 +104,7 @@ async fn waterfall_labels_match_radiod() {
     for (id, (range, bins)) in (1u32..).zip(&requests) {
         let req = v1::SubscribeWaterfall {
             subscription_id: id,
+            receiver_id: 1,
             range: Some(*range),
             bins: *bins,
             row_interval_ms: 50,

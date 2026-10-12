@@ -4,9 +4,10 @@
 //!
 //! | | development (default) | packaged (`--features packaged`) |
 //! |---|---|---|
-//! | `CoaxHub` domain and root | none built in | compiled in by `build.rs` |
-//! | `state_dir`, `[endpoints]`, `[credentials]`, `[backend]`, `[measurements] ignore_host_load` | accepted | rejected |
+//! | settings | `stationd.toml` (`--config`; [`crate::config`]) | none: built-in values only |
+//! | `CoaxHub` domain and root | none built in (`[endpoints]`) | compiled in by `build.rs` |
 //! | SDR profiles | all, including `siggen` | production profiles only |
+//! | `check-config` | yes | no |
 //! | runtime status file | `<state_dir>/status.json` | `/run/coaxhub/stationd/status.json` |
 //! | radiod templates | `packaging/radiod-templates/` | `/usr/share/coaxhub/radiod-templates/` |
 
@@ -15,6 +16,10 @@ use std::path::PathBuf;
 /// The state directory of an installed station (station-protocol §7).
 pub const DEFAULT_STATE_DIR: &str = "/var/lib/coaxhub/stationd";
 
+/// Where an installed station keeps the applied receiver set
+/// (`receivers.json`, §7). The package creates it.
+pub const RECEIVERS_DIR: &str = "/var/lib/coaxhub/receivers";
+
 /// Where a packaged stationd writes its runtime status (systemd
 /// `RuntimeDirectory=coaxhub/stationd`).
 pub const PACKAGED_RUNTIME_DIR: &str = "/run/coaxhub/stationd";
@@ -22,8 +27,10 @@ pub const PACKAGED_RUNTIME_DIR: &str = "/run/coaxhub/stationd";
 /// Where the package installs the radiod templates.
 pub const PACKAGED_TEMPLATES_DIR: &str = "/usr/share/coaxhub/radiod-templates";
 
-/// Where `coaxhub-radiod.service` expects the rendered radiod config.
-pub const DEFAULT_RADIOD_CONFIG: &str = "/run/coaxhub-radiod/radiod.conf";
+/// Where each receiver's unit expects its rendered radiod config:
+/// `/run/coaxhub-radiod/<receiver_id>/radiod.conf` (systemd
+/// `RuntimeDirectory=coaxhub-radiod/%i`).
+pub const RADIOD_RUNTIME_DIR: &str = "/run/coaxhub-radiod";
 
 /// The domain and root compiled into a packaged build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,11 +62,11 @@ const BUILT_IN: Option<BuiltIn> = Some(BuiltIn {
 #[cfg(not(feature = "packaged"))]
 const BUILT_IN: Option<BuiltIn> = None;
 
-/// Which rules a configuration is checked against. [`Flavour::current`] is
-/// the flavour this binary was built as; tests also check the other one.
+/// Which build this is. [`Flavour::current`] is the flavour this binary was
+/// built as; tests also check the other one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Flavour {
-    /// Packaged: test-only settings are rejected.
+    /// Packaged: built-in values, production profiles only.
     pub packaged: bool,
     /// The built-in domain and root (always `Some` when packaged).
     pub built_in: Option<BuiltIn>,

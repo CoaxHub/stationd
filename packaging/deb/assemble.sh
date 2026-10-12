@@ -37,10 +37,12 @@ install -m 0644 "${in}/radiod/rtlsdr.so" "${in}/radiod/librtlsdr.so.0" "${in}/ra
 install -d "${root}/usr/share/coaxhub/radiod-templates"
 install -m 0644 "${src}/radiod-templates/rtlsdr.conf" "${src}/radiod-templates/rtlsdr-hf.conf" \
     "${src}/radiod-templates/rtlsdr-v4.conf" "${root}/usr/share/coaxhub/radiod-templates/"
-install -D -m 0644 "${src}/deb/stationd.toml" "${root}/etc/coaxhub/stationd.toml"
 install -d "${root}/usr/lib/systemd/system"
-install -m 0644 "${src}/systemd/stationd.service" "${src}/systemd/coaxhub-radiod.service" \
+install -m 0644 "${src}/systemd/stationd.service" "${src}/systemd/coaxhub-radiod@.service" \
     "${root}/usr/lib/systemd/system/"
+# What lets stationd (user coaxhub) start and stop the receivers' units.
+install -D -m 0644 "${src}/polkit/coaxhub-stationd.rules" \
+    "${root}/usr/share/polkit-1/rules.d/coaxhub-stationd.rules"
 install -D -m 0644 "${src}/udev/72-coaxhub-rtlsdr.rules" "${root}/usr/lib/udev/rules.d/72-coaxhub-rtlsdr.rules"
 install -D -m 0644 "${src}/modprobe/coaxhub-stationd.conf" "${root}/usr/lib/modprobe.d/coaxhub-stationd.conf"
 
@@ -61,7 +63,6 @@ chmod 0644 "${doc}/copyright"
 # ---------------------------------------------------------------- control
 install -d -m 0755 "${root}/DEBIAN"
 install -m 0755 "${src}/deb/postinst" "${src}/deb/prerm" "${src}/deb/postrm" "${root}/DEBIAN/"
-printf '/etc/coaxhub/stationd.toml\n' >"${root}/DEBIAN/conffiles"
 
 # Shared-library dependencies of the four ELF objects, for the target
 # architecture (dpkg-shlibdeps wants a debian/control to exist). The private
@@ -98,7 +99,7 @@ Version: ${VERSION}
 Architecture: ${ARCH}
 Maintainer: CoaxHub <packages@${COAXHUB_DOMAIN}>
 Installed-Size: ${installed_size}
-Depends: ${shlib_depends}, adduser, iproute2
+Depends: ${shlib_depends}, adduser, iproute2, polkitd | policykit-1
 Recommends: systemd-timesyncd | time-daemon
 Section: hamradio
 Priority: optional
@@ -111,15 +112,16 @@ Description: CoaxHub station daemon with its bundled SDR receiver
  The package bundles a private build of ka9q-radio's radiod (commit
  ${short}) as the receiver's DSP backend, and of osmocom librtlsdr
  ${RTLSDR_VERSION} for RTL-SDR dongles (the RTL-SDR Blog V4 included), under
- /usr/lib/coaxhub/radiod. radiod is run as its own sandboxed service
- (coaxhub-radiod), configured from the SDR profile in
- /etc/coaxhub/stationd.toml, and not put on PATH.
+ /usr/lib/coaxhub/radiod. Each receiver's radiod runs as its own
+ sandboxed service instance (coaxhub-radiod@<receiver>), started by
+ stationd and configured from the receivers set up in the CoaxHub web app,
+ and is not put on PATH.
  .
  Built for Debian ${SUITE} and the CoaxHub service at ${COAXHUB_DOMAIN}.
 CONTROL
 
 (cd "${root}" && find usr -type f -print0 | sort -z | xargs -0 md5sum) >"${root}/DEBIAN/md5sums"
-chmod 0644 "${root}/DEBIAN/control" "${root}/DEBIAN/conffiles" "${root}/DEBIAN/md5sums"
+chmod 0644 "${root}/DEBIAN/control" "${root}/DEBIAN/md5sums"
 
 # ---------------------------------------------------------------- build
 find "${root}" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +

@@ -21,7 +21,7 @@ readonly REPO=/srv/repo
 readonly TEMPLATE=/test/station.sh
 readonly KEYRING=/usr/share/keyrings/coaxhub-archive-keyring.gpg
 readonly SOURCES=/etc/apt/sources.list.d/coaxhub.sources
-readonly CONFIG=/etc/coaxhub/stationd.toml
+readonly RECEIVERS=/var/lib/coaxhub/receivers
 # A well-formed token (chs_enr_ + 32 Crockford base32 characters).
 readonly TOKEN_BODY=0123456789ABCDEFGHJKMNPQRSTVWXYZ
 export GNUPGHOME=/root/repo-gnupg
@@ -118,8 +118,13 @@ runuser -u nobody -- sh "${good}" "${common[@]}" </dev/null >/tmp/t.log 2>&1 || 
 check_eq "not root: refused" 1 "${rc}"
 check_contains "not root: says why" "as root" "$(cat /tmp/t.log)"
 
-rc="$(run /tmp/t.log "${good}" --profile airspy "${common[@]}")"
-check_eq "unknown profile: refused" 1 "${rc}"
+# There is no --profile: the owner sets up receivers in the web app.
+for profile in rtlsdr rtlsdr-hf rtlsdr-v4 airspy; do
+    rc="$(run /tmp/t.log "${good}" --profile "${profile}" "${common[@]}")"
+    check_eq "--profile ${profile}: refused" 1 "${rc}"
+    check_contains "--profile ${profile}: an unknown option" "unknown option: --profile" "$(cat /tmp/t.log)"
+done
+nothing_written "--profile"
 
 # Other systems: /etc/os-release is swapped for a while.
 cp -P /etc/os-release /root/os-release.orig
@@ -152,12 +157,6 @@ for fake in armhf i386; do
 done
 rm -f /tmp/shim/dpkg
 
-rc=0
-COAXHUB_INSTALL_USB_DEVICES=/tmp/nousb sh "${good}" "${common[@]}" </dev/null >/tmp/t.log 2>&1 || rc=$?
-check_eq "no SDR, no terminal, no --yes: refused" 1 "${rc}"
-check_contains "no SDR: says so" "No RTL-SDR found" "$(cat /tmp/t.log)"
-nothing_written "no SDR"
-
 # A wrong fingerprint, and a key file with a second primary key added.
 wrong="$(printf '%s' "${FPR}" | tr '0-9A-F' '1-9A-F0')"
 rc="$(run /tmp/t.log "$(installer "${wrong}")" -y --token-file /root/token "${common[@]}")"
@@ -173,12 +172,13 @@ cp /root/good-key.asc "${REPO}/coaxhub-archive-keyring.asc"
 # ---------------------------------------------------------------- happy path
 # Piped into sh, as `curl -fsSL …/station | sudo sh -s -- …` runs it.
 rc=0
-COAXHUB_INSTALL_USB_DEVICES=/tmp/usb sh -s -- --profile rtlsdr-hf --token-file /root/token \
+COAXHUB_INSTALL_USB_DEVICES=/tmp/usb sh -s -- --token-file /root/token \
     "${common[@]}" <"${good}" >/tmp/install.log 2>&1 || rc=$?
 log="$(cat /tmp/install.log)"
 printf '# installer output:\n%s\n' "$(sed 's/^/#   /' /tmp/install.log)"
 check_eq "happy path: exits 1 (no control plane to enroll with)" 1 "${rc}"
-check_contains "happy path: detects the SDR" "Found an RTL-SDR (0bda:2838, RTL2838UHIDIR)" "${log}"
+check_contains "happy path: lists the SDR as information" "Found an RTL-SDR (0bda:2838, RTL2838UHIDIR)" "${log}"
+check_contains "happy path: says the web app sets up receivers" "web app" "${log}"
 check_contains "happy path: reports the failed enrollment" "enrollment failed" "${log}"
 check_contains "happy path: stationd says why" "cannot reach the enrollment service at https://enroll." "${log}"
 check_lacks "happy path: the token is not in the output" "${TOKEN_BODY}" "${log}"
@@ -191,17 +191,17 @@ check_contains "sources: the suite" "Suites: ${SUITE}" "${sources}"
 check_contains "sources: the URL" "URIs: ${URL}" "${sources}"
 check_eq "the package is installed" "install ok installed" \
     "$(dpkg-query -W -f='${Status}' coaxhub-stationd)"
-check_eq "the profile is written once" 'profile = "rtlsdr-hf"' "$(grep '^profile' "${CONFIG}")"
-check_contains "the rest of stationd.toml is kept" "max_waterfall_subscriptions = 4" "$(cat "${CONFIG}")"
-check "stationd.toml stays valid" stationd check-config
+check "the installer writes no configuration" test ! -e /etc/coaxhub
+check_eq "the installer writes no receivers.json" "" "$(ls -A "${RECEIVERS}")"
+check_lacks "the installer never mentions a profile" "profile" "${log}"
 check_eq "not enrolled after the failure" 3 "$(exit_code stationd status)"
 check_eq "the credentials directory is untouched" "" "$(ls -A /var/lib/coaxhub/stationd)"
 
 # ---------------------------------------------------------------- on a terminal
-# As a person runs it: questions and the token prompt on the terminal.
+# As a person runs it: the token prompt is the only question on the terminal.
 interactive() { python3 /test/interactive.py "$@"; }
 rc=0
-interactive /tmp/tty.log "Choose [1]:" 2 \
+interactive /tmp/tty.log \
     "Enrollment token (input hidden):" "chs_enr_BADBAD" \
     "Enrollment token (input hidden):" "chs_enr_${TOKEN_BODY}" \
     -- sh -c "cat '${good}' | COAXHUB_INSTALL_USB_DEVICES=/tmp/usb sh -s -- ${common[*]}" || rc=$?
@@ -209,8 +209,10 @@ tty_log="$(tr -d '\r' </tmp/tty.log)"
 printf '# terminal:\n%s\n' "$(grep -v '^\(Get\|Hit\|Reading\|Building\|Selecting\|Preparing\|Unpacking\|Setting\)' \
     <<<"${tty_log}" | sed 's/^/#   /')"
 check_eq "terminal: exits 1 (no control plane)" 1 "${rc}"
-check_contains "terminal: asks for the profile" "HF by direct sampling" "${tty_log}"
-check_eq "terminal: answer 2 is rtlsdr-hf" 'profile = "rtlsdr-hf"' "$(grep '^profile' "${CONFIG}")"
+check_contains "terminal: lists the SDR" "Found an RTL-SDR (0bda:2838, RTL2838UHIDIR)" "${tty_log}"
+check_lacks "terminal: no profile question" "Choose" "${tty_log}"
+check_lacks "terminal: no band question" "bands" "${tty_log}"
+check_lacks "terminal: no profile at all" "profile" "${tty_log}"
 check_contains "terminal: a refused token asks again" "Try again (2 of 3)" "${tty_log}"
 check_contains "terminal: then reports the failed enrollment" "enrollment failed" "${tty_log}"
 check_lacks "terminal: the refused token is not echoed" "BADBAD" "${tty_log}"
@@ -219,53 +221,58 @@ check_lacks "terminal: the token is not echoed" "${TOKEN_BODY}" "${tty_log}"
 rc=0
 interactive /tmp/tty.log "Enrollment token (input hidden):" x1 \
     "Enrollment token (input hidden):" x2 "Enrollment token (input hidden):" x3 \
-    -- env COAXHUB_INSTALL_USB_DEVICES=/tmp/usb sh "${good}" --profile rtlsdr "${common[@]}" || rc=$?
+    -- env COAXHUB_INSTALL_USB_DEVICES=/tmp/usb sh "${good}" "${common[@]}" || rc=$?
 check_eq "terminal: three refused tokens: exits 1" 1 "${rc}"
 check_contains "terminal: three refused tokens: says so" "not accepted 3 times" "$(cat /tmp/tty.log)"
 
+# ---------------------------------------------------------------- no SDR
+# The installer says it sees none and carries on (a station can be installed
+# before its SDR arrives), with no question, on a terminal and without one.
+rc="$(COAXHUB_INSTALL_USB_DEVICES=/tmp/nousb run /tmp/t.log "${good}" --token-file /root/token "${common[@]}")"
+check_eq "no SDR, no terminal: carries on (exits 1, no control plane)" 1 "${rc}"
+check_contains "no SDR, no terminal: says it sees none" "No RTL-SDR found" "$(cat /tmp/t.log)"
+check_contains "no SDR, no terminal: reaches enrollment" "enrollment failed" "$(cat /tmp/t.log)"
+check_lacks "no SDR, no terminal: asks nothing" "Continue anyway" "$(cat /tmp/t.log)"
 rc=0
-interactive /tmp/tty.log "Continue anyway? [y/N]" n \
-    -- env COAXHUB_INSTALL_USB_DEVICES=/tmp/nousb sh "${good}" "${common[@]}" || rc=$?
-check_eq "terminal: no SDR, answer no: exits 1" 1 "${rc}"
-check_contains "terminal: no SDR, answer no: stops" "stopped" "$(cat /tmp/tty.log)"
+interactive /tmp/tty.log \
+    -- env COAXHUB_INSTALL_USB_DEVICES=/tmp/nousb sh "${good}" --token-file /root/token "${common[@]}" || rc=$?
+tty_log="$(tr -d '\r' </tmp/tty.log)"
+check_eq "no SDR, terminal: carries on (exits 1, no control plane)" 1 "${rc}"
+check_contains "no SDR, terminal: says it sees none" "No RTL-SDR found" "${tty_log}"
+check_contains "no SDR, terminal: reaches enrollment" "enrollment failed" "${tty_log}"
+check_lacks "no SDR, terminal: asks nothing" "Continue anyway" "${tty_log}"
 
 # ---------------------------------------------------------------- RTL-SDR Blog V4
-# Its own profile, without a question (it covers HF and VHF/UHF).
+# Listed by its USB product string like any other SDR: no question, and no
+# choice made for the owner (the web app offers the V4 its own profile).
 rc=0
 interactive /tmp/tty.log \
     -- env COAXHUB_INSTALL_USB_DEVICES=/tmp/usbv4 sh "${good}" --token-file /root/token "${common[@]}" || rc=$?
 tty_log="$(tr -d '\r' </tmp/tty.log)"
 check_eq "V4 on a terminal: exits 1 (no control plane)" 1 "${rc}"
-check_contains "V4 on a terminal: detects it" "Found an RTL-SDR (0bda:2838, Blog V4)" "${tty_log}"
-check_contains "V4 on a terminal: takes rtlsdr-v4" "Using the rtlsdr-v4 profile" "${tty_log}"
-check_lacks "V4 on a terminal: asks no profile question" "Choose [1]:" "${tty_log}"
-check_eq "V4 on a terminal: rtlsdr-v4 is written" 'profile = "rtlsdr-v4"' "$(grep '^profile' "${CONFIG}")"
-check "stationd.toml with rtlsdr-v4 stays valid" stationd check-config
-
-rc="$(COAXHUB_INSTALL_USB_DEVICES=/tmp/usbv4 run /tmp/t.log "${good}" --profile rtlsdr-hf \
-    --token-file /root/token "${common[@]}")"
-check_eq "V4 with --profile rtlsdr-hf: installs it anyway (exits 1, no control plane)" 1 "${rc}"
-check_contains "V4 with --profile rtlsdr-hf: warns" \
-    "direct sampling (rtlsdr-hf) receives nothing on an RTL-SDR Blog V4" "$(cat /tmp/t.log)"
-check_eq "V4 with --profile rtlsdr-hf: rtlsdr-hf is written" 'profile = "rtlsdr-hf"' "$(grep '^profile' "${CONFIG}")"
+check_contains "V4 on a terminal: lists it" "Found an RTL-SDR (0bda:2838, Blog V4)" "${tty_log}"
+check_lacks "V4 on a terminal: asks no question" "Choose" "${tty_log}"
+check_lacks "V4 on a terminal: names no profile" "profile" "${tty_log}"
 
 rc="$(COAXHUB_INSTALL_USB_DEVICES=/tmp/usbv4 run /tmp/t.log "${good}" --token-file /root/token "${common[@]}")"
 check_eq "V4, no terminal: exits 1 (no control plane)" 1 "${rc}"
-check_contains "V4, no terminal: takes rtlsdr-v4" "Using the rtlsdr-v4 profile" "$(cat /tmp/t.log)"
+check_contains "V4, no terminal: lists it" "Found an RTL-SDR (0bda:2838, Blog V4)" "$(cat /tmp/t.log)"
+check_lacks "V4, no terminal: names no profile" "profile" "$(cat /tmp/t.log)"
+check "nothing under /etc/coaxhub after any of it" test ! -e /etc/coaxhub
+check_eq "no receivers.json after any of it" "" "$(ls -A "${RECEIVERS}")"
 
 # ---------------------------------------------------------------- again
 sum_before="$(md5sum "${KEYRING}" "${SOURCES}")"
 rc=0
-COAXHUB_INSTALL_USB_DEVICES=/tmp/usb sh "${good}" --profile rtlsdr --token-file /root/token \
+COAXHUB_INSTALL_USB_DEVICES=/tmp/usb sh "${good}" --token-file /root/token \
     "${common[@]}" </dev/null >/tmp/t.log 2>&1 || rc=$?
 check_eq "re-run: same result" 1 "${rc}"
 check_eq "re-run: keyring and sources unchanged" "${sum_before}" "$(md5sum "${KEYRING}" "${SOURCES}")"
 check_eq "re-run: one sources file" 1 "$(grep -rl "${URL}" /etc/apt/sources.list.d | wc -l)"
-check_eq "re-run: the new profile, once" 'profile = "rtlsdr"' "$(grep '^profile' "${CONFIG}")"
 
 printf 'chs_enr_TOOSHORT\n' >/root/bad-token
 rc=0
-COAXHUB_INSTALL_USB_DEVICES=/tmp/usb sh "${good}" --profile rtlsdr --token-file /root/bad-token \
+COAXHUB_INSTALL_USB_DEVICES=/tmp/usb sh "${good}" --token-file /root/bad-token \
     "${common[@]}" </dev/null >/tmp/t.log 2>&1 || rc=$?
 check_eq "malformed token: exits 1" 1 "${rc}"
 check_contains "malformed token: says the token was refused" "was not accepted" "$(cat /tmp/t.log)"
@@ -314,7 +321,10 @@ log="$(cat /tmp/t.log)"
 check_eq "enrolled re-run: exits 0" 0 "${rc}"
 check_contains "enrolled re-run: waits for NTP" "The clock is synchronised" "${log}"
 check_contains "enrolled re-run: skips enrollment" "already enrolled" "${log}"
-check_contains "enrolled re-run: --yes takes the default profile" "Using the rtlsdr profile" "${log}"
+check_contains "enrolled re-run: -y asks nothing and carries on without an SDR" "No RTL-SDR found" "${log}"
+check_contains "enrolled re-run: --no-start names stationd alone" \
+    "sudo systemctl enable --now stationd.service" "${log}"
+check_lacks "enrolled re-run: no radiod unit is enabled or started" "coaxhub-radiod" "${log}"
 check_contains "enrolled re-run: prints stationd status" "enrolled" "${log}"
 check_eq "enrolled re-run: the key is untouched" "${key_before}" "$(md5sum /var/lib/coaxhub/stationd/key.pem)"
 
@@ -322,11 +332,12 @@ rc=0
 PATH="/tmp/shim:${PATH}" COAXHUB_INSTALL_USB_DEVICES=/tmp/usbv4 sh "${good}" -y --no-start </dev/null \
     >/tmp/t.log 2>&1 || rc=$?
 check_eq "V4 with --yes: exits 0" 0 "${rc}"
-check_contains "V4 with --yes: takes rtlsdr-v4" "Using the rtlsdr-v4 profile" "$(cat /tmp/t.log)"
-check_eq "V4 with --yes: rtlsdr-v4 is written" 'profile = "rtlsdr-v4"' "$(grep '^profile' "${CONFIG}")"
+check_contains "V4 with --yes: lists it" "Found an RTL-SDR (0bda:2838, Blog V4)" "$(cat /tmp/t.log)"
+check "V4 with --yes: nothing under /etc/coaxhub" test ! -e /etc/coaxhub
+check_eq "V4 with --yes: no receivers.json" "" "$(ls -A "${RECEIVERS}")"
 
 rc=0
-COAXHUB_INSTALL_USB_DEVICES=/tmp/usb sh "${good}" --profile rtlsdr --reenroll --token-file /root/token \
+COAXHUB_INSTALL_USB_DEVICES=/tmp/usb sh "${good}" --reenroll --token-file /root/token \
     "${common[@]}" </dev/null >/tmp/t.log 2>&1 || rc=$?
 check_eq "--reenroll: enrolls again, and fails without a control plane" 1 "${rc}"
 check_contains "--reenroll: reports it" "enrollment failed" "$(cat /tmp/t.log)"

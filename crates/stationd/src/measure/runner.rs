@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! The plan runner: one task per plan, on the station's wall clock
-//! (the measurement design §2.2, §4, §4.1).
+//! The plan runner: one task per receiver of a plan, on the station's wall
+//! clock (station protocol §4.1).
 //!
 //! Minute by minute, at each UTC boundary:
 //!
 //! 1. Under idle duty with the channel closed, it wakes [`OPEN_BEFORE_MS`]
-//!    before a measuring minute and opens the measurement channel, which
-//!    starts the front end.
-//! 2. At the boundary it decides the duty from the connection's listener
-//!    channels and waterfall subscriptions, and sends
-//!    `Event{MEASUREMENT_DUTY}` when it changed; it applies the pause rules.
+//!    before a measuring minute and opens the receiver's measurement
+//!    channel, which starts its front end.
+//! 2. At the boundary it decides the receiver's duty from the connection's
+//!    listener channels and waterfall subscriptions on that receiver, and
+//!    sends `Event{MEASUREMENT_DUTY}` when it changed; it applies the pause
+//!    rules (the host's for every receiver, its backend's for it alone).
 //! 3. A measured minute's 15 dwell slots go round-robin over its windows
 //!    (slot `s` → window `s mod n`), [`Shape::dwell_ms`] each, polled every
 //!    `poll_interval_ms`. A hop's own reply is the dwell's first spectrum when
@@ -17,18 +18,20 @@
 //!    [`WARMUP_MS`] of the open or [`HOP_SETTLE_POLLS`] polls of a hop are
 //!    discarded (none, as measured). A window with fewer
 //!    spectra than planned makes the report partial. After the minute it
-//!    sends the `NoiseFloorReport`.
+//!    sends the receiver's `NoiseFloorReport`.
 //! 4. A minute that is not measured closes the channel [`CLOSE_AFTER_MS`]
 //!    after its boundary (the front end stops when the last channel closes).
 //!
 //! It sends no front-end command: it only opens, retunes, polls and closes
 //! its own channel. Reports go to the outbound queue's measurement class
 //! (dropped once older than 10 s); duty events are events (never dropped for
-//! age). It stops when cancelled (`StopMeasurements`, a frontend change, the
-//! end of the connection), and on its own when the backend refuses the
-//! channel ([`StopCause`]).
+//! age). It stops when cancelled (`StopMeasurements`, a front end or a
+//! receiver changing, the end of the connection: the whole plan stops), and
+//! on its own when its backend refuses the channel ([`StopCause`]).
 
-use station_backend::{MeasurementChannel, MeasurementId};
+use std::sync::Arc;
+
+use station_backend::{Backend, MeasurementChannel, MeasurementId};
 use station_proto::{limits, v1};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -85,6 +88,10 @@ struct Minute {
 
 pub(crate) struct Runner {
     pub measurement_id: u32,
+    /// The receiver this runner measures.
+    pub receiver_id: u32,
+    /// Its backend.
+    pub backend: Arc<dyn Backend>,
     pub channel: MeasurementId,
     pub plan: Plan,
     pub shape: Shape,
@@ -122,7 +129,7 @@ impl Runner {
         let mut duty = self.duty;
         let outcome = self.run_inner(&mut st, &mut duty).await;
         if st.open {
-            if let Err(e) = self.deps.backend.close_measurement(self.channel).await {
+            if let Err(e) = self.backend.close_measurement(self.channel).await {
                 debug!(error = %e, "closing the measurement channel");
             }
         }
@@ -144,18 +151,18 @@ impl Runner {
         self.deps.clock.now_ms()
     }
 
+    /// The receiver's listener channels and subscriptions.
     fn open_count(&self) -> usize {
-        let t = self
-            .deps
+        self.deps
             .tables
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        t.open_channels() + t.open_subscriptions()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .listeners_on(self.receiver_id)
     }
 
     fn load(&self) -> Load {
         let host = self.deps.load.sample();
-        let health = self.deps.backend.health();
+        let health = self.backend.health();
         Load {
             load_avg_1m: host.load_avg_1m,
             cpu_count: host.cpu_count,
@@ -171,8 +178,8 @@ impl Runner {
             resolution_bw_hz: self.shape.resolution_bw_hz,
             poll_interval: std::time::Duration::from_millis(u64::from(self.poll_interval_ms)),
         };
-        if let Err(e) = self.deps.backend.open_measurement(self.channel, ch).await {
-            warn!(error = %e, "the backend refused the measurement channel; measuring stops");
+        if let Err(e) = self.backend.open_measurement(self.channel, ch).await {
+            warn!(receiver_id = self.receiver_id, error = %e, "the backend refused the measurement channel; measuring stops");
             return Err(Halt::Stopped(StopCause::BackendError));
         }
         st.open = true;
@@ -188,7 +195,7 @@ impl Runner {
         }
         st.open = false;
         st.center_hz = None;
-        if let Err(e) = self.deps.backend.close_measurement(self.channel).await {
+        if let Err(e) = self.backend.close_measurement(self.channel).await {
             debug!(error = %e, "closing the measurement channel");
         }
         debug!("measurement channel closed");
@@ -297,8 +304,7 @@ impl Runner {
     }
 
     fn overloads(&self) -> u64 {
-        self.deps
-            .backend
+        self.backend
             .health()
             .frontend
             .map_or(0, |f| f.overloads_total)
@@ -330,7 +336,6 @@ impl Runner {
             let mut hop_reply = None;
             if st.center_hz != Some(w.center_hz) {
                 match self
-                    .deps
                     .backend
                     .retune_measurement(self.channel, w.center_hz)
                     .await
@@ -372,7 +377,7 @@ impl Runner {
                 }
                 let polled = match reply {
                     Some(s) => Ok(s),
-                    None => self.deps.backend.poll_measurement(self.channel).await,
+                    None => self.backend.poll_measurement(self.channel).await,
                 };
                 match polled {
                     Ok(spectrum) => {
@@ -394,10 +399,16 @@ impl Runner {
     }
 
     fn send_duty(&self, duty: v1::MeasurementDuty, minute: i64) {
-        debug!(duty = duty.as_str_name(), minute, "duty changes");
+        debug!(
+            receiver_id = self.receiver_id,
+            duty = duty.as_str_name(),
+            minute,
+            "duty changes"
+        );
         self.deps.outbound.push_body(Body::Event(v1::Event {
             kind: v1::event::Kind::MeasurementDuty as i32,
             measurement_id: Some(self.measurement_id),
+            receiver_id: Some(self.receiver_id),
             measurement_duty: Some(duty as i32),
             effective_unix_ms: Some(minute),
             ..Default::default()
@@ -445,15 +456,17 @@ impl Runner {
             debug!(minute, "nothing measured this minute; no report");
             return;
         }
-        let frontend = match self.deps.backend.frontend_state().await {
-            Ok(f) => f,
+        let mut frontend = match self.backend.frontend_state().await {
+            Ok(f) => sanitize_frontend(f),
             Err(_) => self.frontend.clone(),
         };
+        frontend.receiver_id = self.receiver_id;
         let report = v1::NoiseFloorReport {
             measurement_id: self.measurement_id,
+            receiver_id: self.receiver_id,
             window_start_unix_ms: minute,
             window_ms: limits::NOISE_WINDOW_MS,
-            frontend: Some(sanitize_frontend(frontend)),
+            frontend: Some(frontend),
             overloads: u32::try_from(overloads).unwrap_or(u32::MAX),
             clock: Some((self.deps.clock_state)()),
             bands,

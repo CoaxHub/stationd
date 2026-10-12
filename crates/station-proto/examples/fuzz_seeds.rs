@@ -83,34 +83,118 @@ fn station_message_seeds(dir: &Path) -> Res<()> {
         platform: "linux-aarch64".into(),
         boot_id: 1,
     });
+    // Request ids are those of the target's busy session.
+    let receiver = |receiver_id, start_hz| v1::ReceiverCapabilities {
+        receiver_id,
+        tunable_range: Some(range(start_hz, start_hz + 2_048_000)),
+        hardware_range: Some(range(0, 28_800_000)),
+        sample_rate_hz: 2_048_000,
+        max_channels: 16,
+        frontend: Some(v1::FrontendControls {
+            can_retune: true,
+            ..Default::default()
+        }),
+        sdr_model: "RTL-SDR HF direct sampling".into(),
+    };
     let capabilities = ok(
-        6,
+        8,
         Payload::Capabilities(v1::Capabilities {
-            tunable_range: Some(range(0, 2_400_000)),
-            hardware_range: Some(range(0, 1_766_000_000)),
-            sample_rate_hz: 2_400_000,
-            max_channels: 16,
+            receivers: vec![receiver(1, 6_076_000), receiver(2, 13_176_000)],
             modes: vec![1, 2, 3, 4, 5, 6],
             codecs: vec![1],
             waterfall: Some(v1::WaterfallLimits {
                 max_bins: 4096,
                 min_row_interval_ms: 50,
-                max_subscriptions: 4,
+                max_subscriptions: 8,
             }),
-            frontend: Some(v1::FrontendControls {
-                has_gain: true,
-                max_gain_db: 49.6,
-                antenna_ports: vec!["A".into()],
-                ..Default::default()
+            measurements: Some(v1::MeasurementLimits {
+                max_noise_bands: 32,
+                method_version: 1,
             }),
-            allowed_admin_ops: vec![],
-            frontend_control_allowed: true,
-            sdr_model: "RTL-SDR".into(),
-            measurements: None,
         }),
     );
+    let sdr = |serial: &str, product: &str, models: Vec<v1::ModelOption>, receiver_id| v1::Sdr {
+        usb_vendor_id: 0x0bda,
+        usb_product_id: 0x2838,
+        manufacturer: "RTLSDRBlog".into(),
+        product: product.into(),
+        serial: serial.into(),
+        port: "1-1.3".into(),
+        models,
+        receiver_id,
+    };
+    let option = |model: v1::SdrModel, profiles: &[v1::SdrProfile]| v1::ModelOption {
+        model: model as i32,
+        profiles: profiles.iter().map(|p| *p as i32).collect(),
+    };
+    let v3 = vec![
+        option(
+            v1::SdrModel::RtlsdrDirectSampling,
+            &[v1::SdrProfile::Rtlsdr, v1::SdrProfile::RtlsdrHf],
+        ),
+        option(v1::SdrModel::RtlsdrOther, &[v1::SdrProfile::Rtlsdr]),
+    ];
+    let profile = |profile: v1::SdrProfile, start_hz, end_hz, default_center_hz| v1::ProfileInfo {
+        profile: profile as i32,
+        center_range: Some(range(start_hz, end_hz)),
+        default_center_hz,
+        sample_rate_hz: 2_048_000,
+        tunable_span_hz: 2_048_000,
+        frontend: Some(v1::FrontendControls {
+            can_retune: true,
+            ..Default::default()
+        }),
+    };
+    let hardware = ok(
+        19,
+        Payload::Hardware(v1::Hardware {
+            sdrs: vec![
+                sdr("00000001", "RTL2838UHIDIR", v3.clone(), Some(1)),
+                sdr("00000002", "RTL2838UHIDIR", v3, Some(2)),
+                sdr(
+                    "00000003",
+                    "Blog V4",
+                    vec![option(
+                        v1::SdrModel::RtlsdrBlogV4,
+                        &[v1::SdrProfile::RtlsdrV4],
+                    )],
+                    None,
+                ),
+            ],
+            profiles: vec![
+                profile(
+                    v1::SdrProfile::Rtlsdr,
+                    24_000_000,
+                    1_766_000_000,
+                    98_000_000,
+                ),
+                profile(v1::SdrProfile::RtlsdrHf, 1_024_000, 28_800_000, 7_100_000),
+                profile(v1::SdrProfile::RtlsdrV4, 500_000, 1_766_000_000, 7_100_000),
+            ],
+        }),
+    );
+    let receivers_configured = ok(
+        20,
+        Payload::ReceiversConfigured(v1::ReceiversConfigured {
+            receivers: [1, 2, 3]
+                .into_iter()
+                .map(|receiver_id| v1::ReceiverStatus {
+                    receiver_id,
+                    state: v1::ReceiverState::Starting as i32,
+                    detail: String::new(),
+                })
+                .collect(),
+        }),
+    );
+    let receiver_state = Body::Event(v1::Event {
+        kind: v1::event::Kind::ReceiverState as i32,
+        receiver_id: Some(2),
+        receiver_state: Some(v1::ReceiverState::NoDevice as i32),
+        detail: "SDR 00000002 is not plugged in".into(),
+        ..Default::default()
+    });
     let pong = ok(
-        13,
+        15,
         Payload::Pong(v1::Pong {
             nonce: 5,
             station_time_unix_ms: 0,
@@ -138,14 +222,10 @@ fn station_message_seeds(dir: &Path) -> Res<()> {
         power_dbfs: -40.0,
         squelch_open: Some(true),
     });
-    let status = Body::Status(v1::StationStatus {
-        uptime_s: 60,
-        host: Some(v1::HostHealth {
-            load_avg_1m: 0.3,
-            cpu_count: 4,
-            cpu_temp_c: Some(45.0),
-            ..Default::default()
-        }),
+    let health = |receiver_id| v1::ReceiverHealth {
+        receiver_id,
+        state: v1::ReceiverState::Running as i32,
+        detail: String::new(),
         backend: Some(v1::BackendHealth {
             state: 1,
             version: "ka9q".into(),
@@ -155,6 +235,18 @@ fn station_message_seeds(dir: &Path) -> Res<()> {
             gain_db: 30.0,
             ..Default::default()
         }),
+        active_channels: 1,
+        backend_cpu: Some(0.2),
+    };
+    let status = Body::Status(v1::StationStatus {
+        uptime_s: 60,
+        host: Some(v1::HostHealth {
+            load_avg_1m: 0.3,
+            cpu_count: 4,
+            cpu_temp_c: Some(45.0),
+            ..Default::default()
+        }),
+        receivers: vec![health(1), health(2)],
         ..Default::default()
     });
     let closed = Body::Event(v1::Event {
@@ -165,7 +257,7 @@ fn station_message_seeds(dir: &Path) -> Res<()> {
         ..Default::default()
     });
     let updated = ok(
-        8,
+        10,
         Payload::ChannelUpdated(v1::ChannelUpdated {
             channel_id: 1,
             frequency_hz: 7_150_000,
@@ -175,9 +267,10 @@ fn station_message_seeds(dir: &Path) -> Res<()> {
         }),
     );
     let subscribed = ok(
-        11,
+        13,
         Payload::WaterfallSubscribed(v1::WaterfallSubscribed {
             subscription_id: 3,
+            receiver_id: 1,
             range: Some(range(7_000_000, 7_300_000)),
             bins: 256,
             row_interval_ms: 100,
@@ -189,13 +282,18 @@ fn station_message_seeds(dir: &Path) -> Res<()> {
         }),
     );
 
-    // Protocol 1.1: plan 1 of the target's busy session (idle, band 1).
+    // Plan 1 of the target's busy session (receiver 1 idle, band 1).
+    let frontend = |receiver_id| v1::FrontendState {
+        receiver_id,
+        ..Default::default()
+    };
     let noise = |window_start_unix_ms| {
         Body::Noise(v1::NoiseFloorReport {
             measurement_id: 1,
+            receiver_id: 1,
             window_start_unix_ms,
             window_ms: 60_000,
-            frontend: Some(v1::FrontendState::default()),
+            frontend: Some(frontend(1)),
             overloads: 0,
             clock: Some(v1::ClockState {
                 synchronized: true,
@@ -218,6 +316,7 @@ fn station_message_seeds(dir: &Path) -> Res<()> {
     };
     let duty = Body::Event(v1::Event {
         kind: v1::event::Kind::MeasurementDuty as i32,
+        receiver_id: Some(1),
         measurement_id: Some(1),
         measurement_duty: Some(v1::MeasurementDuty::Continuous as i32),
         effective_unix_ms: Some(1_790_942_460_000),
@@ -230,17 +329,21 @@ fn station_message_seeds(dir: &Path) -> Res<()> {
         ..Default::default()
     });
     let started = ok(
-        16,
+        17,
         Payload::MeasurementsStarted(v1::MeasurementsStarted {
             measurement_id: 2,
             noise_bands: vec![v1::NoiseBand {
                 band_id: 2,
+                receiver_id: 2,
                 ranges: vec![range(14_000_000, 14_350_000)],
                 key: "20m".into(),
             }],
-            noise_interval_ms: 60_000,
-            duty: v1::MeasurementDuty::Continuous as i32,
-            frontend: Some(v1::FrontendState::default()),
+            receivers: vec![v1::MeasuredReceiver {
+                receiver_id: 2,
+                noise_interval_ms: 60_000,
+                duty: v1::MeasurementDuty::Continuous as i32,
+                frontend: Some(frontend(2)),
+            }],
             method_version: 1,
         }),
     );
@@ -253,7 +356,19 @@ fn station_message_seeds(dir: &Path) -> Res<()> {
     frame(&mut measuring, 0, noise(1_790_942_460_000))?;
     write(dir, "measuring", &measuring)?;
 
+    // The receiver set: hardware, the new set accepted, a receiver's state.
+    let mut receivers = Vec::new();
+    frame(&mut receivers, 0, hardware.clone())?;
+    frame(&mut receivers, 0, receivers_configured.clone())?;
+    frame(&mut receivers, 1, receiver_state.clone())?;
+    frame(&mut receivers, 0, capabilities.clone())?;
+    frame(&mut receivers, 250, status.clone())?;
+    write(dir, "receivers", &receivers)?;
+
     let singles: Vec<(&str, Body)> = vec![
+        ("response_hardware", hardware),
+        ("response_receivers_configured", receivers_configured),
+        ("event_receiver_state", receiver_state),
         ("noise", noise(1_790_942_400_000)),
         ("event_measurement_duty", duty),
         ("event_measurement_stopped", stopped),

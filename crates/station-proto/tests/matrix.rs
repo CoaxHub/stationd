@@ -23,8 +23,9 @@ fn v(major: u32, minor: u32) -> ProtocolVersion {
 }
 
 #[test]
-fn protocol_version_is_one_one() {
-    assert_eq!(PROTOCOL_VERSION, v(1, 1));
+fn protocol_version_is_two_zero() {
+    assert_eq!(PROTOCOL_VERSION, v(2, 0));
+    assert_eq!(station_proto::limits::SUPPORTED_MAJORS, [2]);
 }
 
 #[test]
@@ -66,10 +67,17 @@ fn hub_negotiation_matrix() {
             ),
         }
     }
-    assert_eq!(negotiate(&hello_with(1, 4)), Ok(v(1, 1)));
-    // A 1.0 station keeps 1.0: no measurements.
-    assert_eq!(negotiate(&hello_with(1, 0)), Ok(v(1, 0)));
-    assert!(negotiate(&hello_with(2, 0)).is_err());
+    assert_eq!(negotiate(&hello_with(2, 0)), Ok(v(2, 0)));
+    assert_eq!(negotiate(&hello_with(2, 4)), Ok(v(2, 0)));
+    // Major 2 only: an older or newer major is told to update.
+    for (major, minor) in [(1, 0), (1, 1), (3, 0), (0, 9)] {
+        assert_eq!(
+            negotiate(&hello_with(major, minor)),
+            Err(Unsupported {
+                peer: Some(v(major, minor))
+            })
+        );
+    }
     assert_eq!(
         Unsupported {
             peer: Some(v(3, 1))
@@ -106,15 +114,16 @@ fn station_welcome_matrix() {
             assert_eq!(got, Ok(hub.unwrap_or_default()));
         }
     }
-    assert!(negotiate_welcome(&welcome(Some(v(1, 0)))).is_ok());
-    assert!(negotiate_welcome(&welcome(Some(v(1, 1)))).is_ok());
-    assert!(negotiate_welcome(&welcome(Some(v(1, 2)))).is_err());
+    assert!(negotiate_welcome(&welcome(Some(v(2, 0)))).is_ok());
+    assert!(negotiate_welcome(&welcome(Some(v(2, 1)))).is_err());
+    assert!(negotiate_welcome(&welcome(Some(v(1, 1)))).is_err());
+    assert!(negotiate_welcome(&welcome(Some(v(3, 0)))).is_err());
 }
 
 #[test]
 fn session_rejects_unsupported_versions_without_a_strike() {
     let t0 = Instant::now();
-    for station in [v(0, 1), v(2, 0), v(9, 9)] {
+    for station in [v(0, 1), v(1, 0), v(1, 1), v(3, 0), v(9, 9)] {
         let mut s = Session::new(t0);
         let m = msg(Body::Hello(hello_with(station.major, station.minor)));
         let Verdict::Violation(kind) = s.check(&m, t0) else {
@@ -137,10 +146,10 @@ fn session_rejects_unsupported_versions_without_a_strike() {
     // A newer minor of the same major is accepted at our minor.
     let mut s = Session::new(t0);
     assert_eq!(
-        s.check(&msg(Body::Hello(hello_with(1, 9))), t0),
+        s.check(&msg(Body::Hello(hello_with(2, 9))), t0),
         Verdict::Accept
     );
-    assert_eq!(s.negotiated_version(), Some(v(1, 1)));
+    assert_eq!(s.negotiated_version(), Some(v(2, 0)));
 }
 
 fn command(kind: CommandKind) -> Command {
@@ -152,22 +161,31 @@ fn command(kind: CommandKind) -> Command {
             ..Default::default()
         }),
         CommandKind::CloseChannel => close_channel(7),
-        CommandKind::SetFrontend => Command::SetFrontend(v1::SetFrontend::default()),
+        CommandKind::SetFrontend => Command::SetFrontend(v1::SetFrontend {
+            receiver_id: RX,
+            ..Default::default()
+        }),
         CommandKind::SubscribeWaterfall => subscribe(7, 1024, 100),
         CommandKind::UnsubscribeWaterfall => unsubscribe(7),
         CommandKind::Ping => Command::Ping(v1::Ping {
             nonce: 7,
             hub_time_unix_ms: 0,
         }),
-        CommandKind::AdminOp => Command::AdminOp(v1::AdminOp { kind: 1 }),
+        CommandKind::AdminOp => Command::AdminOp(v1::AdminOp {
+            kind: 2,
+            receiver_id: Some(RX),
+        }),
         CommandKind::StartMeasurements => start_measurements(7),
         CommandKind::StopMeasurements => {
             Command::StopMeasurements(v1::StopMeasurements { measurement_id: 7 })
         }
+        CommandKind::GetHardware => Command::GetHardware(v1::GetHardware {}),
+        CommandKind::ConfigureReceivers => configure(&[RX]),
     }
 }
 
-/// A statelessly valid payload of `kind` that echoes id/nonce 7.
+/// A statelessly valid payload of `kind` that echoes id/nonce 7 and
+/// receiver [`RX`].
 fn payload(kind: PayloadKind) -> Payload {
     match kind {
         PayloadKind::Capabilities => Payload::Capabilities(capabilities()),
@@ -177,6 +195,8 @@ fn payload(kind: PayloadKind) -> Payload {
         PayloadKind::WaterfallSubscribed => waterfall_subscribed(7, 1024, 100),
         PayloadKind::Pong => pong(7),
         PayloadKind::MeasurementsStarted => measurements_started(7),
+        PayloadKind::Hardware => Payload::Hardware(hardware()),
+        PayloadKind::ReceiversConfigured => receivers_configured(&[RX]),
     }
 }
 
@@ -202,7 +222,7 @@ fn response_matching_matrix() {
     for cmd in CommandKind::ALL {
         for code in codes {
             for &p in &payloads {
-                let mut s = established_1_1(t0);
+                let mut s = established(t0);
                 s.on_request_sent(&request(1, command(cmd)), t0)
                     .expect("request");
                 let verdict = s.check(&response(1, code as i32, p.map(payload)), t0);
@@ -228,9 +248,9 @@ fn response_matching_matrix() {
             }
         }
     }
-    // 11 commands × 9 codes, one right answer each.
-    assert_eq!(accepted, 99);
-    assert_eq!(rejected, 11 * 9 * 8 - 99);
+    // 13 commands × 9 codes, one right answer each out of 10.
+    assert_eq!(accepted, 13 * 9);
+    assert_eq!(rejected, 13 * 9 * 10 - 13 * 9);
 }
 
 #[test]
@@ -259,7 +279,13 @@ fn ok_payload_table() {
             Some(PayloadKind::MeasurementsStarted),
         ),
         (CommandKind::StopMeasurements, None),
+        (CommandKind::GetHardware, Some(PayloadKind::Hardware)),
+        (
+            CommandKind::ConfigureReceivers,
+            Some(PayloadKind::ReceiversConfigured),
+        ),
     ];
+    assert_eq!(expected.len(), CommandKind::ALL.len());
     for (cmd, p) in expected {
         assert_eq!(cmd.ok_payload(), p, "{cmd}");
         assert_eq!(CommandKind::of(&command(cmd)), cmd);
@@ -274,7 +300,7 @@ fn ok_payload_table() {
         assert_eq!(PayloadKind::of(&payload(p)), p);
     }
     let names: HashSet<_> = CommandKind::ALL.iter().map(|c| c.as_str()).collect();
-    assert_eq!(names.len(), 11);
+    assert_eq!(names.len(), 13);
 }
 
 #[test]
@@ -307,7 +333,15 @@ fn violation_kind_metadata() {
         ViolationKind::NonFiniteFloat { field: "f" },
         ViolationKind::OutOfBounds { field: "f" },
         ViolationKind::InvalidRange { field: "f" },
-        ViolationKind::TunableOutsideHardware,
+        ViolationKind::TunableOutsideHardware { receiver_id: 1 },
+        ViolationKind::UnknownReceiver {
+            kind: MessageKind::Status,
+            receiver_id: 9,
+        },
+        ViolationKind::DuplicateReceiver {
+            field: "status.receivers.receiver_id",
+            receiver_id: 1,
+        },
         ViolationKind::UnsolicitedResponse { request_id: 1 },
         ViolationKind::PayloadMismatch {
             request_id: 1,
@@ -335,7 +369,15 @@ fn violation_kind_metadata() {
         },
         ViolationKind::WaterfallRate { subscription_id: 1 },
         ViolationKind::ResponseTimeouts { consecutive: 3 },
-        ViolationKind::UnsupportedVersion { major: 2, minor: 0 },
+        ViolationKind::UnknownMeasurement {
+            kind: MessageKind::Noise,
+            measurement_id: 1,
+        },
+        ViolationKind::MeasurementRate {
+            kind: MessageKind::Noise,
+            measurement_id: 1,
+        },
+        ViolationKind::UnsupportedVersion { major: 1, minor: 1 },
     ];
     let codes: HashSet<_> = all.iter().map(ViolationKind::code).collect();
     assert_eq!(codes.len(), all.len(), "codes are unique");
@@ -396,6 +438,11 @@ fn violation_kind_metadata() {
             Body::Event(v1::Event::default()),
             MessageKind::Event,
             "event",
+        ),
+        (
+            Body::Noise(v1::NoiseFloorReport::default()),
+            MessageKind::Noise,
+            "noise",
         ),
     ];
     for (body, kind, name) in kinds {

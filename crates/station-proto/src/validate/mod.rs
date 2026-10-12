@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! Hub-side validation of everything a station sends (station-protocol §5),
-//! version negotiation (§3), strikes, the ingress quota, and the station-side
-//! check of incoming requests (§3: unknown values → `UNSUPPORTED`).
+//! version negotiation (§3), strikes, the ingress quota, the station-side
+//! check of incoming requests (§3: unknown values → `UNSUPPORTED`), and the
+//! rules of a receiver set (§4.2: [`check_receiver_set`], shared by the
+//! station and the control plane; [`select_receivers`] for the hub).
 //!
 //! Stations are untrusted. The hub runs every decoded
 //! [`StationMessage`](crate::v1::StationMessage) through
@@ -21,6 +23,7 @@ mod measure;
 mod negotiate;
 mod quota;
 mod rate;
+mod receivers;
 mod request;
 mod session;
 mod strikes;
@@ -37,6 +40,10 @@ pub use negotiate::{
     Unsupported, negotiate, negotiate_against, negotiate_welcome, negotiate_welcome_against,
 };
 pub use quota::{IngressQuota, QuotaDecision};
+pub use receivers::{
+    OverlappingReceiver, ReceiverSelection, ReceiverSetError, check_receiver_set,
+    predicted_tunable_range, ranges_overlap, select_receivers,
+};
 pub use request::{RequestRejection, check_request};
 pub use session::{ExpiredRequests, RequestError, Session};
 pub use strikes::{StrikeOutcome, Strikes};
@@ -82,8 +89,8 @@ pub enum DropReason {
         /// The subscription id.
         subscription_id: u32,
     },
-    /// An `Event` naming a channel or subscription that is neither open nor
-    /// just closed (§5 `Event`).
+    /// An `Event` naming a channel, subscription or receiver that is neither
+    /// open (configured) nor just closed (§5 `Event`, §5.1).
     UnknownEventTarget,
     /// A noise report for a plan whose `MeasurementsStarted` has not arrived
     /// yet (§5.2).
@@ -101,6 +108,21 @@ pub enum DropReason {
     /// §5.2: under idle duty, a noise report for a minute that is not a
     /// measuring minute.
     NotScheduled,
+    /// §5.1: a status or event naming a receiver before the hub's first
+    /// receiver set on this connection was accepted. The station still runs
+    /// the set it kept (§2.3), which the hub hasn't seen.
+    AwaitingReceivers {
+        /// The kind of message that was dropped.
+        kind: MessageKind,
+    },
+    /// §5.1: a status naming a receiver that a later set left out less than
+    /// [`ID_CLOSE_GRACE`](crate::limits::ID_CLOSE_GRACE) ago.
+    ReceiverRemoved {
+        /// The kind of message that was dropped.
+        kind: MessageKind,
+        /// The receiver id.
+        receiver_id: u32,
+    },
 }
 
 /// A protocol violation (station-protocol §5): ends the session, and in most
@@ -193,9 +215,31 @@ pub enum ViolationKind {
         /// Field path.
         field: &'static str,
     },
-    /// §5 `Capabilities`: `tunable_range` is not inside `hardware_range`.
-    #[error("tunable_range is not inside hardware_range")]
-    TunableOutsideHardware,
+    /// §5 `Capabilities`: a receiver's `tunable_range` is not inside its
+    /// `hardware_range`.
+    #[error("receiver {receiver_id}: tunable_range is not inside hardware_range")]
+    TunableOutsideHardware {
+        /// The receiver.
+        receiver_id: u32,
+    },
+    /// §5, §5.1: a receiver the hub did not configure on this connection (or
+    /// left out of a later set more than the grace period ago), or not one of
+    /// the measurement plan's receivers (§5.2).
+    #[error("{kind} names receiver {receiver_id}, which is not configured")]
+    UnknownReceiver {
+        /// The kind of message.
+        kind: MessageKind,
+        /// The receiver id.
+        receiver_id: u32,
+    },
+    /// §5: a receiver listed twice where each must appear once.
+    #[error("{field} lists receiver {receiver_id} twice")]
+    DuplicateReceiver {
+        /// Field path.
+        field: &'static str,
+        /// The receiver id.
+        receiver_id: u32,
+    },
     /// §5 Response: no outstanding request has this id.
     #[error("response to request {request_id}, which is not outstanding")]
     UnsolicitedResponse {
@@ -285,15 +329,6 @@ pub enum ViolationKind {
         /// How many in a row.
         consecutive: u32,
     },
-    /// §3: a message type the negotiated minor does not have (a noise report
-    /// on a 1.0 session).
-    #[error("{kind} is not part of minor {minor}")]
-    MessageNotInMinor {
-        /// The kind of message.
-        kind: MessageKind,
-        /// The negotiated minor.
-        minor: u32,
-    },
     /// §5.2: a noise report or measurement event for a plan the hub never
     /// started on this connection, or stopped more than the grace period ago.
     #[error("{kind} for measurement {measurement_id}, which is not open")]
@@ -340,7 +375,9 @@ impl ViolationKind {
             Self::NonFiniteFloat { .. } => "non_finite_float",
             Self::OutOfBounds { .. } => "out_of_bounds",
             Self::InvalidRange { .. } => "invalid_range",
-            Self::TunableOutsideHardware => "tunable_outside_hardware",
+            Self::TunableOutsideHardware { .. } => "tunable_outside_hardware",
+            Self::UnknownReceiver { .. } => "unknown_receiver",
+            Self::DuplicateReceiver { .. } => "duplicate_receiver",
             Self::UnsolicitedResponse { .. } => "unsolicited_response",
             Self::PayloadMismatch { .. } => "payload_mismatch",
             Self::ResponseFieldMismatch { .. } => "response_field_mismatch",
@@ -353,7 +390,6 @@ impl ViolationKind {
             Self::WaterfallLength { .. } => "waterfall_length",
             Self::WaterfallRate { .. } => "waterfall_rate",
             Self::ResponseTimeouts { .. } => "response_timeouts",
-            Self::MessageNotInMinor { .. } => "message_not_in_minor",
             Self::UnknownMeasurement { .. } => "unknown_measurement",
             Self::MeasurementRate { .. } => "measurement_rate",
             Self::UnsupportedVersion { .. } => "unsupported_version",
@@ -392,7 +428,7 @@ pub enum MessageKind {
     Status,
     /// `Event`.
     Event,
-    /// `NoiseFloorReport` (1.1).
+    /// `NoiseFloorReport`.
     Noise,
 }
 
@@ -454,15 +490,19 @@ pub enum CommandKind {
     Ping,
     /// `AdminOp`.
     AdminOp,
-    /// `StartMeasurements` (1.1).
+    /// `StartMeasurements`.
     StartMeasurements,
-    /// `StopMeasurements` (1.1).
+    /// `StopMeasurements`.
     StopMeasurements,
+    /// `GetHardware`.
+    GetHardware,
+    /// `ConfigureReceivers`.
+    ConfigureReceivers,
 }
 
 impl CommandKind {
     /// Every command, in proto field order.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 13] = [
         Self::GetCapabilities,
         Self::OpenChannel,
         Self::UpdateChannel,
@@ -474,6 +514,8 @@ impl CommandKind {
         Self::AdminOp,
         Self::StartMeasurements,
         Self::StopMeasurements,
+        Self::GetHardware,
+        Self::ConfigureReceivers,
     ];
 
     /// The kind of a request command.
@@ -491,6 +533,8 @@ impl CommandKind {
             Command::AdminOp(_) => Self::AdminOp,
             Command::StartMeasurements(_) => Self::StartMeasurements,
             Command::StopMeasurements(_) => Self::StopMeasurements,
+            Command::GetHardware(_) => Self::GetHardware,
+            Command::ConfigureReceivers(_) => Self::ConfigureReceivers,
         }
     }
 
@@ -505,6 +549,8 @@ impl CommandKind {
             Self::SubscribeWaterfall => Some(PayloadKind::WaterfallSubscribed),
             Self::Ping => Some(PayloadKind::Pong),
             Self::StartMeasurements => Some(PayloadKind::MeasurementsStarted),
+            Self::GetHardware => Some(PayloadKind::Hardware),
+            Self::ConfigureReceivers => Some(PayloadKind::ReceiversConfigured),
             Self::CloseChannel
             | Self::UnsubscribeWaterfall
             | Self::AdminOp
@@ -534,6 +580,8 @@ impl CommandKind {
             Self::AdminOp => "admin_op",
             Self::StartMeasurements => "start_measurements",
             Self::StopMeasurements => "stop_measurements",
+            Self::GetHardware => "get_hardware",
+            Self::ConfigureReceivers => "configure_receivers",
         }
     }
 }
@@ -559,13 +607,17 @@ pub enum PayloadKind {
     WaterfallSubscribed,
     /// `Pong`.
     Pong,
-    /// `MeasurementsStarted` (1.1).
+    /// `MeasurementsStarted`.
     MeasurementsStarted,
+    /// `Hardware`.
+    Hardware,
+    /// `ReceiversConfigured`.
+    ReceiversConfigured,
 }
 
 impl PayloadKind {
     /// Every payload type, in proto field order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
         Self::Capabilities,
         Self::ChannelOpened,
         Self::ChannelUpdated,
@@ -573,6 +625,8 @@ impl PayloadKind {
         Self::WaterfallSubscribed,
         Self::Pong,
         Self::MeasurementsStarted,
+        Self::Hardware,
+        Self::ReceiversConfigured,
     ];
 
     /// The kind of a response payload.
@@ -586,6 +640,8 @@ impl PayloadKind {
             Payload::WaterfallSubscribed(_) => Self::WaterfallSubscribed,
             Payload::Pong(_) => Self::Pong,
             Payload::MeasurementsStarted(_) => Self::MeasurementsStarted,
+            Payload::Hardware(_) => Self::Hardware,
+            Payload::ReceiversConfigured(_) => Self::ReceiversConfigured,
         }
     }
 }

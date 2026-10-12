@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Every station-conformance scenario against the real stationd, in-process,
-//! over real mTLS on loopback, with a `FakeBackend`.
+//! over real mTLS on loopback, with fake backends and units on simulated
+//! SDRs.
 
 // Static [credentials] and [backend] are development-only settings.
 #![cfg(not(feature = "packaged"))]
@@ -42,9 +43,8 @@ conformance!(
     answers_ping,
     answers_every_request_once,
     rejects_unknown_command_as_unsupported,
-    admin_op_denied_by_default,
-    admin_op_allowed_when_configured,
-    set_frontend_denied_when_disabled,
+    admin_op_ok_or_unsupported,
+    set_frontend_on_a_receiver,
     status_at_interval,
     reconnects_after_hub_restart,
     reconnects_after_connection_drop,
@@ -55,17 +55,26 @@ conformance!(
     rejects_tls12_gateway,
     detects_dead_connection,
     opens_channel_and_streams_audio,
+    channel_limit_per_receiver,
     subscribes_waterfall_and_streams_rows,
     drops_channels_on_disconnect,
+    reports_hardware,
+    applies_receiver_set,
+    refuses_invalid_receiver_sets,
+    applies_set_naming_an_absent_sdr,
+    unchanged_set_keeps_channels,
+    changed_and_removed_receivers,
+    sdr_unplugged_and_back,
+    receivers_survive_reconnect_and_restart,
     measures_when_asked,
     duty_follows_listeners,
     stops_measuring_on_frontend_change,
     one_plan_per_connection,
-    refuses_measurements_when_disabled,
 );
 
-/// The pause rule still holds with the injected load (the measurement design §4.1): on a
-/// host whose load stays at 0.75 × its CPUs, an idle plan measures nothing.
+/// The pause rule still holds with the injected load (station protocol
+/// §4.1): on a host whose load stays at 0.75 × its CPUs, an idle plan
+/// measures nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_busy_host_measures_nothing() {
     let scenario = scenarios::by_name("measures_when_asked").expect("known scenario");

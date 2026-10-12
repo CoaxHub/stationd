@@ -20,12 +20,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use enroll_support::{Call, ControlServer, Renew, Script, TestCa, time_now, write_enrolled_config};
-use station_backend::FakeBackend;
 use station_conformance::{FakeHub, StationConn};
 use station_proto::v1;
 use stationd::config::Config;
 use stationd::daemon::{ConnectionState, Observed, StopReason};
-use stationd::flavour::Flavour;
 use stationd::state::{self, NewCredentials, StateDir};
 use stationd::station_api::{ControlError, StationApi};
 use stationd::{DaemonHandle, RunError};
@@ -110,7 +108,7 @@ impl Env {
         let dir = tempfile::tempdir().expect("tmp");
         let root = ca.write_root(dir.path());
         let path = write_enrolled_config(dir.path(), &control.url(), &root);
-        let config = Config::load_as(&path, Flavour::development()).expect("config");
+        let config = Config::load(&path).expect("config");
         let station_id = Uuid::new_v4();
         let serial = ca.write_enrolled(
             &StateDir::new(&config.state_dir),
@@ -150,7 +148,7 @@ impl Env {
     fn spawn(&self) -> DaemonHandle {
         stationd::spawn(
             &self.config,
-            Arc::new(FakeBackend::default()),
+            common::fake_driver().0,
             common::fast_options(),
         )
         .expect("spawn")
@@ -509,7 +507,7 @@ async fn unreachable_or_refusing_station_api_falls_back_to_the_stored_hub() {
     let dir = tempfile::tempdir().expect("tmp");
     let root = ca.write_root(dir.path());
     let path = write_enrolled_config(dir.path(), &format!("https://127.0.0.1:{port}"), &root);
-    let config = Config::load_as(&path, Flavour::development()).expect("config");
+    let config = Config::load(&path).expect("config");
     ca.write_enrolled(
         &StateDir::new(&config.state_dir),
         Uuid::new_v4(),
@@ -517,12 +515,8 @@ async fn unreachable_or_refusing_station_api_falls_back_to_the_stored_hub() {
         "sa1",
         &hub.gateway_url(),
     );
-    let d = stationd::spawn(
-        &config,
-        Arc::new(FakeBackend::default()),
-        common::fast_options(),
-    )
-    .expect("spawn");
+    let d =
+        stationd::spawn(&config, common::fake_driver().0, common::fast_options()).expect("spawn");
     let conn = connected(&mut hub).await;
     drop(conn);
     stop(d).await;
@@ -745,7 +739,7 @@ async fn clock_skew_reaches_status_and_doctor() {
         d.state(),
         d.observed(),
         d.last_error(),
-        Arc::new(FakeBackend::default()),
+        d.receivers(),
     ));
     let mut observed = d.observed();
     let mut conn = hub.accept(WAIT).await.expect("connects");
@@ -778,7 +772,7 @@ async fn clock_skew_reaches_status_and_doctor() {
     assert!(text.contains("next renewal"), "{text}");
     let checks = stationd::doctor::run_config(
         &e.config,
-        std::path::Path::new("stationd.toml"),
+        "stationd.toml",
         &stationd::doctor::Environment::default(),
     )
     .await;

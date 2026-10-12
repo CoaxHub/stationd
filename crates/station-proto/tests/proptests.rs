@@ -16,7 +16,8 @@ use prost::Message as _;
 use station_proto::backoff::{Backoff, Decision};
 use station_proto::v1::{self, request::Command, response::Payload, station_message::Body};
 use station_proto::validate::{
-    Session, Verdict, check_message, decode_station_message, decompress_row,
+    Session, Verdict, check_message, check_receiver_set, decode_station_message, decompress_row,
+    predicted_tunable_range, ranges_overlap,
 };
 
 fn text() -> BoxedStrategy<String> {
@@ -107,64 +108,220 @@ fn audio_params() -> BoxedStrategy<Option<v1::AudioParams>> {
     .boxed()
 }
 
+fn controls() -> BoxedStrategy<Option<v1::FrontendControls>> {
+    proptest::option::of((
+        float(),
+        float(),
+        float(),
+        proptest::collection::vec(text(), 0..10),
+        any::<bool>(),
+    ))
+    .prop_map(|fe| {
+        fe.map(|(a, b, c, ports, has)| v1::FrontendControls {
+            has_gain: has,
+            min_gain_db: a,
+            max_gain_db: b,
+            has_hardware_agc: !has,
+            has_attenuator: has,
+            max_attenuation_db: c,
+            antenna_ports: ports,
+            can_retune: true,
+        })
+    })
+    .boxed()
+}
+
+fn arb_receiver_capabilities() -> BoxedStrategy<v1::ReceiverCapabilities> {
+    (
+        small_id(),
+        range(),
+        range(),
+        any::<u32>(),
+        prop_oneof![0u32..100, any::<u32>()],
+        controls(),
+        text(),
+    )
+        .prop_map(|(receiver_id, tun, hw, sr, maxch, frontend, sdr_model)| {
+            v1::ReceiverCapabilities {
+                receiver_id,
+                tunable_range: tun,
+                hardware_range: hw,
+                sample_rate_hz: sr,
+                max_channels: maxch,
+                frontend,
+                sdr_model,
+            }
+        })
+        .boxed()
+}
+
 fn capabilities() -> BoxedStrategy<v1::Capabilities> {
     ({
         (
-            (
-                range(),
-                range(),
-                any::<u32>(),
-                prop_oneof![0u32..100, any::<u32>()],
-            ),
+            proptest::collection::vec(arb_receiver_capabilities(), 0..18),
             (
                 proptest::collection::vec(enum_value(), 0..8),
                 proptest::collection::vec(enum_value(), 0..3),
-                proptest::collection::vec(enum_value(), 0..3),
             ),
             proptest::option::of((any::<u32>(), any::<u32>(), any::<u32>())),
-            proptest::option::of((
-                float(),
-                float(),
-                float(),
-                proptest::collection::vec(text(), 0..10),
-            )),
-            (any::<bool>(), text()),
+            proptest::option::of((0u32..40, 0u32..3)),
         )
             .prop_map(
-                |((tun, hw, sr, maxch), (modes, codecs, ops), wf, fe, (fca, sdr))| {
-                    v1::Capabilities {
-                        tunable_range: tun,
-                        hardware_range: hw,
-                        sample_rate_hz: sr,
-                        max_channels: maxch,
-                        modes,
-                        codecs,
-                        waterfall: wf.map(|(max_bins, min_row_interval_ms, max_subscriptions)| {
-                            v1::WaterfallLimits {
-                                max_bins,
-                                min_row_interval_ms,
-                                max_subscriptions,
-                            }
-                        }),
-                        frontend: fe.map(|(a, b, c, ports)| v1::FrontendControls {
-                            has_gain: true,
-                            min_gain_db: a,
-                            max_gain_db: b,
-                            has_hardware_agc: false,
-                            has_attenuator: true,
-                            max_attenuation_db: c,
-                            antenna_ports: ports,
-                            can_retune: true,
-                        }),
-                        allowed_admin_ops: ops,
-                        frontend_control_allowed: fca,
-                        sdr_model: sdr,
-                        measurements: None,
-                    }
+                |(receivers, (modes, codecs), wf, measurements)| v1::Capabilities {
+                    receivers,
+                    modes,
+                    codecs,
+                    waterfall: wf.map(|(max_bins, min_row_interval_ms, max_subscriptions)| {
+                        v1::WaterfallLimits {
+                            max_bins,
+                            min_row_interval_ms,
+                            max_subscriptions,
+                        }
+                    }),
+                    measurements: measurements.map(|(max_noise_bands, method_version)| {
+                        v1::MeasurementLimits {
+                            max_noise_bands,
+                            method_version,
+                        }
+                    }),
                 },
             )
     })
     .boxed()
+}
+
+fn arb_sdr() -> BoxedStrategy<v1::Sdr> {
+    (
+        (text(), text(), text(), text()),
+        proptest::collection::vec(
+            (enum_value(), proptest::collection::vec(enum_value(), 0..3)),
+            0..3,
+        ),
+        proptest::option::of(small_id()),
+    )
+        .prop_map(
+            |((manufacturer, product, serial, port), models, receiver_id)| v1::Sdr {
+                usb_vendor_id: 0x0bda,
+                usb_product_id: 0x2838,
+                manufacturer,
+                product,
+                serial,
+                port,
+                models: models
+                    .into_iter()
+                    .map(|(model, profiles)| v1::ModelOption { model, profiles })
+                    .collect(),
+                receiver_id,
+            },
+        )
+        .boxed()
+}
+
+fn arb_hardware() -> BoxedStrategy<v1::Hardware> {
+    (
+        proptest::collection::vec(arb_sdr(), 0..18),
+        proptest::collection::vec(
+            (enum_value(), range(), freq(), any::<u32>(), controls()),
+            0..4,
+        ),
+    )
+        .prop_map(|(sdrs, profiles)| v1::Hardware {
+            sdrs,
+            profiles: profiles
+                .into_iter()
+                .map(
+                    |(profile, center_range, default_center_hz, span, frontend)| v1::ProfileInfo {
+                        profile,
+                        center_range,
+                        default_center_hz,
+                        sample_rate_hz: 2_048_000,
+                        tunable_span_hz: span,
+                        frontend,
+                    },
+                )
+                .collect(),
+        })
+        .boxed()
+}
+
+fn arb_receivers_configured() -> BoxedStrategy<v1::ReceiversConfigured> {
+    proptest::collection::vec((small_id(), enum_value(), text()), 0..18)
+        .prop_map(|rs| v1::ReceiversConfigured {
+            receivers: rs
+                .into_iter()
+                .map(|(receiver_id, state, detail)| v1::ReceiverStatus {
+                    receiver_id,
+                    state,
+                    detail,
+                })
+                .collect(),
+        })
+        .boxed()
+}
+
+fn arb_frontend_state() -> BoxedStrategy<v1::FrontendState> {
+    (small_id(), float(), float(), text(), freq(), range())
+        .prop_map(|(receiver_id, g, a, port, c, tr)| v1::FrontendState {
+            receiver_id,
+            gain_db: g,
+            hardware_agc: false,
+            attenuation_db: a,
+            antenna_port: port,
+            center_frequency_hz: c,
+            tunable_range: tr,
+        })
+        .boxed()
+}
+
+fn noise_band() -> BoxedStrategy<v1::NoiseBand> {
+    (
+        small_id(),
+        small_id(),
+        proptest::collection::vec(range(), 0..3),
+        prop_oneof![Just("40m".to_owned()), text()],
+    )
+        .prop_map(|(band_id, receiver_id, ranges, key)| v1::NoiseBand {
+            band_id,
+            receiver_id,
+            ranges: ranges.into_iter().flatten().collect(),
+            key,
+        })
+        .boxed()
+}
+
+fn arb_measurements_started() -> BoxedStrategy<v1::MeasurementsStarted> {
+    (
+        small_id(),
+        proptest::collection::vec(noise_band(), 0..3),
+        proptest::collection::vec(
+            (
+                small_id(),
+                prop_oneof![Just(60_000u32), any::<u32>()],
+                enum_value(),
+                proptest::option::of(arb_frontend_state()),
+            ),
+            0..3,
+        ),
+    )
+        .prop_map(
+            |(measurement_id, noise_bands, receivers)| v1::MeasurementsStarted {
+                measurement_id,
+                noise_bands,
+                receivers: receivers
+                    .into_iter()
+                    .map(
+                        |(receiver_id, noise_interval_ms, duty, frontend)| v1::MeasuredReceiver {
+                            receiver_id,
+                            noise_interval_ms,
+                            duty,
+                            frontend,
+                        },
+                    )
+                    .collect(),
+                method_version: 1,
+            },
+        )
+        .boxed()
 }
 
 fn payload() -> BoxedStrategy<Payload> {
@@ -172,7 +329,7 @@ fn payload() -> BoxedStrategy<Payload> {
         prop_oneof![
             capabilities().prop_map(Payload::Capabilities),
             (
-                small_id(),
+                (small_id(), small_id()),
                 freq(),
                 enum_value(),
                 any::<i32>(),
@@ -180,9 +337,17 @@ fn payload() -> BoxedStrategy<Payload> {
                 audio_params()
             )
                 .prop_map(
-                    |(channel_id, frequency_hz, mode, low_cut_hz, high_cut_hz, audio)| {
+                    |(
+                        (channel_id, receiver_id),
+                        frequency_hz,
+                        mode,
+                        low_cut_hz,
+                        high_cut_hz,
+                        audio,
+                    )| {
                         Payload::ChannelOpened(v1::ChannelOpened {
                             channel_id,
+                            receiver_id,
                             frequency_hz,
                             mode,
                             low_cut_hz,
@@ -202,18 +367,12 @@ fn payload() -> BoxedStrategy<Payload> {
                     })
                 }
             ),
-            (float(), float(), text(), freq(), range()).prop_map(|(g, a, port, c, tr)| {
-                Payload::FrontendState(v1::FrontendState {
-                    gain_db: g,
-                    hardware_agc: false,
-                    attenuation_db: a,
-                    antenna_port: port,
-                    center_frequency_hz: c,
-                    tunable_range: tr,
-                })
-            }),
+            arb_frontend_state().prop_map(Payload::FrontendState),
+            arb_hardware().prop_map(Payload::Hardware),
+            arb_receivers_configured().prop_map(Payload::ReceiversConfigured),
+            arb_measurements_started().prop_map(Payload::MeasurementsStarted),
             (
-                small_id(),
+                (small_id(), small_id()),
                 range(),
                 prop_oneof![Just(256u32), any::<u32>()],
                 prop_oneof![Just(100u32), any::<u32>()],
@@ -221,9 +380,17 @@ fn payload() -> BoxedStrategy<Payload> {
                 enum_value()
             )
                 .prop_map(
-                    |(subscription_id, range, bins, row_interval_ms, (o, s), compression)| {
+                    |(
+                        (subscription_id, receiver_id),
+                        range,
+                        bins,
+                        row_interval_ms,
+                        (o, s),
+                        compression,
+                    )| {
                         Payload::WaterfallSubscribed(v1::WaterfallSubscribed {
                             subscription_id,
+                            receiver_id,
                             range,
                             bins,
                             row_interval_ms,
@@ -266,32 +433,123 @@ fn body() -> BoxedStrategy<Option<Body>> {
         2 => (small_id(), float(), float(), proptest::option::of(any::<bool>())).prop_map(|(channel_id, snr_db, power_dbfs, squelch_open)| {
             Body::Signal(v1::ChannelSignal { channel_id, snr_db, power_dbfs, squelch_open })
         }),
-        1 => (float(), proptest::option::of(float()), enum_value(), text(), enum_value(), float(), proptest::option::of(float())).prop_map(
-            |(load, temp, bstate, bver, fstate, gain, pwr)| Body::Status(v1::StationStatus {
+        1 => (float(), proptest::option::of(float()), proptest::collection::vec(arb_receiver_health(), 0..18)).prop_map(
+            |(load, temp, receivers)| Body::Status(v1::StationStatus {
                 uptime_s: 1,
                 host: Some(v1::HostHealth { load_avg_1m: load, cpu_temp_c: temp, ..Default::default() }),
-                backend: Some(v1::BackendHealth { state: bstate, version: bver }),
-                frontend: Some(v1::FrontendHealth { state: fstate, gain_db: gain, input_power_dbfs: pwr, ..Default::default() }),
+                receivers,
                 ..Default::default()
             })
         ),
-        2 => (enum_value(), proptest::option::of(small_id()), proptest::option::of(small_id()), text()).prop_map(
-            |(kind, channel_id, subscription_id, detail)| Body::Event(v1::Event { kind, channel_id, subscription_id, detail, ..Default::default() })
+        2 => (
+            (enum_value(), proptest::option::of(small_id()), proptest::option::of(small_id()), text()),
+            (proptest::option::of(small_id()), proptest::option::of(enum_value())),
+            (proptest::option::of(small_id()), proptest::option::of(enum_value()), proptest::option::of(any::<i64>())),
+        ).prop_map(
+            |((kind, channel_id, subscription_id, detail), (receiver_id, receiver_state), (measurement_id, measurement_duty, effective_unix_ms))| {
+                Body::Event(v1::Event {
+                    kind,
+                    channel_id,
+                    subscription_id,
+                    detail,
+                    receiver_id,
+                    receiver_state,
+                    measurement_id,
+                    measurement_duty,
+                    effective_unix_ms,
+                    ..Default::default()
+                })
+            }
         ),
+        2 => arb_noise().prop_map(Body::Noise),
     ];
     proptest::option::weighted(0.97, b)
     }).boxed()
+}
+
+fn arb_receiver_health() -> BoxedStrategy<v1::ReceiverHealth> {
+    (
+        (small_id(), enum_value(), text()),
+        proptest::option::of((enum_value(), text())),
+        proptest::option::of((enum_value(), float(), proptest::option::of(float()))),
+        proptest::option::of(float()),
+    )
+        .prop_map(
+            |((receiver_id, state, detail), backend, frontend, backend_cpu)| v1::ReceiverHealth {
+                receiver_id,
+                state,
+                detail,
+                backend: backend.map(|(state, version)| v1::BackendHealth { state, version }),
+                frontend: frontend.map(|(state, gain_db, input_power_dbfs)| v1::FrontendHealth {
+                    state,
+                    gain_db,
+                    input_power_dbfs,
+                    ..Default::default()
+                }),
+                active_channels: 0,
+                backend_cpu,
+            },
+        )
+        .boxed()
+}
+
+fn arb_noise() -> BoxedStrategy<v1::NoiseFloorReport> {
+    (
+        (small_id(), small_id()),
+        prop_oneof![Just(1_790_942_400_000i64), any::<i64>()],
+        prop_oneof![Just(60_000u32), any::<u32>()],
+        proptest::option::of(arb_frontend_state()),
+        (0u32..6, 0u32..6),
+        proptest::collection::vec(
+            (small_id(), range(), float(), 0u32..2_000_000, float()),
+            0..3,
+        ),
+    )
+        .prop_map(
+            |((measurement_id, receiver_id), start, window_ms, frontend, (cm, ci), bands)| {
+                v1::NoiseFloorReport {
+                    measurement_id,
+                    receiver_id,
+                    window_start_unix_ms: start,
+                    window_ms,
+                    frontend,
+                    overloads: 0,
+                    clock: Some(v1::ClockState {
+                        synchronized: true,
+                        max_error_ms: 0,
+                    }),
+                    bands: bands
+                        .into_iter()
+                        .map(|(band_id, measured, rbw, samples, p)| v1::BandNoise {
+                            band_id,
+                            measured,
+                            resolution_bw_hz: rbw,
+                            samples,
+                            p10_db_hz: p,
+                            p25_db_hz: p,
+                            p50_db_hz: p,
+                            p90_db_hz: p,
+                        })
+                        .collect(),
+                    partial: false,
+                    cycle_minutes: cm,
+                    cycle_index: ci,
+                }
+            },
+        )
+        .boxed()
 }
 
 fn station_message() -> impl Strategy<Value = v1::StationMessage> {
     body().prop_map(|body| v1::StationMessage { body })
 }
 
-/// An established session with channels 1–3, subscriptions 1–2 (256 bins,
-/// zstd) and one outstanding request of every kind (ids 10–18).
+/// A session with receivers 1–3 configured (request 1), channels 1–3,
+/// subscriptions 1–2 (256 bins, zstd), plan 5 accepted on receiver 1 and
+/// one outstanding request of every kind.
 fn busy_session(t0: Instant) -> Session {
-    let mut s = established(t0);
-    let mut id = 0;
+    let mut s = configured(t0, &[1, 2, 3]);
+    let mut id = 1;
     let mut send = |s: &mut Session, c: Command| {
         id += 1;
         s.on_request_sent(&request(id, c), t0).expect("request");
@@ -323,8 +581,19 @@ fn busy_session(t0: Instant) -> Session {
             ..Default::default()
         }),
     );
+    let rid = send(&mut s, start_measurements(5));
+    assert_eq!(
+        s.check(&response(rid, OK, Some(measurements_started(5))), t0),
+        Verdict::Accept
+    );
     let _ = send(&mut s, close_channel(3));
-    let _ = send(&mut s, Command::SetFrontend(v1::SetFrontend::default()));
+    let _ = send(
+        &mut s,
+        Command::SetFrontend(v1::SetFrontend {
+            receiver_id: 1,
+            ..Default::default()
+        }),
+    );
     let _ = send(&mut s, subscribe(3, 256, 100));
     let _ = send(&mut s, unsubscribe(2));
     let _ = send(
@@ -334,7 +603,20 @@ fn busy_session(t0: Instant) -> Session {
             hub_time_unix_ms: 0,
         }),
     );
-    let _ = send(&mut s, Command::AdminOp(v1::AdminOp { kind: 1 }));
+    let _ = send(
+        &mut s,
+        Command::AdminOp(v1::AdminOp {
+            kind: 2,
+            receiver_id: Some(1),
+        }),
+    );
+    let _ = send(&mut s, Command::GetHardware(v1::GetHardware {}));
+    let _ = send(&mut s, configure(&[1, 2, 4]));
+    let _ = send(&mut s, start_measurements(6));
+    let _ = send(
+        &mut s,
+        Command::StopMeasurements(v1::StopMeasurements { measurement_id: 5 }),
+    );
     s
 }
 
@@ -383,6 +665,58 @@ proptest! {
             let _ = check_message(&m, 0);
             let _ = busy_session(t0).check(&m, t0);
             let _ = Session::new(t0).check(&m, t0);
+        }
+    }
+
+    #[test]
+    fn an_accepted_receiver_set_keeps_the_rules(
+        receivers in proptest::collection::vec(
+            (
+                0u32..5,
+                prop_oneof![Just(String::new()), (1u32..5).prop_map(|n| format!("{n:08}"))],
+                0i32..5,
+                0i32..5,
+                prop_oneof![1_000_000u64..30_000_000, 0u64..2_000_000_000],
+                proptest::option::of(-5.0f32..60.0),
+            ),
+            0..6,
+        ),
+        arbitrary in arb_hardware(),
+    ) {
+        let set = v1::ConfigureReceivers {
+            receivers: receivers
+                .into_iter()
+                .map(|(receiver_id, sdr_serial, model, profile, center_frequency_hz, gain_db)| {
+                    v1::ReceiverConfig {
+                        receiver_id,
+                        sdr_serial,
+                        model,
+                        profile,
+                        center_frequency_hz,
+                        gain_db,
+                        ..Default::default()
+                    }
+                })
+                .collect(),
+        };
+        // Total on any hardware report.
+        let _ = check_receiver_set(&set, &arbitrary);
+        let hw = common::hardware();
+        if check_receiver_set(&set, &hw).is_ok() {
+            let ids: Vec<u32> = set.receivers.iter().map(|r| r.receiver_id).collect();
+            prop_assert!(ids.iter().all(|&id| id != 0));
+            let ranges: Vec<v1::FrequencyRange> = set
+                .receivers
+                .iter()
+                .map(|r| predicted_tunable_range(r.center_frequency_hz, 2_048_000))
+                .collect();
+            for (i, a) in ranges.iter().enumerate() {
+                prop_assert!(!ids[i + 1..].contains(&ids[i]));
+                prop_assert!(!set.receivers[i + 1..].iter().any(|r| r.sdr_serial == set.receivers[i].sdr_serial));
+                for b in &ranges[i + 1..] {
+                    prop_assert!(!ranges_overlap(a, b));
+                }
+            }
         }
     }
 

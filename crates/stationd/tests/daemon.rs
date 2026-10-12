@@ -8,14 +8,14 @@
 
 mod common;
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use station_backend::FakeBackend;
 use station_conformance::scenarios::{Harness, ScenarioConfig};
-use station_conformance::{HubTls, LocalPolicy, StationConn, TestPki, TlsVersions};
+use station_conformance::{HubTls, StationConn, TestPki, TlsVersions};
 use station_proto::v1;
+use stationd::cli::ConfigArg;
 use stationd::daemon::{ConnectionState, StopReason};
+use stationd::receivers::Driver;
 use stationd::tls::Connector;
 use stationd::{DaemonHandle, RunError, RunOptions};
 use tokio::sync::watch;
@@ -32,16 +32,16 @@ fn cfg() -> ScenarioConfig {
 }
 
 async fn harness() -> Harness {
-    Harness::new(LocalPolicy::default()).await.expect("harness")
+    Harness::new().await.expect("harness")
 }
 
-fn spawn_with(h: &Harness, backend: FakeBackend, options: RunOptions) -> DaemonHandle {
+fn spawn_with(h: &Harness, driver: Driver, options: RunOptions) -> DaemonHandle {
     let config = common::load(&common::write_config(&h.target));
-    stationd::spawn(&config, Arc::new(backend), options).expect("spawn")
+    stationd::spawn(&config, driver, options).expect("spawn")
 }
 
 fn spawn(h: &Harness) -> DaemonHandle {
-    spawn_with(h, FakeBackend::default(), common::fast_options())
+    spawn_with(h, common::fake_driver().0, common::fast_options())
 }
 
 async fn wait_state(
@@ -159,7 +159,7 @@ async fn incompatible_welcome_is_an_unsupported_version() {
     let mut conn = h.hub.accept(WAIT).await.expect("accept");
     conn.expect_hello(WAIT).await.expect("hello");
     conn.send_welcome(v1::Welcome {
-        protocol_version: Some(v1::ProtocolVersion { major: 2, minor: 0 }),
+        protocol_version: Some(v1::ProtocolVersion { major: 3, minor: 0 }),
         connection_id: "x".into(),
         ..Default::default()
     })
@@ -202,7 +202,7 @@ async fn no_welcome_or_a_request_first_means_reconnect() {
         welcome_timeout: Duration::from_millis(300),
         ..common::fast_options()
     };
-    let d = spawn_with(&h, FakeBackend::default(), options);
+    let d = spawn_with(&h, common::fake_driver().0, options);
     // 1: never welcomed.
     let mut silent = h.hub.accept(WAIT).await.expect("accept");
     silent.expect_hello(WAIT).await.expect("hello");
@@ -275,33 +275,54 @@ fn events(msgs: &[(tokio::time::Instant, v1::StationMessage)]) -> Vec<v1::Event>
         .collect()
 }
 
+/// An AM channel `id` on receiver 1 at 6.2 MHz.
+fn open_am(id: u32) -> Command {
+    Command::OpenChannel(v1::OpenChannel {
+        channel_id: id,
+        receiver_id: 1,
+        frequency_hz: 6_200_000,
+        mode: v1::Mode::Am as i32,
+        low_cut_hz: -4000,
+        high_cut_hz: 4000,
+        audio: Some(v1::AudioParams {
+            codec: v1::AudioCodec::Opus as i32,
+            bitrate_bps: 16_000,
+            sample_rate_hz: 12_000,
+            frame_duration_ms: 20,
+        }),
+        squelch_snr_db: None,
+    })
+}
+
+/// Waterfall subscription `id` on receiver 1, 7.3 to 7.5 MHz.
+fn subscribe(id: u32) -> Command {
+    Command::SubscribeWaterfall(v1::SubscribeWaterfall {
+        subscription_id: id,
+        receiver_id: 1,
+        range: Some(v1::FrequencyRange {
+            start_hz: 7_300_000,
+            end_hz: 7_500_000,
+        }),
+        bins: 128,
+        row_interval_ms: 100,
+        quantization: None,
+        compression: v1::WaterfallCompression::Zstd as i32,
+    })
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn backend_events_are_forwarded_and_update_tables() {
     let mut h = harness().await;
-    let backend = FakeBackend::default();
-    let d = spawn_with(&h, backend.clone(), common::fast_options());
-    let mut conn = connected(&mut h).await;
-    let open = |id: u32| {
-        Command::OpenChannel(v1::OpenChannel {
-            channel_id: id,
-            frequency_hz: 6_200_000,
-            mode: v1::Mode::Am as i32,
-            low_cut_hz: -4000,
-            high_cut_hz: 4000,
-            audio: Some(v1::AudioParams {
-                codec: v1::AudioCodec::Opus as i32,
-                bitrate_bps: 16_000,
-                sample_rate_hz: 12_000,
-                frame_duration_ms: 20,
-            }),
-            squelch_snr_db: None,
-        })
-    };
-    let r = conn.call(open(1), WAIT).await.expect("open");
+    let (driver, backends, _units) = common::fake_driver();
+    let d = spawn_with(&h, driver, common::fast_options());
+    let (mut conn, _) = h.ready(&cfg()).await.expect("receivers");
+    let backend = backends.get(1).expect("receiver 1's backend");
+    let r = conn.call(open_am(1), WAIT).await.expect("open");
     assert_eq!(r.result.map(|r| r.code), Some(v1::ResultCode::Ok as i32));
     // Retune away: the backend closes channel 1 by itself.
     let retune = Command::SetFrontend(v1::SetFrontend {
-        center_frequency_hz: Some(14_100_000),
+        receiver_id: 1,
+        center_frequency_hz: Some(7_400_000),
         ..Default::default()
     });
     let r = conn.call(retune, WAIT).await.expect("retune");
@@ -324,10 +345,13 @@ async fn backend_events_are_forwarded_and_update_tables() {
         kinds.contains(&(v1::event::Kind::FrontendChanged as i32)),
         "{kinds:?}"
     );
-    assert!(
-        kinds.contains(&(v1::event::Kind::DeviceLost as i32)),
-        "{kinds:?}"
-    );
+    // The receiver's events carry its ID; details are cut to 256 bytes.
+    let lost = events(&got)
+        .into_iter()
+        .find(|e| e.kind == v1::event::Kind::DeviceLost as i32)
+        .expect("DEVICE_LOST");
+    assert_eq!(lost.receiver_id, Some(1));
+    assert_eq!(lost.detail.len(), 256);
     // The table forgot channel 1: the latest status says 0 channels, and a
     // close gets NOT_FOUND.
     let last_status = got
@@ -339,7 +363,14 @@ async fn backend_events_are_forwarded_and_update_tables() {
         })
         .expect("a status");
     assert_eq!(last_status.active_channels, 0);
-    assert!(last_status.host.is_some() && last_status.backend.is_some());
+    assert!(last_status.host.is_some());
+    let health: Vec<(u32, i32, u32)> = last_status
+        .receivers
+        .iter()
+        .map(|r| (r.receiver_id, r.state, r.active_channels))
+        .collect();
+    let running = v1::ReceiverState::Running as i32;
+    assert_eq!(health, [(1, running, 0), (2, running, 0)]);
     let r = conn
         .call(
             Command::CloseChannel(v1::CloseChannel { channel_id: 1 }),
@@ -352,18 +383,7 @@ async fn backend_events_are_forwarded_and_update_tables() {
         Some(v1::ResultCode::NotFound as i32)
     );
     // Subscription closed by the backend, and a backend restart.
-    let sub = Command::SubscribeWaterfall(v1::SubscribeWaterfall {
-        subscription_id: 2,
-        range: Some(v1::FrequencyRange {
-            start_hz: 14_000_000,
-            end_hz: 14_200_000,
-        }),
-        bins: 128,
-        row_interval_ms: 100,
-        quantization: None,
-        compression: v1::WaterfallCompression::Zstd as i32,
-    });
-    let r = conn.call(sub, WAIT).await.expect("subscribe");
+    let r = conn.call(subscribe(2), WAIT).await.expect("subscribe");
     assert_eq!(r.result.map(|r| r.code), Some(v1::ResultCode::Ok as i32));
     backend.emit_event(v1::Event {
         kind: v1::event::Kind::SubscriptionClosed as i32,
@@ -378,7 +398,9 @@ async fn backend_events_are_forwarded_and_update_tables() {
         .collect(Duration::from_millis(300))
         .await
         .expect("collect");
-    assert_eq!(events(&got).len(), 2);
+    let got = events(&got);
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[1].receiver_id, Some(1));
     stop(d).await;
 }
 
@@ -423,7 +445,7 @@ async fn run_api_with_external_shutdown_and_revocation() {
         async move {
             stationd::run(
                 &config,
-                Arc::new(FakeBackend::default()),
+                common::fake_driver().0,
                 common::fast_options(),
                 shutdown,
                 tx,
@@ -451,20 +473,14 @@ async fn spawn_fails_on_bad_credentials() {
     let mut target = h.target.clone();
     target.key = target.cert.clone();
     let config = common::load(&common::write_config(&target));
-    let e = stationd::spawn(
-        &config,
-        Arc::new(FakeBackend::default()),
-        RunOptions::default(),
-    )
-    .expect_err("key is a certificate");
+    let e = stationd::spawn(&config, common::fake_driver().0, RunOptions::default())
+        .expect_err("key is a certificate");
     assert!(matches!(e, RunError::Tls(_)), "{e}");
     assert!(format!("{:?}", RunOptions::default()).contains("backoff"));
 }
 
 async fn connector_error(hub_tls: impl FnOnce(&TestPki) -> HubTls) -> String {
-    let h = Harness::with_hub_tls(LocalPolicy::default(), hub_tls)
-        .await
-        .expect("harness");
+    let h = Harness::with_hub_tls(hub_tls).await.expect("harness");
     let config = common::load(&common::write_config(&h.target));
     let creds = stationd::credentials::load(&config).expect("credentials");
     let connector = Connector::new(creds.tls.config, &creds.gateway).expect("connector");
@@ -534,12 +550,13 @@ async fn nothing_listening_is_a_tcp_error() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_check_config_and_run() {
     let mut h = harness().await;
-    let path = common::write_config(&h.target);
+    let path = ConfigArg::at(common::write_config(&h.target));
     let summary = stationd::cli::check_config(&path).expect("valid");
     assert!(
         summary.contains(&h.target.station_id.to_string()),
         "{summary}"
     );
+    assert!(summary.contains("0 receiver(s) applied"), "{summary}");
     let stop = CancellationToken::new();
     let run = tokio::spawn({
         let stop = stop.clone();

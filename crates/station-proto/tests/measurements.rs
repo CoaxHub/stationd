@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
-//! Station protocol 1.1, measurements (§5.2): every rule of the table, the
-//! 1.0 compatibility, and the wall-clock plausibility checks.
+//! Measurements (§5.2): every rule of the table, per receiver, and the
+//! wall-clock plausibility checks.
 
 mod common;
 
@@ -12,6 +12,8 @@ use station_proto::validate::{
     CommandKind, DropReason, MessageKind, RequestError, RequestRejection, Verdict, ViolationKind,
     check_request, is_band_key, is_measuring_minute, sanitize_capabilities,
 };
+
+use v1::MeasurementDuty::{Continuous, Idle};
 
 /// 2026-10-02 12:00:00 UTC: a measuring minute.
 const NOON: i64 = 1_790_942_400_000;
@@ -55,53 +57,20 @@ fn helpers() {
 }
 
 #[test]
-fn a_1_0_session_has_no_measurements() {
-    let t0 = Instant::now();
-    let mut s = established(t0);
-    // The hub must not send a plan.
-    assert_eq!(
-        s.on_request_sent(&request(1, start_measurements(9)), t0),
-        Err(RequestError::NotInMinor(CommandKind::StartMeasurements))
-    );
-    // A noise report is a message 1.0 does not have.
-    assert_eq!(
-        *violation(&s.check(&noise(9, NOON), t0)),
-        ViolationKind::MessageNotInMinor {
-            kind: MessageKind::Noise,
-            minor: 0
-        }
-    );
-    // Measurement event kinds are unknown in 1.0.
-    let mut s = established(t0);
-    assert!(matches!(
-        violation(&s.check(&stopped_event(9), t0)),
-        ViolationKind::UnknownEnumValue {
-            field: "event.kind",
-            ..
-        }
-    ));
-    // `Capabilities.measurements` is a field 1.0 ignores.
+fn capabilities_keep_and_clamp_the_limits() {
     let mut caps = capabilities();
     caps.measurements = Some(v1::MeasurementLimits {
-        enabled: true,
         max_noise_bands: 4,
         method_version: 1,
     });
-    let clean = sanitize_capabilities(&caps, 0).expect("valid");
-    assert!(clean.capabilities.measurements.is_none());
-    let kept = sanitize_capabilities(&caps, 1).expect("valid");
+    let kept = sanitize_capabilities(&caps, 0).expect("valid");
     assert_eq!(kept.capabilities.measurements, caps.measurements);
-}
-
-#[test]
-fn capabilities_clamp_the_band_count() {
-    let mut caps = capabilities();
+    assert!(kept.clamped.is_empty());
     caps.measurements = Some(v1::MeasurementLimits {
-        enabled: true,
         max_noise_bands: 99,
         method_version: 1,
     });
-    let s = sanitize_capabilities(&caps, 1).expect("valid");
+    let s = sanitize_capabilities(&caps, 0).expect("valid");
     assert_eq!(
         s.capabilities.measurements.map(|m| m.max_noise_bands),
         Some(32)
@@ -112,21 +81,14 @@ fn capabilities_clamp_the_band_count() {
 #[test]
 fn station_side_request_checks() {
     let start = request(1, start_measurements(9));
-    assert_eq!(
-        check_request(&start, 0),
-        Err(RequestRejection::Unsupported {
-            field: "request.command"
-        })
-    );
-    assert_eq!(check_request(&start, 1), Ok(CommandKind::StartMeasurements));
+    assert_eq!(check_request(&start, 0), Ok(CommandKind::StartMeasurements));
     let stop = request(
         2,
         Command::StopMeasurements(v1::StopMeasurements { measurement_id: 9 }),
     );
-    assert!(check_request(&stop, 0).is_err());
-    assert_eq!(check_request(&stop, 1), Ok(CommandKind::StopMeasurements));
+    assert_eq!(check_request(&stop, 0), Ok(CommandKind::StopMeasurements));
     assert_eq!(
-        check_request(&request(3, start_measurements(0)), 1),
+        check_request(&request(3, start_measurements(0)), 0),
         Err(RequestRejection::InvalidArgument {
             field: "start_measurements.measurement_id"
         })
@@ -169,29 +131,245 @@ fn measurements_started_must_echo_the_request() {
             }),
             "measurements_started.noise_bands.ranges",
         ),
+        // Band 1 was asked of RX.
+        (
+            started_with(|m| {
+                m.noise_bands[0].receiver_id = RX2;
+                m.receivers[0] = measured(RX2, Idle);
+            }),
+            "measurements_started.noise_bands.receiver_id",
+        ),
+        // A receiver no accepted band is on...
+        (
+            started_with(|m| m.receivers.push(measured(RX2, Idle))),
+            "measurements_started.receivers.receiver_id",
+        ),
+        // ...a receiver twice...
+        (
+            started_with(|m| m.receivers.push(measured(RX, Continuous))),
+            "measurements_started.receivers.receiver_id",
+        ),
+        // ...or an accepted band's receiver missing.
+        (
+            started_with(|m| m.receivers.clear()),
+            "measurements_started.receivers",
+        ),
+        // A cadence faster than asked.
+        (
+            started_with(|m| m.receivers[0].noise_interval_ms = 60_000 - 1),
+            "measurements_started.receivers.noise_interval_ms",
+        ),
     ];
     for (payload, field) in cases {
-        let mut s = established_1_1(t0);
+        let mut s = established(t0);
         s.on_request_sent(&request(1, start_measurements(9)), t0)
             .expect("request");
-        assert_eq!(
-            *violation(&s.check(&response(1, OK, payload), t0)),
+        let v = s.check(&response(1, OK, payload), t0);
+        match violation(&v) {
+            // Stateless rules come first (a cadence outside the set).
             ViolationKind::ResponseFieldMismatch {
                 request_id: 1,
                 command: CommandKind::StartMeasurements,
-                field
+                field: f,
             }
-        );
+            | ViolationKind::OutOfBounds { field: f } => assert_eq!(*f, field),
+            other => panic!("{field}: {other:?}"),
+        }
     }
+    // Asked for 2 minutes, answered 1.
+    let mut s = established(t0);
+    let mut slow = start_measurements(9);
+    if let Command::StartMeasurements(m) = &mut slow {
+        m.noise_interval_ms = 120_000;
+    }
+    s.on_request_sent(&request(1, slow), t0).expect("request");
+    assert!(matches!(
+        violation(&s.check(&response(1, OK, started_with(|_| {})), t0)),
+        ViolationKind::ResponseFieldMismatch {
+            field: "measurements_started.receivers.noise_interval_ms",
+            ..
+        }
+    ));
     // A stretched cycle and a narrower range are fine.
-    let mut s = established_1_1(t0);
+    let mut s = established(t0);
     s.on_request_sent(&request(1, start_measurements(9)), t0)
         .expect("request");
     let ok = started_with(|m| {
-        m.noise_interval_ms = 120_000;
+        m.receivers[0].noise_interval_ms = 120_000;
         m.noise_bands[0].ranges = vec![range(7_000_000, 7_050_000)];
     });
     assert_eq!(s.check(&response(1, OK, ok), t0), Verdict::Accept);
+    // Both receivers, each with its own cadence and duty.
+    let mut s = established(t0);
+    s.on_request_sent(&request(1, start_measurements(9)), t0)
+        .expect("request");
+    assert_eq!(
+        s.check(&response(1, OK, both_started(9)), t0),
+        Verdict::Accept
+    );
+    // Nothing accepted (no band inside a receiver) is a plan too.
+    let mut s = established(t0);
+    s.on_request_sent(&request(1, start_measurements(9)), t0)
+        .expect("request");
+    let none = started_with(|m| {
+        m.noise_bands.clear();
+        m.receivers.clear();
+    });
+    assert_eq!(s.check(&response(1, OK, none), t0), Verdict::Accept);
+}
+
+/// Both bands accepted: band 1 on RX (idle, every minute) and band 2 on
+/// RX2 (continuous, a 2-minute cycle).
+#[allow(clippy::unnecessary_wraps, reason = "a response payload")]
+fn both_started(measurement_id: u32) -> Option<Payload> {
+    let Payload::MeasurementsStarted(mut m) = measurements_started(measurement_id) else {
+        unreachable!()
+    };
+    m.noise_bands.push(v1::NoiseBand {
+        band_id: 2,
+        receiver_id: RX2,
+        ranges: vec![range(14_000_000, 14_350_000)],
+        key: "20m".into(),
+    });
+    let mut second = measured(RX2, Continuous);
+    second.noise_interval_ms = 120_000;
+    m.receivers.push(second);
+    Some(Payload::MeasurementsStarted(m))
+}
+
+/// A session with plan 9 over both receivers.
+fn with_both(t0: Instant) -> station_proto::validate::Session {
+    let mut s = established(t0);
+    s.on_request_sent(&request(1, start_measurements(9)), t0)
+        .expect("request");
+    assert_eq!(
+        s.check(&response(1, OK, both_started(9)), t0),
+        Verdict::Accept
+    );
+    s
+}
+
+/// A valid report of RX2's band 2 for plan 9.
+fn noise_rx2(window_start_unix_ms: i64) -> v1::StationMessage {
+    let mut m = noise(9, window_start_unix_ms);
+    if let Some(Body::Noise(n)) = m.body.as_mut() {
+        n.receiver_id = RX2;
+        n.frontend = Some(measuring_frontend(RX2));
+        n.cycle_minutes = 2;
+        n.bands[0].band_id = 2;
+        n.bands[0].measured = Some(range(14_000_000, 14_350_000));
+    }
+    m
+}
+
+#[test]
+fn each_receiver_reports_its_own_bands() {
+    let t0 = Instant::now();
+    let mut s = with_both(t0);
+    assert_eq!(s.check(&noise(9, NOON), t0), Verdict::Accept);
+    assert_eq!(s.check(&noise_rx2(NOON), t0), Verdict::Accept);
+    // RX reporting RX2's band, and RX2 reporting RX's.
+    let mut s = with_both(t0);
+    assert_eq!(
+        *violation(&s.check(&noise_with(|n| n.bands[0].band_id = 2), t0)),
+        ViolationKind::OutOfBounds {
+            field: "noise.bands.band_id"
+        }
+    );
+    let mut wrong = noise_rx2(NOON);
+    if let Some(Body::Noise(n)) = wrong.body.as_mut() {
+        n.bands[0].band_id = 1;
+        n.bands[0].measured = Some(range(7_000_000, 7_300_000));
+    }
+    let mut s = with_both(t0);
+    assert_eq!(
+        *violation(&s.check(&wrong, t0)),
+        ViolationKind::OutOfBounds {
+            field: "noise.bands.band_id"
+        }
+    );
+    // Rates are per receiver: two reports each at once (burst 2), then RX's
+    // third is dropped while RX2 is unaffected... and RX2's cadence is its
+    // own (2 minutes: one per minute).
+    let mut s = with_both(t0);
+    for _ in 0..2 {
+        assert_eq!(s.check(&noise(9, NOON), t0), Verdict::Accept);
+        assert_eq!(s.check(&noise_rx2(NOON), t0), Verdict::Accept);
+    }
+    let rate = Verdict::Drop(DropReason::RateLimited {
+        kind: MessageKind::Noise,
+    });
+    assert_eq!(s.check(&noise(9, NOON), t0), rate);
+    assert_eq!(s.check(&noise_rx2(NOON), t0 + secs(31)), rate);
+    assert_eq!(s.check(&noise(9, NOON), t0 + secs(31)), Verdict::Accept);
+    assert_eq!(s.check(&noise_rx2(NOON), t0 + secs(61)), Verdict::Accept);
+    // Duty is per receiver: RX idle skips minute 3, RX2 continuous doesn't.
+    let mut s = with_both(t0);
+    assert_eq!(
+        s.check(&noise(9, NOON + 3 * MIN), t0),
+        Verdict::Drop(DropReason::NotScheduled)
+    );
+    assert_eq!(s.check(&noise_rx2(NOON + 3 * MIN), t0), Verdict::Accept);
+    // RX2 goes idle from minute 4; RX doesn't change.
+    assert_eq!(
+        s.check(&duty_event_for(RX2, 9, Idle, NOON + 4 * MIN), t0),
+        Verdict::Accept
+    );
+    assert_eq!(
+        s.check(&noise_rx2(NOON + 4 * MIN), t0 + secs(60)),
+        Verdict::Drop(DropReason::NotScheduled)
+    );
+    assert_eq!(
+        s.check(&noise(9, NOON + 4 * MIN), t0 + secs(60)),
+        Verdict::Drop(DropReason::NotScheduled)
+    );
+    // Duty-change rates are per receiver too.
+    let mut s = with_both(t0);
+    for _ in 0..2 {
+        assert_eq!(
+            s.check(&duty_event_for(RX, 9, Continuous, NOON), t0),
+            Verdict::Accept
+        );
+    }
+    assert!(matches!(
+        s.check(&duty_event_for(RX, 9, Continuous, NOON), t0),
+        Verdict::Drop(DropReason::RateLimited { .. })
+    ));
+    assert_eq!(
+        s.check(&duty_event_for(RX2, 9, Idle, NOON), t0),
+        Verdict::Accept
+    );
+}
+
+#[test]
+fn receivers_outside_the_plan() {
+    let t0 = Instant::now();
+    // The fixture plan measures RX only.
+    let mut s = with_plan(t0, 9);
+    assert_eq!(
+        *violation(&s.check(&noise_rx2(NOON), t0)),
+        ViolationKind::UnknownReceiver {
+            kind: MessageKind::Noise,
+            receiver_id: RX2
+        }
+    );
+    let mut s = with_plan(t0, 9);
+    assert_eq!(
+        *violation(&s.check(&duty_event_for(RX2, 9, Continuous, NOON), t0)),
+        ViolationKind::UnknownReceiver {
+            kind: MessageKind::Event,
+            receiver_id: RX2
+        }
+    );
+    // A duty change before the plan's answer: dropped, its receivers aren't
+    // known yet.
+    let mut s = established(t0);
+    s.on_request_sent(&request(1, start_measurements(9)), t0)
+        .expect("request");
+    assert_eq!(
+        s.check(&duty_event(9, Continuous, NOON), t0),
+        Verdict::Drop(DropReason::AwaitingMeasurements { measurement_id: 9 })
+    );
 }
 
 #[test]
@@ -199,29 +377,45 @@ fn measurements_started_stateless_rules() {
     let t0 = Instant::now();
     let cases: Vec<(Option<Payload>, ViolationKind)> = vec![
         (
-            started_with(|m| m.noise_interval_ms = 90_000),
+            started_with(|m| m.receivers[0].noise_interval_ms = 90_000),
             ViolationKind::OutOfBounds {
-                field: "measurements_started.noise_interval_ms",
+                field: "measurements_started.receivers.noise_interval_ms",
             },
         ),
         (
-            started_with(|m| m.duty = 0),
+            started_with(|m| m.receivers[0].duty = 0),
             ViolationKind::UnspecifiedEnum {
-                field: "measurements_started.duty",
+                field: "measurements_started.receivers.duty",
             },
         ),
         (
-            started_with(|m| m.duty = 7),
+            started_with(|m| m.receivers[0].duty = 7),
             ViolationKind::UnknownEnumValue {
-                field: "measurements_started.duty",
+                field: "measurements_started.receivers.duty",
                 value: 7,
-                minor: 1,
+                minor: 0,
             },
         ),
         (
-            started_with(|m| m.frontend = None),
+            started_with(|m| m.receivers[0].frontend = None),
             ViolationKind::MissingField {
-                field: "measurements_started.frontend",
+                field: "measurements_started.receivers.frontend",
+            },
+        ),
+        (
+            started_with(|m| m.receivers[0].frontend = Some(measuring_frontend(RX2))),
+            ViolationKind::OutOfBounds {
+                field: "measurements_started.receivers.frontend.receiver_id",
+            },
+        ),
+        (
+            started_with(|m| {
+                m.receivers = (1..=17).map(|id| measured(id, Idle)).collect();
+            }),
+            ViolationKind::TooManyEntries {
+                field: "measurements_started.receivers",
+                len: 17,
+                max: 16,
             },
         ),
         (
@@ -253,7 +447,7 @@ fn measurements_started_stateless_rules() {
         ),
     ];
     for (payload, expected) in cases {
-        let mut s = established_1_1(t0);
+        let mut s = established(t0);
         s.on_request_sent(&request(1, start_measurements(9)), t0)
             .expect("request");
         assert_eq!(
@@ -266,11 +460,14 @@ fn measurements_started_stateless_rules() {
 #[test]
 fn a_refused_plan_is_gone() {
     let t0 = Instant::now();
-    let mut s = established_1_1(t0);
+    let mut s = established(t0);
     s.on_request_sent(&request(1, start_measurements(9)), t0)
         .expect("request");
-    let denied = v1::ResultCode::PermissionDenied as i32;
-    assert_eq!(s.check(&response(1, denied, None), t0), Verdict::Accept);
+    let out_of_range = v1::ResultCode::OutOfRange as i32;
+    assert_eq!(
+        s.check(&response(1, out_of_range, None), t0),
+        Verdict::Accept
+    );
     assert!(!s.is_measurement_open(9, t0));
     assert_eq!(
         *violation(&s.check(&noise(9, NOON), t0)),
@@ -284,7 +481,7 @@ fn a_refused_plan_is_gone() {
 #[test]
 fn reports_before_the_answer_are_dropped() {
     let t0 = Instant::now();
-    let mut s = established_1_1(t0);
+    let mut s = established(t0);
     s.on_request_sent(&request(1, start_measurements(9)), t0)
         .expect("request");
     assert_eq!(
@@ -359,6 +556,22 @@ fn report_rules() {
             noise_with(|n| n.frontend = None),
             ViolationKind::MissingField {
                 field: "noise.frontend",
+            },
+        ),
+        (
+            noise_with(|n| n.frontend = Some(measuring_frontend(RX2))),
+            ViolationKind::OutOfBounds {
+                field: "noise.frontend.receiver_id",
+            },
+        ),
+        (
+            noise_with(|n| {
+                n.receiver_id = 0;
+                n.frontend = Some(measuring_frontend(0));
+            }),
+            ViolationKind::UnknownReceiver {
+                kind: MessageKind::Noise,
+                receiver_id: 0,
             },
         ),
         (
@@ -575,6 +788,17 @@ fn duty_events() {
         ViolationKind::UnknownMeasurement {
             kind: MessageKind::Event,
             measurement_id: 8
+        }
+    );
+    let mut s = with_plan(t0, 9);
+    let mut m = duty_event(9, continuous, NOON);
+    if let Some(Body::Event(e)) = m.body.as_mut() {
+        e.receiver_id = None;
+    }
+    assert_eq!(
+        *violation(&s.check(&m, t0)),
+        ViolationKind::MissingField {
+            field: "event.receiver_id"
         }
     );
     let mut s = with_plan(t0, 9);

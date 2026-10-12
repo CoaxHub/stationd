@@ -7,7 +7,6 @@
 
 use std::path::Path;
 
-use station_backend::Health;
 use station_proto::{PROTOCOL_VERSION, limits, v1};
 
 use crate::dispatch::truncate_utf8;
@@ -48,22 +47,30 @@ pub struct Counters {
     pub measurement_reports_dropped_total: u64,
 }
 
-/// A `StationStatus` from backend health, host metrics and counters.
-pub fn station_status(health: &Health, host: v1::HostHealth, c: Counters) -> v1::StationStatus {
-    let mut backend = health.backend.clone();
-    backend.version = truncate_utf8(&backend.version, limits::MAX_VERSION_BYTES);
-    let frontend = health.frontend.map(|mut f| {
-        if !f.gain_db.is_finite() {
-            f.gain_db = 0.0;
-        }
-        f.input_power_dbfs = f.input_power_dbfs.filter(|p| p.is_finite());
-        f
-    });
+/// A front end's health the hub's checks pass: finite floats and a
+/// specified state.
+pub fn sanitize_frontend_health(mut f: v1::FrontendHealth) -> v1::FrontendHealth {
+    if !f.gain_db.is_finite() {
+        f.gain_db = 0.0;
+    }
+    f.input_power_dbfs = f.input_power_dbfs.filter(|p| p.is_finite());
+    if f.state == v1::frontend_health::State::Unspecified as i32 {
+        f.state = v1::frontend_health::State::Ok as i32;
+    }
+    f
+}
+
+/// A `StationStatus` from each receiver's health (§4.2), host metrics and
+/// counters.
+pub fn station_status(
+    receivers: Vec<v1::ReceiverHealth>,
+    host: v1::HostHealth,
+    c: Counters,
+) -> v1::StationStatus {
     v1::StationStatus {
         uptime_s: c.uptime_s,
         host: Some(host),
-        backend: Some(backend),
-        frontend,
+        receivers,
         active_channels: c.active_channels,
         active_subscriptions: c.active_subscriptions,
         audio_frames_dropped_total: c.audio_frames_dropped_total,
@@ -231,18 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn status_sanitises_floats_and_strings() {
-        let health = Health {
-            backend: v1::BackendHealth {
-                state: 1,
-                version: "x".repeat(200),
-            },
-            frontend: Some(v1::FrontendHealth {
-                gain_db: f32::NAN,
-                input_power_dbfs: Some(f32::INFINITY),
-                ..Default::default()
-            }),
-        };
+    fn status_carries_counters_and_sane_front_ends() {
         let c = Counters {
             uptime_s: 5,
             active_channels: 2,
@@ -251,19 +247,27 @@ mod tests {
             waterfall_rows_dropped_total: 4,
             measurement_reports_dropped_total: 5,
         };
-        let s = station_status(&health, v1::HostHealth::default(), c);
+        let rx = v1::ReceiverHealth {
+            receiver_id: 3,
+            state: v1::ReceiverState::Running as i32,
+            ..Default::default()
+        };
+        let s = station_status(vec![rx.clone()], v1::HostHealth::default(), c);
         assert_eq!(s.uptime_s, 5);
         assert_eq!((s.active_channels, s.active_subscriptions), (2, 1));
         assert_eq!(
             (s.audio_frames_dropped_total, s.waterfall_rows_dropped_total),
             (3, 4)
         );
-        let f = s.frontend.expect("frontend");
+        assert_eq!(s.measurement_reports_dropped_total, 5);
+        assert_eq!(s.receivers, vec![rx]);
+        let f = sanitize_frontend_health(v1::FrontendHealth {
+            gain_db: f32::NAN,
+            input_power_dbfs: Some(f32::INFINITY),
+            ..Default::default()
+        });
         assert!(f.gain_db.is_finite());
         assert_eq!(f.input_power_dbfs, None);
-        assert_eq!(
-            s.backend.map(|b| b.version.len()),
-            Some(limits::MAX_VERSION_BYTES)
-        );
+        assert_eq!(f.state, v1::frontend_health::State::Ok as i32);
     }
 }

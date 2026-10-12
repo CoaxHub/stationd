@@ -16,46 +16,49 @@ import "coaxhub/station/v1/common.proto";
 message GetCapabilities {}
 
 message Capabilities {
-  // Range the station can demodulate RIGHT NOW without retuning the
-  // frontend (the current passband). Listeners can only tune inside it.
-  FrequencyRange tunable_range = 1;
-  // Full range the hardware could cover if the owner retunes the frontend.
-  FrequencyRange hardware_range = 2;
-  uint32 sample_rate_hz = 3;
-  // Maximum simultaneous audio channels the station accepts.
-  uint32 max_channels = 4;
-  repeated Mode modes = 5;
-  repeated AudioCodec codecs = 6;
-  WaterfallLimits waterfall = 7;
-  FrontendControls frontend = 8;
-  // Admin operations the owner allows (stationd.toml). Default: empty.
-  repeated AdminOpKind allowed_admin_ops = 9;
-  // Whether the owner allows SetFrontend (stationd.toml). Default: true.
-  bool frontend_control_allowed = 10;
-  // Informational, untrusted, at most 64 bytes: e.g. "RTL-SDR Blog V4".
-  string sdr_model = 11;
-  // Protocol 1.1: the station can measure (measure.proto). Absent: it can't,
-  // and the hub sends it no plan.
-  MeasurementLimits measurements = 12;
+  // The receivers running now, in frequency order. Their tunable ranges
+  // never overlap. Empty: the station has no receiver running.
+  repeated ReceiverCapabilities receivers = 1;
+  // What every receiver can demodulate and encode.
+  repeated Mode modes = 2;
+  repeated AudioCodec codecs = 3;
+  // Waterfall subscriptions, across all receivers.
+  WaterfallLimits waterfall = 4;
+  // The station can measure (measure.proto). Absent: it can't, and the hub
+  // sends it no plan.
+  MeasurementLimits measurements = 5;
 }
 
-// What the station's measuring accepts (protocol 1.1, measure.proto).
+// One running receiver: one SDR with its own backend.
+message ReceiverCapabilities {
+  // As configured by the hub (ConfigureReceivers).
+  uint32 receiver_id = 1;
+  // Range the receiver can demodulate RIGHT NOW without retuning its
+  // front end (the current passband). Listeners can only tune inside it.
+  FrequencyRange tunable_range = 2;
+  // Full range the hardware could cover if the owner retunes the front end.
+  FrequencyRange hardware_range = 3;
+  uint32 sample_rate_hz = 4;
+  // Maximum simultaneous audio channels on this receiver.
+  uint32 max_channels = 5;
+  FrontendControls frontend = 6;
+  // Informational, untrusted, at most 64 bytes: e.g. "RTL-SDR Blog V4".
+  string sdr_model = 7;
+}
+
+// What the station's measuring accepts (measure.proto).
 message MeasurementLimits {
-  // [measurements] enabled in stationd.toml: the owner's local switch. When
-  // false the station refuses every plan (PERMISSION_DENIED) and the hub
-  // sends none.
-  bool enabled = 1;
-  // The most noise bands the station accepts in a plan; the hub clamps it to 32.
-  uint32 max_noise_bands = 2;
-  reserved 3, 4;  // a later minor version
+  // The most noise bands the station accepts in a plan, across receivers;
+  // the hub clamps it to 32.
+  uint32 max_noise_bands = 1;
   // The measurement method the station runs (MeasurementsStarted.method_version).
-  uint32 method_version = 5;
+  uint32 method_version = 2;
 }
 
 message WaterfallLimits {
   uint32 max_bins = 1;             // per subscription
   uint32 min_row_interval_ms = 2;  // fastest row rate supported
-  uint32 max_subscriptions = 3;
+  uint32 max_subscriptions = 3;    // across all receivers
 }
 
 message FrontendControls {
@@ -74,31 +77,34 @@ message FrontendControls {
 
 // ------------------------------------------------------------ Audio channels
 
-// Creates a demodulated audio channel. channel_id is chosen by the hub and
-// must not be in use on this connection.
+// Creates a demodulated audio channel on one receiver. channel_id is chosen
+// by the hub and must not be in use on this connection. The channel stays on
+// that receiver for its life.
 message OpenChannel {
   uint32 channel_id = 1;
-  uint64 frequency_hz = 2;
-  Mode mode = 3;
-  int32 low_cut_hz = 4;
-  int32 high_cut_hz = 5;
-  AudioParams audio = 6;
+  uint32 receiver_id = 2;
+  uint64 frequency_hz = 3;
+  Mode mode = 4;
+  int32 low_cut_hz = 5;
+  int32 high_cut_hz = 6;
+  AudioParams audio = 7;
   // Squelch threshold in dB SNR. Absent = squelch off.
-  optional float squelch_snr_db = 7;
+  optional float squelch_snr_db = 8;
 }
 
 // What the station actually configured (may be rounded by the backend).
 message ChannelOpened {
   uint32 channel_id = 1;
-  uint64 frequency_hz = 2;
-  Mode mode = 3;
-  int32 low_cut_hz = 4;
-  int32 high_cut_hz = 5;
-  AudioParams audio = 6;
+  uint32 receiver_id = 2;
+  uint64 frequency_hz = 3;
+  Mode mode = 4;
+  int32 low_cut_hz = 5;
+  int32 high_cut_hz = 6;
+  AudioParams audio = 7;
 }
 
-// Changes an open channel in place. Absent fields keep their value.
-// Codec parameters cannot change; close and reopen instead.
+// Changes an open channel in place, on its receiver. Absent fields keep their
+// value. Codec parameters cannot change; close and reopen instead.
 message UpdateChannel {
   uint32 channel_id = 1;
   optional uint64 frequency_hz = 2;
@@ -124,50 +130,57 @@ message CloseChannel {
 
 // ------------------------------------------------------------ Frontend
 
-// Changes shared hardware settings. Affects every channel on the station, so
-// the hub only sends it on behalf of the owner (never a listener).
+// Changes one receiver's hardware settings while it runs. Affects every
+// channel on that receiver, so the hub only sends it on behalf of the owner
+// (never a listener). Only what the receiver's FrontendControls offer; what
+// its backend can't change live is a receiver setting (ConfigureReceivers).
 // Absent fields keep their value.
 message SetFrontend {
-  optional float gain_db = 1;
-  optional bool hardware_agc = 2;
-  optional float attenuation_db = 3;
-  optional string antenna_port = 4;
+  uint32 receiver_id = 1;
+  optional float gain_db = 2;
+  optional bool hardware_agc = 3;
+  optional float attenuation_db = 4;
+  optional string antenna_port = 5;
   // Moves the passband. Existing channels outside the new passband are
   // closed by the station (Event CHANNEL_CLOSED).
-  optional uint64 center_frequency_hz = 5;
+  optional uint64 center_frequency_hz = 6;
 }
 
 message FrontendState {
-  float gain_db = 1;
-  bool hardware_agc = 2;
-  float attenuation_db = 3;
-  string antenna_port = 4;
-  uint64 center_frequency_hz = 5;
-  FrequencyRange tunable_range = 6;
+  uint32 receiver_id = 1;
+  float gain_db = 2;
+  bool hardware_agc = 3;
+  float attenuation_db = 4;
+  string antenna_port = 5;
+  uint64 center_frequency_hz = 6;
+  FrequencyRange tunable_range = 7;
 }
 
 // ------------------------------------------------------------ Waterfall
 
-// Starts a spectrum stream. subscription_id is chosen by the hub.
+// Starts a spectrum stream on one receiver. subscription_id is chosen by the
+// hub.
 message SubscribeWaterfall {
   uint32 subscription_id = 1;
-  FrequencyRange range = 2;
+  uint32 receiver_id = 2;
+  FrequencyRange range = 3;
   // Number of bins across the range. 64..=Capabilities.waterfall.max_bins.
-  uint32 bins = 3;
+  uint32 bins = 4;
   // Time between rows. >= Capabilities.waterfall.min_row_interval_ms.
-  uint32 row_interval_ms = 4;
-  Quantization quantization = 5;
-  WaterfallCompression compression = 6;
+  uint32 row_interval_ms = 5;
+  Quantization quantization = 6;
+  WaterfallCompression compression = 7;
 }
 
 // What the station actually configured. Rows use exactly these values.
 message WaterfallSubscribed {
   uint32 subscription_id = 1;
-  FrequencyRange range = 2;
-  uint32 bins = 3;
-  uint32 row_interval_ms = 4;
-  Quantization quantization = 5;
-  WaterfallCompression compression = 6;
+  uint32 receiver_id = 2;
+  FrequencyRange range = 3;
+  uint32 bins = 4;
+  uint32 row_interval_ms = 5;
+  Quantization quantization = 6;
+  WaterfallCompression compression = 7;
 }
 
 message UnsubscribeWaterfall {
@@ -188,13 +201,13 @@ message Pong {
 
 // ------------------------------------------------------------ Admin operations
 
-// Typed, opt-in maintenance operations. The station refuses any kind not
-// listed in its local allowed_admin_ops with RESULT_CODE_PERMISSION_DENIED.
+// Typed maintenance operations, sent only on behalf of the owner. A station
+// that doesn't implement a kind answers RESULT_CODE_UNSUPPORTED.
 // There is deliberately no "run command" or "push config" operation.
 enum AdminOpKind {
   ADMIN_OP_KIND_UNSPECIFIED = 0;
   ADMIN_OP_KIND_RESTART_STATIOND = 1;  // restart the stationd service
-  ADMIN_OP_KIND_RESTART_BACKEND = 2;   // restart the DSP backend (radiod)
+  ADMIN_OP_KIND_RESTART_BACKEND = 2;   // restart one receiver's backend, or all
   ADMIN_OP_KIND_UPDATE = 3;            // upgrade CoaxHub packages from the signed repo
   ADMIN_OP_KIND_REBOOT_HOST = 4;       // reboot the machine
 }
@@ -203,4 +216,6 @@ enum AdminOpKind {
 // then performs it. The connection may drop as a consequence.
 message AdminOp {
   AdminOpKind kind = 1;
+  // RESTART_BACKEND: the receiver; absent = every receiver.
+  optional uint32 receiver_id = 2;
 }

@@ -1,24 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! Measuring the noise floor (station protocol 1.1).
+//! Measuring the noise floor (station protocol §4.1).
 //!
-//! The hub asks with a plan (`StartMeasurements`); the station runs it on
-//! its own clock, on a spectrum channel of its own that is not listener
-//! capacity, and never retunes the front end for it:
+//! The hub asks with a plan (`StartMeasurements`) whose bands each lie in
+//! one receiver; the station runs it on its own clock, on a spectrum channel
+//! of its own per receiver measured (not listener capacity), and never
+//! retunes a front end for it:
 //!
-//! - [`plan`]: which windows the measurement channel visits, and when;
+//! - [`plan`]: which windows a receiver's measurement channel visits, and
+//!   when;
 //! - `station_backend::reduce`: spectra to the quantiles of a band's minute;
-//! - [`schedule`]: the duty (continuous while listened to, one minute in five
-//!   while idle) and the pause rules;
+//! - [`schedule`]: the duty (continuous while a receiver is listened to, one
+//!   minute in five while idle) and the pause rules;
 //! - [`clock`]: the wall clock the schedule follows, and the clock state;
-//! - the runner (one task per plan), and [`Measurer`]: one per connection,
-//!   which answers `StartMeasurements`/`StopMeasurements` and stops the plan
-//!   when the front end changes (`Event{MEASUREMENT_STOPPED}`) or the
-//!   connection ends (silently: a plan belongs to one connection, and
-//!   nothing is buffered across a disconnect).
+//! - the runner (one task per receiver of the plan), and [`Measurer`]: one
+//!   per connection, which answers `StartMeasurements`/`StopMeasurements`
+//!   and stops the whole plan when a front end or a receiver changes
+//!   (`Event{MEASUREMENT_STOPPED}`) or the connection ends (silently: a plan
+//!   belongs to one connection, and nothing is buffered across a
+//!   disconnect).
 //!
-//! `[measurements] enabled = false` in `stationd.toml` turns it off on the
-//! station: `Capabilities.measurements.enabled` is false and every plan is
-//! refused with `PERMISSION_DENIED`.
+//! Whether a station measures is the owner's choice, kept by the control
+//! plane: the hub sends no plan to a station whose measuring is off.
 
 pub mod clock;
 pub mod load;
@@ -31,13 +33,13 @@ mod tests;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use station_backend::Backend;
 use station_proto::{limits, v1};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::dispatch::Tables;
 use crate::outbound::{DropCounters, Outbound};
+use crate::receivers::Receivers;
 
 pub use self::clock::{MeasureClock, ScaledClock, SystemClock};
 pub use self::load::{FixedLoad, HostLoad, LoadSource, ProcLoad};
@@ -48,11 +50,11 @@ use self::schedule::duty_for;
 /// What the measurement code needs from the connection.
 #[derive(Clone)]
 pub struct MeasureDeps {
-    /// The DSP backend.
-    pub backend: Arc<dyn Backend>,
+    /// The station's receivers.
+    pub receivers: Receivers,
     /// Where reports and events go.
     pub outbound: Arc<Outbound>,
-    /// The connection's channels and subscriptions (the duty).
+    /// The connection's channels and subscriptions (each receiver's duty).
     pub tables: Arc<Mutex<Tables>>,
     /// The queue's drop counters (the pause rules).
     pub drops: Arc<DropCounters>,
@@ -62,8 +64,6 @@ pub struct MeasureDeps {
     pub load: Arc<dyn LoadSource>,
     /// The clock state reports carry.
     pub clock_state: Arc<dyn Fn() -> v1::ClockState + Send + Sync>,
-    /// `[measurements] enabled`.
-    pub enabled: bool,
 }
 
 impl std::fmt::Debug for MeasureDeps {
@@ -71,19 +71,8 @@ impl std::fmt::Debug for MeasureDeps {
         f.debug_struct("MeasureDeps")
             .field("clock", &self.clock)
             .field("load", &self.load)
-            .field("enabled", &self.enabled)
             .finish_non_exhaustive()
     }
-}
-
-/// The `Capabilities.measurements` of a station whose backend `can_measure`,
-/// with the owner's switch.
-pub fn limits_for(can_measure: bool, enabled: bool) -> Option<v1::MeasurementLimits> {
-    can_measure.then_some(v1::MeasurementLimits {
-        enabled,
-        max_noise_bands: limits::MAX_NOISE_BANDS,
-        method_version: limits::MEASURE_METHOD_VERSION,
-    })
 }
 
 /// A refused `StartMeasurements`.
@@ -105,7 +94,8 @@ fn refuse(code: v1::ResultCode, message: impl Into<String>) -> Refusal {
 /// Why a plan stops other than by `StopMeasurements`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
-    /// `SetFrontend`, or `Event{FRONTEND_CHANGED}`.
+    /// `SetFrontend`, `Event{FRONTEND_CHANGED}`, or a receiver entering or
+    /// leaving `RUNNING` (`Event{RECEIVER_STATE}`).
     FrontendChanged,
     /// `Event{BACKEND_RESTARTED}`.
     BackendRestarted,
@@ -137,6 +127,32 @@ pub struct Measurer {
 /// Channel ids are `stationd`'s own; one plan at a time needs few.
 static CHANNEL_IDS: AtomicU32 = AtomicU32::new(1);
 
+/// A requested band, checked: (`band_id`, `receiver_id`, key, ranges).
+type Requested = (u32, u32, String, Vec<(u64, u64)>);
+
+/// The well-formed bands of `req`, each once: a band ID not 0, a key of
+/// `[a-z0-9]{1,8}`, 1–8 ranges sorted and apart.
+fn requested_bands(req: &v1::StartMeasurements) -> Vec<Requested> {
+    let mut seen = std::collections::HashSet::new();
+    req.noise_bands
+        .iter()
+        .filter(|b| b.band_id != 0 && station_proto::validate::is_band_key(&b.key))
+        .filter_map(|b| {
+            let ranges: Vec<(u64, u64)> = b
+                .ranges
+                .iter()
+                .take(limits::MAX_BAND_RANGES)
+                .map(|r| (r.start_hz, r.end_hz.min(limits::MAX_FREQUENCY_HZ)))
+                .collect();
+            let sorted =
+                ranges.iter().all(|(s, e)| s < e) && ranges.windows(2).all(|w| w[0].1 < w[1].0);
+            (sorted && !ranges.is_empty())
+                .then(|| (b.band_id, b.receiver_id, b.key.clone(), ranges))
+        })
+        .filter(|b| seen.insert(b.0))
+        .collect()
+}
+
 impl Measurer {
     /// No plan yet.
     pub fn new(deps: MeasureDeps) -> Arc<Self> {
@@ -161,16 +177,10 @@ impl Measurer {
         self: &Arc<Self>,
         req: v1::StartMeasurements,
     ) -> Result<v1::MeasurementsStarted, Refusal> {
-        if !self.deps.enabled {
-            return Err(refuse(
-                v1::ResultCode::PermissionDenied,
-                "measuring is turned off in stationd.toml ([measurements] enabled = false)",
-            ));
-        }
-        if !self.deps.backend.can_measure() {
+        if !self.deps.receivers.can_measure() {
             return Err(refuse(
                 v1::ResultCode::Unsupported,
-                "this backend cannot measure",
+                "this station's backend cannot measure",
             ));
         }
         let shape = check_shape(&req)?;
@@ -189,13 +199,14 @@ impl Measurer {
             });
         }
         match self.prepare(&req, shape).await {
-            Ok((started, runner)) => {
-                self.spawn(runner, req.measurement_id, stop);
+            Ok((started, runners)) => {
+                for runner in runners {
+                    self.spawn(runner, req.measurement_id, stop.clone());
+                }
                 info!(
                     measurement_id = req.measurement_id,
                     bands = started.noise_bands.len(),
-                    duty = v1::MeasurementDuty::try_from(started.duty)
-                        .map_or("unknown", |d| d.as_str_name()),
+                    receivers = ?started.receivers.iter().map(|r| r.receiver_id).collect::<Vec<_>>(),
                     "measuring the noise floor"
                 );
                 Ok(started)
@@ -207,62 +218,96 @@ impl Measurer {
         }
     }
 
+    /// Plans each receiver of `req` that runs: its accepted bands, its
+    /// `MeasuredReceiver` and its runner.
     async fn prepare(
         &self,
         req: &v1::StartMeasurements,
         shape: plan::Shape,
-    ) -> Result<(v1::MeasurementsStarted, Runner), Refusal> {
-        let backend_error = |e: station_backend::BackendError| refuse(e.code, e.message);
-        let caps = self
-            .deps
-            .backend
-            .capabilities()
-            .await
-            .map_err(backend_error)?;
-        let frontend = runner::sanitize_frontend(
-            self.deps
-                .backend
-                .frontend_state()
+    ) -> Result<(v1::MeasurementsStarted, Vec<Runner>), Refusal> {
+        let bands = requested_bands(req);
+        let mut order: Vec<u32> = Vec::new();
+        for b in &bands {
+            if !order.contains(&b.1) {
+                order.push(b.1);
+            }
+        }
+        let mut budget = limits::MAX_NOISE_BANDS as usize;
+        let mut accepted = Vec::new();
+        let mut measured = Vec::new();
+        let mut runners = Vec::new();
+        for receiver_id in order {
+            let mine: Vec<plan::BandRequest> = bands
+                .iter()
+                .filter(|b| b.1 == receiver_id)
+                .map(|(id, _, key, ranges)| (*id, key.clone(), ranges.clone()))
+                .collect();
+            let Some((runner, interval)) = self
+                .plan_receiver(receiver_id, &mine, req, shape, budget)
                 .await
-                .map_err(backend_error)?,
-        );
-        let tunable = caps
-            .tunable_range
-            .or(frontend.tunable_range)
-            .ok_or_else(|| refuse(v1::ResultCode::BackendError, "no tunable range"))?;
+            else {
+                continue;
+            };
+            budget = budget.saturating_sub(runner.plan.bands.len());
+            accepted.extend(runner.plan.bands.iter().map(|b| {
+                v1::NoiseBand {
+                    band_id: b.band_id,
+                    receiver_id,
+                    ranges: b
+                        .ranges
+                        .iter()
+                        .map(|&(start_hz, end_hz)| v1::FrequencyRange { start_hz, end_hz })
+                        .collect(),
+                    key: b.key.clone(),
+                }
+            }));
+            measured.push(v1::MeasuredReceiver {
+                receiver_id,
+                noise_interval_ms: interval,
+                duty: runner.duty as i32,
+                frontend: Some(runner.frontend.clone()),
+            });
+            runners.push(runner);
+        }
+        if accepted.is_empty() {
+            return Err(refuse(
+                v1::ResultCode::OutOfRange,
+                "no band of the plan is inside a running receiver's tunable range",
+            ));
+        }
+        let started = v1::MeasurementsStarted {
+            measurement_id: req.measurement_id,
+            noise_bands: accepted,
+            receivers: measured,
+            method_version: limits::MEASURE_METHOD_VERSION,
+        };
+        Ok((started, runners))
+    }
+
+    /// The runner of `bands` (at most `budget` of them) on receiver
+    /// `receiver_id`, with its cadence; `None` when it doesn't run or no
+    /// band is inside its tunable range.
+    async fn plan_receiver(
+        &self,
+        receiver_id: u32,
+        bands: &[plan::BandRequest],
+        req: &v1::StartMeasurements,
+        shape: plan::Shape,
+        budget: usize,
+    ) -> Option<(Runner, u32)> {
+        let backend = self.deps.receivers.running_backend(receiver_id)?;
+        let caps = backend.capabilities().await.ok()?;
+        let mut frontend = runner::sanitize_frontend(backend.frontend_state().await.ok()?);
+        frontend.receiver_id = receiver_id;
+        let tunable = caps.receiver.tunable_range.or(frontend.tunable_range)?;
         let fe = plan::FrontEnd {
             tunable: (tunable.start_hz, tunable.end_hz),
             center_hz: frontend.center_frequency_hz,
         };
-        let bands: Vec<plan::BandRequest> = req
-            .noise_bands
-            .iter()
-            .filter(|b| b.band_id != 0 && station_proto::validate::is_band_key(&b.key))
-            .filter_map(|b| {
-                let ranges: Vec<(u64, u64)> = b
-                    .ranges
-                    .iter()
-                    .take(limits::MAX_BAND_RANGES)
-                    .map(|r| (r.start_hz, r.end_hz.min(limits::MAX_FREQUENCY_HZ)))
-                    .collect();
-                let sorted =
-                    ranges.iter().all(|(s, e)| s < e) && ranges.windows(2).all(|w| w[0].1 < w[1].0);
-                (sorted && !ranges.is_empty()).then(|| (b.band_id, b.key.clone(), ranges))
-            })
-            .collect();
-        let mut seen = std::collections::HashSet::new();
-        let bands: Vec<_> = bands.into_iter().filter(|b| seen.insert(b.0)).collect();
-        let grid = self
-            .deps
-            .backend
-            .measurement_grid(shape.resolution_bw_hz)
-            .await;
-        let plan = plan::plan(&bands, fe, shape, grid, limits::MAX_NOISE_BANDS as usize);
+        let grid = backend.measurement_grid(shape.resolution_bw_hz).await;
+        let plan = plan::plan(bands, fe, shape, grid, budget);
         if plan.bands.is_empty() {
-            return Err(refuse(
-                v1::ResultCode::OutOfRange,
-                "no band of the plan is inside the tunable range",
-            ));
+            return None;
         }
         let cycle_ms = plan.cycle_minutes() * limits::NOISE_WINDOW_MS;
         let interval = limits::NOISE_INTERVALS_MS
@@ -270,36 +315,17 @@ impl Measurer {
             .copied()
             .find(|&i| i >= cycle_ms.max(req.noise_interval_ms))
             .unwrap_or(cycle_ms);
-        let duty = duty_for({
-            let t = self
-                .deps
+        let duty = duty_for(
+            self.deps
                 .tables
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            t.open_channels() + t.open_subscriptions()
-        });
-        let started = v1::MeasurementsStarted {
-            measurement_id: req.measurement_id,
-            noise_bands: plan
-                .bands
-                .iter()
-                .map(|b| v1::NoiseBand {
-                    band_id: b.band_id,
-                    ranges: b
-                        .ranges
-                        .iter()
-                        .map(|&(start_hz, end_hz)| v1::FrequencyRange { start_hz, end_hz })
-                        .collect(),
-                    key: b.key.clone(),
-                })
-                .collect(),
-            noise_interval_ms: interval,
-            duty: duty as i32,
-            frontend: Some(frontend.clone()),
-            method_version: limits::MEASURE_METHOD_VERSION,
-        };
+                .unwrap_or_else(PoisonError::into_inner)
+                .listeners_on(receiver_id),
+        );
         let runner = Runner {
             measurement_id: req.measurement_id,
+            receiver_id,
+            backend,
             channel: self.next_channel.fetch_add(1, Ordering::Relaxed),
             plan,
             shape,
@@ -309,7 +335,7 @@ impl Measurer {
             duty,
             frontend,
         };
-        Ok((started, runner))
+        Some((runner, interval))
     }
 
     fn spawn(self: &Arc<Self>, mut runner: Runner, measurement_id: u32, stop: CancellationToken) {
@@ -325,7 +351,8 @@ impl Measurer {
         });
     }
 
-    /// Forgets plan `id` if it is the running one; returns whether it was.
+    /// Forgets plan `id` if it is the running one, stopping every receiver
+    /// of it; returns whether it was.
     fn clear(&self, id: u32) -> bool {
         let mut running = self.running();
         if running.as_ref().is_some_and(|r| r.measurement_id == id) {

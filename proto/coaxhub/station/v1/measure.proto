@@ -1,4 +1,4 @@
-// CoaxHub Stations — station measurements (protocol 1.1).
+// CoaxHub Stations — station measurements.
 //
 // SPDX-License-Identifier: MIT
 // The station protocol is MIT-licensed so any implementation (including the
@@ -7,25 +7,14 @@
 // §4.1, §5.2 and §6.4.
 //
 // The hub asks a station to measure the noise floor of a few frequency ranges
-// with a plan (StartMeasurements). The station runs it on its own clock, on
-// low-rate spectrum channels of its own that are not listener capacity, and
-// never retunes its front end for it. It measures every minute while it has
-// listener channels or waterfall subscriptions open (continuous duty), and
-// only the UTC minutes whose number is a multiple of 5 while it has none
+// with a plan (StartMeasurements). Each band lies inside one receiver. The
+// station runs the plan on its own clock, on low-rate spectrum channels of its
+// own (one per receiver measured) that are not listener capacity, and never
+// retunes a front end for it. Each receiver measures every minute while it
+// has listener channels or waterfall subscriptions open (continuous duty),
+// and only the UTC minutes whose number is a multiple of 5 while it has none
 // (idle duty). Every value is an untrusted claim, uncalibrated, on the
 // backend's scale.
-//
-// Wiring into the other files:
-//   Capabilities.measurements                       = 12 (MeasurementLimits, control.proto)
-//   Request.start_measurements = 19, Request.stop_measurements = 20 (gateway.proto)
-//   Response.measurements_started                   = 19 (gateway.proto)
-//   StationMessage.noise                            = 8  (gateway.proto)
-//   Event.Kind MEASUREMENT_STOPPED = 9, MEASUREMENT_DUTY = 10, and
-//   Event.measurement_id, measurement_duty, effective_unix_ms, measurement_stop_reason
-//                                                   (status.proto)
-//   StationStatus.measurement_reports_dropped_total = 9  (status.proto)
-// Reserved for a later minor version: StationMessage = 9,
-// StartMeasurements = 4, MeasurementsStarted = 3 and 4, MeasurementLimits = 3 and 4.
 
 syntax = "proto3";
 
@@ -34,9 +23,10 @@ package coaxhub.station.v1;
 import "coaxhub/station/v1/common.proto";
 import "coaxhub/station/v1/control.proto";
 
-// Continuous while the station has listener channels or waterfall
+// Continuous while the receiver has listener channels or waterfall
 // subscriptions open; idle (the UTC minutes whose number is a multiple of 5)
-// while it has none. The station decides it; the hub never sets it.
+// while it has none. The station decides it per receiver; the hub never sets
+// it.
 enum MeasurementDuty {
   MEASUREMENT_DUTY_UNSPECIFIED = 0;
   MEASUREMENT_DUTY_CONTINUOUS = 1;
@@ -46,11 +36,12 @@ enum MeasurementDuty {
 // Why the station stopped a plan on its own (Event MEASUREMENT_STOPPED).
 enum MeasurementStopReason {
   MEASUREMENT_STOP_REASON_UNSPECIFIED = 0;
-  // SetFrontend, or the front end changed by itself (FRONTEND_CHANGED).
+  // SetFrontend, a receiver reconfigured, or a front end changed by itself
+  // (FRONTEND_CHANGED, RECEIVER_STATE).
   MEASUREMENT_STOP_REASON_FRONTEND_CHANGED = 1;
-  // The backend restarted (BACKEND_RESTARTED).
+  // A receiver's backend restarted (BACKEND_RESTARTED).
   MEASUREMENT_STOP_REASON_BACKEND_RESTARTED = 2;
-  // The backend refused or lost the measurement channel.
+  // The backend refused or lost a measurement channel.
   MEASUREMENT_STOP_REASON_BACKEND_ERROR = 3;
 }
 
@@ -58,31 +49,33 @@ enum MeasurementStopReason {
 // subscription ids; one plan per connection.
 message StartMeasurements {
   uint32 measurement_id = 1;
-  // At most 32, band_id unique, each inside the station's coverage.
+  // At most 32 across receivers, band_id unique, each inside one receiver's
+  // coverage.
   repeated NoiseBand noise_bands = 2;
-  // Report cadence, ms: 60000 (one report per measured minute).
+  // Report cadence, ms: 60000 (one report per receiver per measured minute).
   uint32 noise_interval_ms = 3;
-  reserved 4;  // a later minor version
   // The measurement spectrum channel: bin_count bins of resolution_bw_hz each
   // (1024 x 500 Hz: one 512 kHz window). BIN_COUNT is fixed for the
   // channel's life.
-  uint32 bin_count = 5;
-  float resolution_bw_hz = 6;
+  uint32 bin_count = 4;
+  float resolution_bw_hz = 5;
   // Time spent on each window before the channel hops to the next one, ms (4000).
-  uint32 dwell_ms = 7;
+  uint32 dwell_ms = 6;
   // Time between two polls of the channel, ms (500: 2 polls/s).
-  uint32 poll_interval_ms = 8;
+  uint32 poll_interval_ms = 7;
 }
 
 // One noise band of a plan.
 message NoiseBand {
   // Hub-assigned, unique in the plan, never 0.
   uint32 band_id = 1;
+  // The receiver whose coverage holds the band.
+  uint32 receiver_id = 2;
   // The parts of the band to measure: 1-8 ranges, sorted and apart,
   // start_hz < end_hz. The station pools only bins inside them.
-  repeated FrequencyRange ranges = 2;
+  repeated FrequencyRange ranges = 3;
   // The band's name, for logs only ("40m"): 1-8 bytes of [a-z0-9].
-  string key = 3;
+  string key = 4;
 }
 
 // The plan as the station runs it. Answers StartMeasurements with OK.
@@ -90,17 +83,23 @@ message MeasurementsStarted {
   uint32 measurement_id = 1;
   // The accepted subset of the requested bands; ranges may only shrink.
   repeated NoiseBand noise_bands = 2;
-  reserved 3, 4;  // a later minor version
-  // The actual cadence, ms, >= the requested one: 60000, or 120000 or 300000
-  // when the windows don't fit one minute and the cycle stretches.
-  uint32 noise_interval_ms = 5;
-  // The duty from the next UTC minute on.
-  MeasurementDuty duty = 6;
-  // The front end the plan runs under.
-  FrontendState frontend = 7;
+  // Each receiver measured, once.
+  repeated MeasuredReceiver receivers = 3;
   // The measurement method (what a value means: windows, statistic,
   // normalisation). 1 = the first method.
-  uint32 method_version = 8;
+  uint32 method_version = 4;
+}
+
+// One receiver of a running plan.
+message MeasuredReceiver {
+  uint32 receiver_id = 1;
+  // The actual cadence, ms, >= the requested one: 60000, or 120000 or 300000
+  // when the receiver's windows don't fit one minute and its cycle stretches.
+  uint32 noise_interval_ms = 2;
+  // The receiver's duty from the next UTC minute on.
+  MeasurementDuty duty = 3;
+  // The front end the plan runs under.
+  FrontendState frontend = 4;
 }
 
 // Stops the plan. NOT_FOUND is harmless.
@@ -108,29 +107,31 @@ message StopMeasurements {
   uint32 measurement_id = 1;
 }
 
-// The noise floor of one measured minute: one per measured minute, sent in
-// the minute that follows it.
+// The noise floor of one receiver's measured minute: one per receiver per
+// measured minute, sent in the minute that follows it.
 message NoiseFloorReport {
   uint32 measurement_id = 1;
+  uint32 receiver_id = 2;
   // UTC, the start of the measured minute: a multiple of 60000.
-  int64 window_start_unix_ms = 2;
+  int64 window_start_unix_ms = 3;
   // The window's length, ms: 60000.
-  uint32 window_ms = 3;
-  // The front-end settings the window was measured under.
-  FrontendState frontend = 4;
+  uint32 window_ms = 4;
+  // The receiver's front-end settings the window was measured under.
+  FrontendState frontend = 5;
   // ADC overload events during the window.
-  uint32 overloads = 5;
+  uint32 overloads = 6;
   // The station's clock while measuring.
-  ClockState clock = 6;
-  // The bands measured in this window, at most 32, each an accepted band_id once.
-  repeated BandNoise bands = 7;
+  ClockState clock = 7;
+  // The receiver's bands measured in this window, at most 32, each an
+  // accepted band_id once.
+  repeated BandNoise bands = 8;
   // Fewer spectra than planned went into the window (the channel was warming
   // up, a poll failed): the values are less certain.
-  bool partial = 8;
-  // How many measured minutes one cycle over every window takes (1, 2 or 5),
-  // and which of them this window is (0-based).
-  uint32 cycle_minutes = 9;
-  uint32 cycle_index = 10;
+  bool partial = 9;
+  // How many measured minutes one cycle over the receiver's windows takes
+  // (1, 2 or 5), and which of them this window is (0-based).
+  uint32 cycle_minutes = 10;
+  uint32 cycle_index = 11;
 }
 
 // One band's noise over one window.

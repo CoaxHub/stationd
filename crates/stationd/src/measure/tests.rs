@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! The plan runner under a paused clock with the fake backend: the idle
-//! schedule, duty changes, stops, the local switch and the pause rules.
+//! The plan runners under a paused clock with fake receivers: the idle
+//! schedule, duty changes per receiver, stops and the pause rules.
 
 use std::sync::{Arc, Mutex};
 
@@ -10,9 +10,10 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use super::*;
-use crate::config::LocalPolicy;
 use crate::dispatch::{self, Media, RequestContext};
 use crate::outbound::QueueLimits;
+use crate::receivers::FakeBackends;
+use crate::receivers::testing::Station;
 
 use v1::station_message::Body;
 
@@ -21,64 +22,13 @@ const NOON: i64 = 1_790_942_400_000;
 const MIN: i64 = 60_000;
 
 struct Rig {
-    backend: FakeBackend,
+    station: Station,
     clock: ScaledClock,
     measurer: Arc<Measurer>,
     requests: RequestContext,
     seen: Arc<Mutex<Vec<(i64, v1::StationMessage)>>>,
     load: Arc<Mutex<f32>>,
     _collector: JoinHandle<()>,
-}
-
-fn rig_with(enabled: bool, backend: FakeBackend) -> Rig {
-    // 11:58:30 UTC.
-    let clock = ScaledClock::new(NOON - 90_000, 1);
-    // The fake floor's daily curve follows the test's clock, not the host's.
-    let backend = backend.with_wall_clock(Arc::new(move || clock.now_ms()));
-    let drops = Arc::new(DropCounters::default());
-    let outbound = Outbound::new(QueueLimits::default(), Arc::clone(&drops));
-    let tables: Arc<Mutex<Tables>> = Arc::default();
-    let load = Arc::new(Mutex::new(0.1f32));
-    let host_load = Arc::clone(&load);
-    let measurer = Measurer::new(MeasureDeps {
-        backend: Arc::new(backend.clone()),
-        outbound: Arc::clone(&outbound),
-        tables: Arc::clone(&tables),
-        drops,
-        clock: Arc::new(clock),
-        load: Arc::new(SharedLoad(host_load)),
-        clock_state: Arc::new(|| v1::ClockState {
-            synchronized: true,
-            max_error_ms: 0,
-        }),
-        enabled,
-    });
-    let requests = RequestContext {
-        backend: Arc::new(backend.clone()),
-        policy: Arc::new(LocalPolicy {
-            measurements: enabled,
-            ..LocalPolicy::default()
-        }),
-        minor: 1,
-        tables,
-        measurer: Some(Arc::clone(&measurer)),
-    };
-    let seen: Arc<Mutex<Vec<(i64, v1::StationMessage)>>> = Arc::default();
-    let sink = Arc::clone(&seen);
-    let collector = tokio::spawn(async move {
-        while let Some(m) = outbound.next().await {
-            sink.lock().expect("seen").push((clock.now_ms(), m));
-        }
-    });
-    Rig {
-        backend,
-        clock,
-        measurer,
-        requests,
-        seen,
-        load,
-        _collector: collector,
-    }
 }
 
 /// A load the test changes as it goes, on 4 CPUs.
@@ -94,33 +44,95 @@ impl LoadSource for SharedLoad {
     }
 }
 
-fn rig() -> Rig {
-    rig_with(true, FakeBackend::default())
+/// The standard station (receiver 1 on 40 m, receiver 2 on 20 m) at
+/// 11:58:30 UTC.
+async fn rig() -> Rig {
+    let clock = ScaledClock::new(NOON - 90_000, 1);
+    // The fake floor's daily curve follows the test's clock, not the host's.
+    let backends = FakeBackends::default().with_wall_clock(Arc::new(move || clock.now_ms()));
+    let station = Station::standard_with(backends).await;
+    let drops = Arc::new(DropCounters::default());
+    let outbound = Outbound::new(QueueLimits::default(), Arc::clone(&drops));
+    let tables: Arc<Mutex<Tables>> = Arc::default();
+    let load = Arc::new(Mutex::new(0.1f32));
+    let host_load = Arc::clone(&load);
+    let measurer = Measurer::new(MeasureDeps {
+        receivers: station.receivers.clone(),
+        outbound: Arc::clone(&outbound),
+        tables: Arc::clone(&tables),
+        drops,
+        clock: Arc::new(clock),
+        load: Arc::new(SharedLoad(host_load)),
+        clock_state: Arc::new(|| v1::ClockState {
+            synchronized: true,
+            max_error_ms: 0,
+        }),
+    });
+    let requests = RequestContext {
+        receivers: station.receivers.clone(),
+        minor: 0,
+        tables,
+        measurer: Some(Arc::clone(&measurer)),
+    };
+    let seen: Arc<Mutex<Vec<(i64, v1::StationMessage)>>> = Arc::default();
+    let sink = Arc::clone(&seen);
+    let collector = tokio::spawn(async move {
+        while let Some(m) = outbound.next().await {
+            sink.lock().expect("seen").push((clock.now_ms(), m));
+        }
+    });
+    Rig {
+        station,
+        clock,
+        measurer,
+        requests,
+        seen,
+        load,
+        _collector: collector,
+    }
 }
 
-fn forty() -> v1::StartMeasurements {
+fn band(band_id: u32, receiver_id: u32, ranges: &[(u64, u64)], key: &str) -> v1::NoiseBand {
+    v1::NoiseBand {
+        band_id,
+        receiver_id,
+        ranges: ranges
+            .iter()
+            .map(|&(start_hz, end_hz)| v1::FrequencyRange { start_hz, end_hz })
+            .collect(),
+        key: key.into(),
+    }
+}
+
+/// 40 m, on receiver 1, around its DC spike.
+fn forty_band() -> v1::NoiseBand {
+    band(
+        3,
+        1,
+        &[(7_000_000, 7_098_000), (7_102_000, 7_300_000)],
+        "40m",
+    )
+}
+
+/// Part of 20 m, on receiver 2.
+fn twenty_band() -> v1::NoiseBand {
+    band(5, 2, &[(14_000_000, 14_190_000)], "20m")
+}
+
+fn plan(bands: Vec<v1::NoiseBand>) -> v1::StartMeasurements {
     v1::StartMeasurements {
         measurement_id: 7,
-        noise_bands: vec![v1::NoiseBand {
-            band_id: 3,
-            ranges: vec![
-                v1::FrequencyRange {
-                    start_hz: 7_000_000,
-                    end_hz: 7_098_000,
-                },
-                v1::FrequencyRange {
-                    start_hz: 7_102_000,
-                    end_hz: 7_300_000,
-                },
-            ],
-            key: "40m".into(),
-        }],
+        noise_bands: bands,
         noise_interval_ms: 60_000,
         bin_count: 1024,
         resolution_bw_hz: 500.0,
         dwell_ms: 4000,
         poll_interval_ms: 500,
     }
+}
+
+fn forty() -> v1::StartMeasurements {
+    plan(vec![forty_band()])
 }
 
 impl Rig {
@@ -132,9 +144,13 @@ impl Rig {
         self.clock.ms_at(i)
     }
 
-    /// (time, op) of the measurement channel, in this clock's ms.
+    fn backend(&self, receiver_id: u32) -> FakeBackend {
+        self.station.backends.get(receiver_id).expect("backend")
+    }
+
+    /// (time, op) of receiver 1's measurement channel, in this clock's ms.
     fn ops(&self) -> Vec<(i64, MeasurementOp)> {
-        self.backend
+        self.backend(1)
             .measurement_log()
             .into_iter()
             .map(|(i, op)| (self.at(i), op))
@@ -153,6 +169,15 @@ impl Rig {
             .collect()
     }
 
+    /// The window starts of `receiver_id`'s reports, from noon.
+    fn starts(&self, receiver_id: u32) -> Vec<i64> {
+        self.reports()
+            .iter()
+            .filter(|n| n.receiver_id == receiver_id)
+            .map(|n| n.window_start_unix_ms - NOON)
+            .collect()
+    }
+
     fn events(&self) -> Vec<(i64, v1::Event)> {
         self.seen
             .lock()
@@ -165,12 +190,13 @@ impl Rig {
             .collect()
     }
 
-    /// Opens a listener channel the way the hub would.
+    /// Opens a listener channel on receiver 1 the way the hub would.
     async fn listen(&self, channel_id: u32) -> Media {
         let req = v1::Request {
             request_id: u64::from(channel_id),
             command: Some(v1::request::Command::OpenChannel(v1::OpenChannel {
                 channel_id,
+                receiver_id: 1,
                 frequency_hz: 7_100_000,
                 mode: v1::Mode::Lsb as i32,
                 low_cut_hz: -2800,
@@ -201,12 +227,14 @@ impl Rig {
     }
 }
 
-fn duty_events(events: &[(i64, v1::Event)]) -> Vec<(i32, i64)> {
+/// (receiver, duty, from) of the duty events.
+fn duty_events(events: &[(i64, v1::Event)]) -> Vec<(u32, i32, i64)> {
     events
         .iter()
         .filter(|(_, e)| e.kind == v1::event::Kind::MeasurementDuty as i32)
         .map(|(_, e)| {
             (
+                e.receiver_id.unwrap_or_default(),
                 e.measurement_duty.unwrap_or_default(),
                 e.effective_unix_ms.unwrap_or_default(),
             )
@@ -214,20 +242,30 @@ fn duty_events(events: &[(i64, v1::Event)]) -> Vec<(i32, i64)> {
         .collect()
 }
 
+fn stop_reasons(events: &[(i64, v1::Event)]) -> Vec<Option<i32>> {
+    events
+        .iter()
+        .filter(|(_, e)| e.kind == v1::event::Kind::MeasurementStopped as i32)
+        .map(|(_, e)| e.measurement_stop_reason)
+        .collect()
+}
+
 #[tokio::test(start_paused = true)]
 async fn idle_duty_measures_one_minute_in_five() {
-    let r = rig();
+    let r = rig().await;
     let started = r.measurer.start(forty()).await.expect("plan");
     assert_eq!(started.measurement_id, 7);
-    assert_eq!(started.duty, v1::MeasurementDuty::Idle as i32);
-    assert_eq!(started.noise_interval_ms, 60_000);
     assert_eq!(started.method_version, 1);
     assert_eq!(started.noise_bands.len(), 1);
+    assert_eq!(started.noise_bands[0].receiver_id, 1);
     assert_eq!(started.noise_bands[0].ranges.len(), 2);
-    assert_eq!(
-        started.frontend.as_ref().map(|f| f.center_frequency_hz),
-        Some(7_100_000)
-    );
+    assert_eq!(started.receivers.len(), 1);
+    let rx = &started.receivers[0];
+    assert_eq!(rx.receiver_id, 1);
+    assert_eq!(rx.duty, v1::MeasurementDuty::Idle as i32);
+    assert_eq!(rx.noise_interval_ms, 60_000);
+    let fe = rx.frontend.as_ref().expect("frontend");
+    assert_eq!((fe.receiver_id, fe.center_frequency_hz), (1, 7_100_000));
     r.until(NOON + 11 * MIN + 1_000).await;
     // The channel opens 2 s before each measuring minute and closes 0.5 s
     // after it: the front end runs 62.5 s in 300 s.
@@ -247,15 +285,13 @@ async fn idle_duty_measures_one_minute_in_five() {
             (11 * MIN + 500, false),
         ]
     );
+    // Receiver 2 is not in the plan: its front end is never touched.
+    assert!(r.backend(2).measurement_log().is_empty());
     // One report per measuring minute, never for the others.
+    assert_eq!(r.starts(1), [0, 5 * MIN, 10 * MIN]);
     let reports = r.reports();
-    let starts: Vec<i64> = reports
-        .iter()
-        .map(|n| n.window_start_unix_ms - NOON)
-        .collect();
-    assert_eq!(starts, [0, 5 * MIN, 10 * MIN]);
     let n = &reports[0];
-    assert_eq!(n.measurement_id, 7);
+    assert_eq!((n.measurement_id, n.receiver_id), (7, 1));
     assert_eq!(n.window_ms, 60_000);
     assert!(!n.partial);
     assert_eq!((n.cycle_minutes, n.cycle_index), (1, 0));
@@ -274,36 +310,41 @@ async fn idle_duty_measures_one_minute_in_five() {
     // The fake floor at noon is about −123 dB/Hz.
     assert!(b.p10_db_hz < b.p25_db_hz && b.p25_db_hz < b.p50_db_hz && b.p50_db_hz < b.p90_db_hz);
     assert!((-128.0..-121.0).contains(&b.p50_db_hz), "{}", b.p50_db_hz);
-    assert!(n.frontend.is_some() && n.clock.is_some());
+    assert_eq!(n.frontend.as_ref().map(|f| f.receiver_id), Some(1));
+    assert!(n.clock.is_some());
     // No duty change.
     assert!(duty_events(&r.events()).is_empty());
 }
 
 #[tokio::test(start_paused = true)]
-async fn listeners_make_it_continuous_from_the_next_minute() {
-    let r = rig();
-    r.measurer.start(forty()).await.expect("plan");
-    // A listener at 11:59:20 makes 12:00 continuous; 12:01 is measured too.
+async fn listeners_make_their_receiver_continuous_from_the_next_minute() {
+    let r = rig().await;
+    let started = r
+        .measurer
+        .start(plan(vec![forty_band(), twenty_band()]))
+        .await
+        .expect("plan");
+    let receivers: Vec<u32> = started.receivers.iter().map(|m| m.receiver_id).collect();
+    assert_eq!(receivers, [1, 2]);
+    // A listener on receiver 1 at 11:59:20 makes its 12:00 continuous.
     r.until(NOON - 40_000).await;
     let _audio = r.listen(1).await;
     r.until(NOON + 2 * MIN + 30_000).await;
     r.close(1).await;
     // Idle again from 12:03; the next measuring minute is 12:05.
     r.until(NOON + 6 * MIN + 1_000).await;
-    let starts: Vec<i64> = r
-        .reports()
-        .iter()
-        .map(|n| n.window_start_unix_ms - NOON)
-        .collect();
-    assert_eq!(starts, [0, MIN, 2 * MIN, 5 * MIN]);
+    assert_eq!(r.starts(1), [0, MIN, 2 * MIN, 5 * MIN]);
+    // Receiver 2 stayed idle all along.
+    assert_eq!(r.starts(2), [0, 5 * MIN]);
     assert_eq!(
         duty_events(&r.events()),
         [
-            (v1::MeasurementDuty::Continuous as i32, NOON),
-            (v1::MeasurementDuty::Idle as i32, NOON + 3 * MIN),
+            (1, v1::MeasurementDuty::Continuous as i32, NOON),
+            (1, v1::MeasurementDuty::Idle as i32, NOON + 3 * MIN),
         ]
     );
-    // Open all through 12:00–12:03, closed 0.5 s into 12:03.
+    // Receiver 1's channel was open all through 12:00–12:03, closed 0.5 s
+    // into 12:03.
     let ops = r.ops();
     assert_eq!(ops[0].0, NOON - 2_000);
     assert_eq!(
@@ -313,6 +354,11 @@ async fn listeners_make_it_continuous_from_the_next_minute() {
             MeasurementOp::Close { id: ops_id(&ops) }
         )
     );
+    // Each report names its own receiver's band only.
+    for n in r.reports() {
+        let want = if n.receiver_id == 1 { 3 } else { 5 };
+        assert!(n.bands.iter().all(|b| b.band_id == want), "{n:?}");
+    }
 }
 
 fn ops_id(ops: &[(i64, MeasurementOp)]) -> u32 {
@@ -323,9 +369,12 @@ fn ops_id(ops: &[(i64, MeasurementOp)]) -> u32 {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_frontend_change_stops_the_plan() {
-    let r = rig();
-    r.measurer.start(forty()).await.expect("plan");
+async fn a_frontend_change_stops_the_whole_plan() {
+    let r = rig().await;
+    r.measurer
+        .start(plan(vec![forty_band(), twenty_band()]))
+        .await
+        .expect("plan");
     r.until(NOON + 30_000).await;
     r.measurer.stop_for(StopReason::FrontendChanged);
     r.until(NOON + 6 * MIN).await;
@@ -345,7 +394,8 @@ async fn a_frontend_change_stops_the_plan() {
         stopped[0].measurement_stop_reason,
         Some(v1::MeasurementStopReason::FrontendChanged as i32)
     );
-    assert!(r.backend.measurement_ids().is_empty(), "channel closed");
+    assert!(r.backend(1).measurement_ids().is_empty(), "channel closed");
+    assert!(r.backend(2).measurement_ids().is_empty(), "channel closed");
     assert_eq!(r.measurer.current(), None);
     // A new plan may start.
     let mut again = forty();
@@ -358,7 +408,7 @@ async fn a_frontend_change_stops_the_plan() {
 
 #[tokio::test(start_paused = true)]
 async fn stop_and_one_plan_at_a_time() {
-    let r = rig();
+    let r = rig().await;
     r.measurer.start(forty()).await.expect("plan");
     let busy = r.measurer.start(forty()).await.expect_err("second plan");
     assert_eq!(busy.code, v1::ResultCode::AlreadyExists);
@@ -367,21 +417,22 @@ async fn stop_and_one_plan_at_a_time() {
     assert!(!r.measurer.stop(7));
     r.until(NOON + 2 * MIN).await;
     assert!(r.reports().is_empty());
-    assert!(r.backend.measurement_ids().is_empty());
+    assert!(r.backend(1).measurement_ids().is_empty());
 }
 
 #[tokio::test(start_paused = true)]
 async fn refusals() {
-    let r = rig_with(false, FakeBackend::default());
-    let off = r.measurer.start(forty()).await.expect_err("switched off");
-    assert_eq!(off.code, v1::ResultCode::PermissionDenied);
-    let r = rig();
-    let mut far = forty();
-    far.noise_bands[0].ranges = vec![v1::FrequencyRange {
-        start_hz: 14_000_000,
-        end_hz: 14_350_000,
-    }];
-    let out = r.measurer.start(far).await.expect_err("not covered");
+    let r = rig().await;
+    // A band outside its receiver's passband, and one on a receiver that
+    // doesn't run: nothing to measure.
+    let out = r
+        .measurer
+        .start(plan(vec![
+            band(1, 1, &[(14_000_000, 14_350_000)], "a"),
+            band(2, 9, &[(7_000_000, 7_050_000)], "b"),
+        ]))
+        .await
+        .expect_err("not covered");
     assert_eq!(out.code, v1::ResultCode::OutOfRange);
     // The failed start left no plan behind.
     assert_eq!(r.measurer.current(), None);
@@ -410,56 +461,56 @@ async fn refusals() {
         let e = r.measurer.start(bad).await.expect_err("invalid");
         assert_eq!(e.code, v1::ResultCode::InvalidArgument, "{}", e.message);
     }
-    // A band the hub listed twice or malformed is left out.
+    // A band the hub listed twice, malformed, or on a receiver that doesn't
+    // run, is left out.
     let mut odd = forty();
     odd.noise_bands.push(odd.noise_bands[0].clone());
-    odd.noise_bands.push(v1::NoiseBand {
-        band_id: 4,
-        ranges: vec![],
-        key: "BAD KEY".into(),
-    });
+    odd.noise_bands.push(band(4, 1, &[], "BAD KEY"));
+    odd.noise_bands
+        .push(band(6, 9, &[(7_000_000, 7_050_000)], "c"));
     let ok = r.measurer.start(odd).await.expect("plan");
     assert_eq!(ok.noise_bands.len(), 1);
+    assert_eq!(ok.receivers.len(), 1);
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_failing_backend_stops_the_plan() {
-    let backend = FakeBackend::default();
-    let r = rig_with(true, backend.clone());
-    r.measurer.start(forty()).await.expect("plan");
-    backend.set_measurement_failure(true);
+    let r = rig().await;
+    r.measurer
+        .start(plan(vec![forty_band(), twenty_band()]))
+        .await
+        .expect("plan");
+    r.backend(2).set_measurement_failure(true);
     r.until(NOON + MIN).await;
-    let stopped: Vec<Option<i32>> = r
-        .events()
-        .into_iter()
-        .filter(|(_, e)| e.kind == v1::event::Kind::MeasurementStopped as i32)
-        .map(|(_, e)| e.measurement_stop_reason)
-        .collect();
     assert_eq!(
-        stopped,
+        stop_reasons(&r.events()),
         [Some(v1::MeasurementStopReason::BackendError as i32)]
     );
     assert_eq!(r.measurer.current(), None);
+    assert!(
+        r.backend(1).measurement_ids().is_empty(),
+        "every receiver stops"
+    );
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_busy_station_pauses_for_five_quiet_minutes() {
-    let r = rig();
+async fn a_busy_station_pauses_every_receiver_for_five_quiet_minutes() {
+    let r = rig().await;
     let _audio = r.listen(1).await;
-    r.measurer.start(forty()).await.expect("plan");
+    r.measurer
+        .start(plan(vec![forty_band(), twenty_band()]))
+        .await
+        .expect("plan");
     r.until(NOON + 30_000).await;
     // Busy at 12:01: no report for it, nor until five quiet minutes passed.
     *r.load.lock().expect("load") = 3.5;
     r.until(NOON + MIN + 30_000).await;
     *r.load.lock().expect("load") = 0.2;
     r.until(NOON + 7 * MIN + 1_000).await;
-    let starts: Vec<i64> = r
-        .reports()
-        .iter()
-        .map(|n| n.window_start_unix_ms - NOON)
-        .collect();
-    assert_eq!(starts, [-MIN, 0, 6 * MIN]);
-    // The channel was closed while paused.
+    assert_eq!(r.starts(1), [-MIN, 0, 6 * MIN]);
+    // Receiver 2, idle, lost its 12:05.
+    assert_eq!(r.starts(2), [0]);
+    // Receiver 1's channel was closed while paused.
     let closes = r
         .ops()
         .into_iter()
@@ -469,9 +520,23 @@ async fn a_busy_station_pauses_for_five_quiet_minutes() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_degraded_backend_pauses_its_receiver_alone() {
+    let r = rig().await;
+    r.measurer
+        .start(plan(vec![forty_band(), twenty_band()]))
+        .await
+        .expect("plan");
+    let mut degraded = r.backend(2).health();
+    degraded.backend.state = v1::backend_health::State::Degraded as i32;
+    r.backend(2).set_health(degraded);
+    r.until(NOON + 6 * MIN + 1_000).await;
+    assert_eq!(r.starts(1), [0, 5 * MIN]);
+    assert!(r.starts(2).is_empty());
+}
+
+#[tokio::test(start_paused = true)]
 async fn missed_polls_make_the_report_partial() {
-    let backend = FakeBackend::default();
-    let r = rig_with(true, backend.clone());
+    let r = rig().await;
     let _audio = r.listen(1).await;
     // 11:59:59: too late to open 2 s ahead, but the first spectrum is valid at once.
     r.until(NOON - 1_000).await;
@@ -483,9 +548,9 @@ async fn missed_polls_make_the_report_partial() {
     assert_eq!(reports[0].bands[0].samples, 592 * 120);
     // Polls failing for 10 s of the next minute.
     r.until(NOON + MIN + 10_000).await;
-    backend.set_measurement_failure(true);
+    r.backend(1).set_measurement_failure(true);
     r.until(NOON + MIN + 20_000).await;
-    backend.set_measurement_failure(false);
+    r.backend(1).set_measurement_failure(false);
     r.until(NOON + 2 * MIN + 1_000).await;
     let reports = r.reports();
     assert_eq!(reports.len(), 2);
@@ -510,27 +575,20 @@ async fn missed_polls_make_the_report_partial() {
     assert_eq!(
         caps.measurements,
         Some(v1::MeasurementLimits {
-            enabled: true,
             max_noise_bands: 32,
             method_version: 1
         })
     );
-    assert!(r.backend.can_measure());
+    assert!(r.backend(1).can_measure());
 }
 
 #[tokio::test(start_paused = true)]
 async fn hops_use_their_own_reply_and_stay_on_the_grid() {
-    let r = rig();
+    let r = rig().await;
     let _audio = r.listen(1).await;
     let mut two = forty();
-    two.noise_bands.push(v1::NoiseBand {
-        band_id: 4,
-        ranges: vec![v1::FrequencyRange {
-            start_hz: 7_500_000,
-            end_hz: 7_900_000,
-        }],
-        key: "x".into(),
-    });
+    two.noise_bands
+        .push(band(4, 1, &[(7_500_000, 7_900_000)], "x"));
     let started = r.measurer.start(two).await.expect("plan");
     assert_eq!(started.noise_bands.len(), 2);
     r.until(NOON - 30_000).await;

@@ -1,29 +1,32 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! `stationd backend-config`: renders radiod's config from the SDR profile
+//! `stationd backend-config --receiver <id>`: renders one receiver's radiod
+//! config from its profile's template and `receivers.json`
 //! (station-protocol §9).
 //!
-//! `coaxhub-radiod.service` runs it before every radiod start. The template
+//! `coaxhub-radiod@<id>.service` runs it before every start, as the radiod
+//! user, into `/run/coaxhub-radiod/<id>/radiod.conf` (0644). The template
 //! `<templates>/<profile>.conf` is copied with these placeholders filled in
 //! (on non-comment lines only):
 //!
 //! | Placeholder | Value |
 //! |---|---|
-//! | `{{status_group}}` | [`profile::RADIOD_STATUS_GROUP`]'s address (radiod implies port 5006) |
-//! | `{{data_group}}` | [`profile::RADIOD_DATA_GROUP`]'s address (radiod implies port 5004; a port would be hashed as a name) |
-//! | `{{center_frequency_hz}}` | `[sdr] center_frequency_hz`, else the profile default, in Hz |
+//! | `{{status_group}}` | the status group of the receiver's slot, `239.77.<slot>.6` (radiod implies port 5006) |
+//! | `{{data_group}}` | the data group of its slot, `239.77.<slot>.4` (radiod implies port 5004; a port would be hashed as a name) |
+//! | `{{center_frequency_hz}}` | its centre, in Hz |
+//! | `{{serial}}` | its SDR's USB serial; a line holding it is left out when the receiver has none (radiod then opens the only RTL-SDR) |
+//! | `{{gain_db}}` | its gain, else the profile's default, in dB |
 //!
 //! A template must use both group placeholders and set `ttl = 0`, so the
 //! groups stay fixed by the package and radiod's traffic stays on the
-//! loopback interface. Any other `{{…}}` is an error.
-//!
-//! Before rendering, `backend-config` logs a warning when the profile cannot
-//! receive with an attached dongle ([`profile_warning`]: `rtlsdr-hf` with an
-//! RTL-SDR Blog V4); it renders the owner's profile all the same.
+//! loopback interface. Any other `{{…}}` is an error. Nothing else of the
+//! output comes from outside the package: the hub's set reaches it only as
+//! numbers, enums and a serial from the station's own list, checked when it
+//! was applied.
 
 use std::path::{Path, PathBuf};
 
-use crate::config::SdrSettings;
-use crate::profile;
+use crate::flavour::RADIOD_RUNTIME_DIR;
+use crate::receivers::store::{StoreError, StoredReceiver, StoredSet};
 use crate::state::{self, StateError};
 
 /// Mode of the rendered file.
@@ -33,9 +36,23 @@ pub const OUTPUT_MODE: u32 = 0o644;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RenderError {
-    /// `stationd.toml` has no `[sdr]` section.
-    #[error("stationd.toml has no [sdr] profile to render a radiod config for")]
-    NoProfile,
+    /// Receiver 0 never exists.
+    #[error("receiver 0 does not exist: receiver IDs start at 1")]
+    ZeroReceiver,
+    /// The receiver is not in the applied set.
+    #[error("receiver {0} is not in the applied receiver set")]
+    UnknownReceiver(u32),
+    /// The receiver's profile is not in this build.
+    #[error("receiver {receiver_id}: this build has no SDR profile {profile:?}")]
+    ProfileNotInBuild {
+        /// The receiver.
+        receiver_id: u32,
+        /// Its profile.
+        profile: &'static str,
+    },
+    /// `receivers.json` cannot be read.
+    #[error(transparent)]
+    Store(#[from] StoreError),
     /// The template file cannot be read.
     #[error("cannot read radiod template {}: {source}", path.display())]
     Template {
@@ -57,25 +74,57 @@ pub enum RenderError {
     Write(#[from] StateError),
 }
 
-/// The template for `sdr` in `templates_dir`.
-pub fn template_path(templates_dir: &Path, sdr: &SdrSettings) -> PathBuf {
-    templates_dir.join(format!("{}.conf", sdr.profile.name))
+/// Where receiver `id`'s unit reads its config.
+pub fn default_out(receiver_id: u32) -> PathBuf {
+    Path::new(RADIOD_RUNTIME_DIR)
+        .join(receiver_id.to_string())
+        .join("radiod.conf")
 }
 
-/// Renders `template` (read from `path`, for messages) for `sdr`.
-pub fn render(template: &str, path: &Path, sdr: &SdrSettings) -> Result<String, RenderError> {
+/// The template for `rx` in `templates_dir`.
+pub fn template_path(templates_dir: &Path, rx: &StoredReceiver) -> PathBuf {
+    templates_dir.join(format!("{}.conf", rx.profile.profile().name))
+}
+
+/// Receiver `id` of the set at `store`, if a build of `packaged` flavour
+/// can run it.
+pub fn find(store: &Path, id: u32, packaged: bool) -> Result<StoredReceiver, RenderError> {
+    if id == 0 {
+        return Err(RenderError::ZeroReceiver);
+    }
+    let set = StoredSet::load(store)?;
+    let rx = set.get(id).ok_or(RenderError::UnknownReceiver(id))?;
+    if !rx.profile.in_build(packaged) {
+        return Err(RenderError::ProfileNotInBuild {
+            receiver_id: id,
+            profile: rx.profile.profile().name,
+        });
+    }
+    Ok(rx.clone())
+}
+
+/// Renders `template` (read from `path`, for messages) for `rx`.
+pub fn render(template: &str, path: &Path, rx: &StoredReceiver) -> Result<String, RenderError> {
     let malformed = |problem: String| RenderError::Malformed {
         path: path.to_owned(),
         problem,
     };
-    let status = profile::RADIOD_STATUS_GROUP.ip().to_string();
-    let data = profile::RADIOD_DATA_GROUP.ip().to_string();
-    let center = sdr.center_hz().map(|hz| hz.to_string());
+    let profile = rx.profile.profile();
+    let (status, data) = rx.groups();
+    let status = status.ip().to_string();
+    let data = data.ip().to_string();
+    let center = profile.center.map(|_| rx.center_frequency_hz.to_string());
+    let gain = rx
+        .gain_db
+        .or(profile.gain.map(|g| g.default_db))
+        .map(|g| g.to_string());
     let mut out = format!(
-        "# Generated by stationd backend-config from {} (SDR profile {:?}).\n\
-         # Do not edit: it is rendered again before every radiod start.\n",
+        "# Generated by stationd backend-config for receiver {} (slot {}) from {} (SDR profile {:?}).\n\
+         # Do not edit: it is rendered again before every start of its radiod.\n",
+        rx.receiver_id,
+        rx.slot,
         path.display(),
-        sdr.profile.name
+        profile.name
     );
     let (mut saw_status, mut saw_data, mut saw_ttl0) = (false, false, false);
     for (n, line) in template.lines().enumerate() {
@@ -85,14 +134,23 @@ pub fn render(template: &str, path: &Path, sdr: &SdrSettings) -> Result<String, 
             out.push('\n');
             continue;
         }
+        let mut rendered = String::new();
         let mut rest = line;
+        let mut omit = false;
         while let Some(open) = rest.find("{{") {
-            out.push_str(&rest[..open]);
+            rendered.push_str(&rest[..open]);
             let after = &rest[open + 2..];
             let close = after
                 .find("}}")
                 .ok_or_else(|| malformed(format!("line {}: unclosed {{{{", n + 1)))?;
             let name = after[..close].trim();
+            let missing = |what: &str| {
+                malformed(format!(
+                    "line {}: profile {:?} has no {what}",
+                    n + 1,
+                    profile.name
+                ))
+            };
             let value = match name {
                 "status_group" => {
                     saw_status = true;
@@ -102,13 +160,14 @@ pub fn render(template: &str, path: &Path, sdr: &SdrSettings) -> Result<String, 
                     saw_data = true;
                     data.as_str()
                 }
-                "center_frequency_hz" => center.as_deref().ok_or_else(|| {
-                    malformed(format!(
-                        "line {}: profile {:?} has no centre frequency",
-                        n + 1,
-                        sdr.profile.name
-                    ))
-                })?,
+                "center_frequency_hz" => center
+                    .as_deref()
+                    .ok_or_else(|| missing("centre frequency"))?,
+                "gain_db" => gain.as_deref().ok_or_else(|| missing("gain"))?,
+                "serial" => {
+                    omit |= rx.sdr_serial.is_empty();
+                    rx.sdr_serial.as_str()
+                }
                 other => {
                     return Err(malformed(format!(
                         "line {}: unknown placeholder {{{{{other}}}}}",
@@ -116,14 +175,17 @@ pub fn render(template: &str, path: &Path, sdr: &SdrSettings) -> Result<String, 
                     )));
                 }
             };
-            out.push_str(value);
+            rendered.push_str(value);
             rest = &after[close + 2..];
         }
         if rest.contains("}}") {
             return Err(malformed(format!("line {}: stray }}}}", n + 1)));
         }
-        out.push_str(rest);
-        out.push('\n');
+        rendered.push_str(rest);
+        if !omit {
+            out.push_str(&rendered);
+            out.push('\n');
+        }
         let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
         saw_ttl0 |= compact == "ttl=0";
     }
@@ -142,63 +204,44 @@ pub fn render(template: &str, path: &Path, sdr: &SdrSettings) -> Result<String, 
     Ok(out)
 }
 
-/// Reads the profile's template from `templates_dir` and renders it.
-pub fn render_profile(templates_dir: &Path, sdr: &SdrSettings) -> Result<String, RenderError> {
-    let path = template_path(templates_dir, sdr);
+/// Reads `rx`'s template from `templates_dir` and renders it.
+pub fn render_receiver(templates_dir: &Path, rx: &StoredReceiver) -> Result<String, RenderError> {
+    let path = template_path(templates_dir, rx);
     let template = std::fs::read_to_string(&path).map_err(|source| RenderError::Template {
         path: path.clone(),
         source,
     })?;
-    render(&template, &path, sdr)
+    render(&template, &path, rx)
 }
 
-/// Renders the profile's template and writes it to `out` atomically (0644).
-pub fn write(templates_dir: &Path, sdr: &SdrSettings, out: &Path) -> Result<(), RenderError> {
-    let text = render_profile(templates_dir, sdr)?;
+/// Renders `rx`'s template and writes it to `out` atomically (0644).
+pub fn write(templates_dir: &Path, rx: &StoredReceiver, out: &Path) -> Result<(), RenderError> {
+    let text = render_receiver(templates_dir, rx)?;
     state::write_atomic(out, text.as_bytes(), OUTPUT_MODE)?;
     Ok(())
-}
-
-/// Where Linux lists USB devices.
-pub const USB_DEVICES_DIR: &str = "/sys/bus/usb/devices";
-
-/// The USB `product` string of an RTL-SDR Blog V4 (its manufacturer
-/// string is `RTLSDRBlog`; its IDs are the usual RTL-SDR ones).
-pub const BLOG_V4_PRODUCT: &str = "Blog V4";
-
-/// A warning when the profile cannot receive with an attached dongle:
-/// `rtlsdr-hf` with an RTL-SDR Blog V4, which receives HF through its
-/// upconverter and nothing by direct sampling. `usb_devices` is sysfs's
-/// USB device directory ([`USB_DEVICES_DIR`]). It only warns: the dongle
-/// may be meant for another use, and the owner's profile stands.
-pub fn profile_warning(sdr: &SdrSettings, usb_devices: &Path) -> Option<String> {
-    if sdr.profile.name != "rtlsdr-hf" {
-        return None;
-    }
-    let (port, _) = crate::doctor::usb_devices(usb_devices)
-        .into_iter()
-        .filter(|(_, id)| sdr.profile.usb_ids.contains(id))
-        .find(|(port, _)| {
-            std::fs::read_to_string(usb_devices.join(port).join("product"))
-                .is_ok_and(|p| p.trim() == BLOG_V4_PRODUCT)
-        })?;
-    Some(format!(
-        "the RTL-SDR at USB port {port} is an RTL-SDR Blog V4, and the SDR profile is rtlsdr-hf: \
-         direct sampling receives nothing on a V4; use profile rtlsdr-v4 (set [sdr] profile in \
-         stationd.toml, or run the installer again with --profile rtlsdr-v4)"
-    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::flavour::Flavour;
+    use crate::profile::ProfileId;
+    use crate::receivers::store::Model;
     use std::collections::BTreeMap;
 
-    fn sdr(name: &str, center: Option<u64>) -> SdrSettings {
-        SdrSettings {
-            profile: profile::by_name(name, false).expect("profile"),
-            center_frequency_hz: center,
+    fn rx(profile: ProfileId, slot: u8, serial: &str, center: Option<u64>) -> StoredReceiver {
+        StoredReceiver {
+            receiver_id: 11,
+            slot,
+            sdr_serial: serial.into(),
+            model: Model::RtlsdrDirectSampling,
+            profile,
+            center_frequency_hz: center
+                .or(profile.profile().center.map(|c| c.default_hz))
+                .unwrap_or(0),
+            gain_db: None,
+            hardware_agc: None,
+            attenuation_db: None,
         }
     }
 
@@ -212,34 +255,43 @@ mod tests {
 
     /// The rendered output, with the template path made relative so the
     /// golden files do not depend on the checkout location.
-    fn render_for_golden(s: &SdrSettings) -> String {
-        render_profile(&templates(), s)
+    fn render_for_golden(r: &StoredReceiver) -> String {
+        render_receiver(&templates(), r)
             .expect("render")
             .replace(&templates().display().to_string(), "<templates>")
     }
 
     #[test]
     fn golden_renderings() {
+        let mut gain = rx(ProfileId::RtlsdrV4, 12, "00000002", Some(145_500_000));
+        gain.gain_db = Some(28.5);
         let cases = [
-            ("rtlsdr", None, "radiod-rtlsdr.conf"),
-            ("rtlsdr", Some(145_500_000), "radiod-rtlsdr-145500000.conf"),
-            ("rtlsdr-hf", None, "radiod-rtlsdr-hf.conf"),
             (
-                "rtlsdr-hf",
-                Some(14_074_000),
+                rx(ProfileId::Rtlsdr, 3, "A0000011", None),
+                "radiod-rtlsdr.conf",
+            ),
+            (
+                rx(ProfileId::Rtlsdr, 0, "", Some(145_500_000)),
+                "radiod-rtlsdr-145500000.conf",
+            ),
+            (
+                rx(ProfileId::RtlsdrHf, 7, "00000001", None),
+                "radiod-rtlsdr-hf.conf",
+            ),
+            (
+                rx(ProfileId::RtlsdrHf, 1, "", Some(14_074_000)),
                 "radiod-rtlsdr-hf-14074000.conf",
             ),
-            ("rtlsdr-v4", None, "radiod-rtlsdr-v4.conf"),
             (
-                "rtlsdr-v4",
-                Some(145_500_000),
-                "radiod-rtlsdr-v4-145500000.conf",
+                rx(ProfileId::RtlsdrV4, 12, "00000002", None),
+                "radiod-rtlsdr-v4.conf",
             ),
-            ("siggen", None, "radiod-siggen.conf"),
+            (gain, "radiod-rtlsdr-v4-145500000.conf"),
+            (rx(ProfileId::Siggen, 0, "", None), "radiod-siggen.conf"),
         ];
         let update = std::env::var_os("STATIOND_UPDATE_GOLDEN").is_some();
-        for (name, center, file) in cases {
-            let got = render_for_golden(&sdr(name, center));
+        for (r, file) in cases {
+            let got = render_for_golden(&r);
             let path = golden_dir().join(file);
             if update {
                 std::fs::write(&path, &got).expect("update golden");
@@ -288,8 +340,9 @@ mod tests {
         }
     }
 
-    /// With the defaults, every template renders to exactly the settings
-    /// of the radiod test config it was derived from.
+    /// In slot 0 without a serial, with the defaults, every template renders
+    /// to exactly the settings of the radiod test config it was derived
+    /// from.
     #[test]
     fn templates_match_the_tested_configs() {
         assert_eq!(hz("98m0"), "98000000");
@@ -299,9 +352,10 @@ mod tests {
         let normalise = |m: BTreeMap<String, String>| -> BTreeMap<String, String> {
             m.into_iter().map(|(k, v)| (k, hz(&v))).collect()
         };
-        for p in profile::PROFILES {
+        for id in ProfileId::ALL {
+            let p = id.profile();
             let rendered = normalise(ini(
-                &render_profile(&templates(), &sdr(p.name, None)).expect("render")
+                &render_receiver(&templates(), &rx(id, 0, "", None)).expect("render")
             ));
             let tested = std::fs::read_to_string(testdata.join(format!("radiod-{}.conf", p.name)))
                 .expect("testdata");
@@ -312,19 +366,49 @@ mod tests {
         }
     }
 
+    /// What the package's tests check of each profile.
+    #[test]
+    fn each_receiver_gets_its_serial_and_its_slots_groups() {
+        for id in [ProfileId::Rtlsdr, ProfileId::RtlsdrHf, ProfileId::RtlsdrV4] {
+            let text = render_receiver(&templates(), &rx(id, 7, "A0000011", Some(14_200_000)))
+                .expect("render");
+            let conf = ini(&text);
+            assert_eq!(conf["global.hardware"], "rtlsdr", "{text}");
+            assert_eq!(conf["rtlsdr.serial"], "A0000011", "{text}");
+            assert_eq!(conf["global.status"], "239.77.7.6");
+            assert_eq!(conf["global.data"], "239.77.7.4");
+            assert_eq!(conf["global.ttl"], "0");
+            assert_eq!(conf["rtlsdr.frequency"], "14200000");
+            assert!(!text.contains("239.77.0."), "{text}");
+            assert!(text.contains("receiver 11 (slot 7)"), "{text}");
+            if id == ProfileId::RtlsdrHf {
+                assert_eq!(conf["rtlsdr.direct_sampling"], "2");
+                assert!(!conf.contains_key("rtlsdr.gain"));
+            } else {
+                assert!(!conf.contains_key("rtlsdr.direct_sampling"));
+                assert_eq!(conf["rtlsdr.gain"], "30");
+            }
+        }
+        let v4 = render_receiver(&templates(), &rx(ProfileId::RtlsdrV4, 1, "", None)).expect("v4");
+        assert!(v4.contains("description = \"RTL-SDR Blog V4\""), "{v4}");
+        assert!(!v4.contains("serial ="), "no serial: no line, {v4}");
+    }
+
     #[test]
     fn malformed_templates() {
-        let s = sdr("rtlsdr", None);
+        let r = rx(ProfileId::Rtlsdr, 2, "S1", None);
         let p = Path::new("t.conf");
         let base = "status = {{status_group}}\ndata = {{ data_group }}\nttl = 0\n";
-        let ok = render(base, p, &s).expect("minimal");
+        let ok = render(base, p, &r).expect("minimal");
         assert!(
-            ok.contains("status = 239.77.0.6\ndata = 239.77.0.4\n"),
+            ok.contains("status = 239.77.2.6\ndata = 239.77.2.4\n"),
             "{ok}"
         );
         // Comments are copied verbatim, placeholders included.
-        let ok = render(&format!("# {{{{nope}}}}\n{base}"), p, &s).expect("comment");
+        let ok = render(&format!("# {{{{nope}}}}\n{base}"), p, &r).expect("comment");
         assert!(ok.contains("# {{nope}}"), "{ok}");
+        let ok = render(&format!("{base}serial = {{{{serial}}}}\n"), p, &r).expect("serial");
+        assert!(ok.contains("serial = S1\n"), "{ok}");
         for (text, needle) in [
             (
                 format!("{base}x = {{{{nope}}}}\n"),
@@ -341,56 +425,66 @@ mod tests {
                 "ttl = 0",
             ),
         ] {
-            let e = render(&text, p, &s).expect_err(needle);
+            let e = render(&text, p, &r).expect_err(needle);
             assert!(e.to_string().contains(needle), "{e}");
         }
         let e = render(
             &format!("{base}f = {{{{center_frequency_hz}}}}\n"),
             p,
-            &sdr("siggen", None),
+            &rx(ProfileId::Siggen, 0, "", None),
         )
         .expect_err("siggen has no centre");
         assert!(e.to_string().contains("no centre frequency"), "{e}");
-        let e = render_profile(Path::new("/nonexistent"), &s).expect_err("missing");
+        let e = render(
+            &format!("{base}g = {{{{gain_db}}}}\n"),
+            p,
+            &rx(ProfileId::RtlsdrHf, 0, "", None),
+        )
+        .expect_err("direct sampling has no gain");
+        assert!(e.to_string().contains("no gain"), "{e}");
+        let e = render_receiver(Path::new("/nonexistent"), &r).expect_err("missing");
         assert!(matches!(e, RenderError::Template { .. }), "{e}");
-        assert!(RenderError::NoProfile.to_string().contains("[sdr]"));
-    }
-
-    /// A USB device directory as sysfs lists it.
-    fn usb(dir: &Path, port: &str, ids: (&str, &str), product: Option<&str>) {
-        let d = dir.join(port);
-        std::fs::create_dir_all(&d).expect("mkdir");
-        std::fs::write(d.join("idVendor"), format!("{}\n", ids.0)).expect("write");
-        std::fs::write(d.join("idProduct"), format!("{}\n", ids.1)).expect("write");
-        if let Some(p) = product {
-            std::fs::write(d.join("product"), format!("{p}\n")).expect("write");
-        }
     }
 
     #[test]
-    fn warns_about_direct_sampling_on_a_blog_v4() {
+    fn finds_the_receiver() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let dir = tmp.path();
-        let hf = sdr("rtlsdr-hf", None);
-        // Nothing attached, a hub, a V3, and a device that is not an RTL-SDR.
-        assert_eq!(profile_warning(&hf, &dir.join("none")), None);
-        usb(dir, "usb1", ("1d6b", "0002"), Some("xHCI Host Controller"));
-        usb(dir, "1-1.2", ("0bda", "2838"), Some("RTL2838UHIDIR"));
-        usb(dir, "1-1.4", ("1234", "5678"), Some(BLOG_V4_PRODUCT));
-        std::fs::create_dir(dir.join("1-1.5")).expect("no ids");
-        assert_eq!(profile_warning(&hf, dir), None);
-        // A V4.
-        usb(dir, "1-1.3", ("0bda", "2838"), Some(BLOG_V4_PRODUCT));
-        let w = profile_warning(&hf, dir).expect("a V4 with rtlsdr-hf");
-        assert!(w.contains("USB port 1-1.3"), "{w}");
-        assert!(
-            w.contains("direct sampling receives nothing on a V4; use profile rtlsdr-v4"),
-            "{w}"
+        let store = tmp.path().join("receivers.json");
+        let set = StoredSet {
+            receivers: vec![
+                rx(ProfileId::Rtlsdr, 3, "A", None),
+                StoredReceiver {
+                    receiver_id: 14,
+                    ..rx(ProfileId::Siggen, 1, "", None)
+                },
+            ],
+        };
+        set.save(&store).expect("save");
+        assert_eq!(find(&store, 11, true).expect("11").slot, 3);
+        assert!(matches!(
+            find(&store, 0, true),
+            Err(RenderError::ZeroReceiver)
+        ));
+        assert!(matches!(
+            find(&store, 99, true),
+            Err(RenderError::UnknownReceiver(99))
+        ));
+        assert!(matches!(
+            find(&store, 14, true),
+            Err(RenderError::ProfileNotInBuild {
+                receiver_id: 14,
+                profile: "siggen"
+            })
+        ));
+        assert!(find(&store, 14, false).is_ok());
+        assert!(matches!(
+            find(&tmp.path().join("none.json"), 11, true),
+            Err(RenderError::UnknownReceiver(11))
+        ));
+        assert_eq!(
+            default_out(11),
+            Path::new("/run/coaxhub-radiod/11/radiod.conf")
         );
-        // The other profiles have nothing to warn about.
-        for name in ["rtlsdr", "rtlsdr-v4", "siggen"] {
-            assert_eq!(profile_warning(&sdr(name, None), dir), None, "{name}");
-        }
     }
 
     #[test]
@@ -398,15 +492,15 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let tmp = tempfile::tempdir().expect("tmp");
         let out = tmp.path().join("radiod.conf");
-        let s = sdr("rtlsdr-hf", Some(10_000_000));
-        write(&templates(), &s, &out).expect("write");
+        let r = rx(ProfileId::RtlsdrHf, 4, "", Some(10_000_000));
+        write(&templates(), &r, &out).expect("write");
         let text = std::fs::read_to_string(&out).expect("read");
         assert!(text.contains("frequency = 10000000\n"), "{text}");
         let mode = std::fs::metadata(&out).expect("stat").permissions().mode() & 0o777;
         assert_eq!(mode, 0o644);
         let e = write(
             &templates(),
-            &s,
+            &r,
             &tmp.path().join("missing/dir/radiod.conf"),
         )
         .expect_err("no dir");

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! [`Ka9qBackend`]: `station_backend::Backend` for ka9q-radio's `radiod`
-//! (station-protocol §9), built on [`Ka9qClient`].
+//! (station-protocol §9), built on [`Ka9qClient`]: one backend per receiver,
+//! each on its own radiod's groups ([`group::slot_groups`]).
 //!
 //! | Protocol | radiod |
 //! |---|---|
@@ -12,7 +13,7 @@
 //! | `SetFrontend` | `FIRST_LO_FREQUENCY` for a retune, verified in the reply; gain, AGC, attenuation and antenna are `UNSUPPORTED` |
 //! | `AudioFrame` | the Opus payload of each RTP packet; `seq` re-based per channel (gaps kept), `timestamp` on the 48 kHz RTP clock re-based per channel |
 //! | `ChannelSignal` | SNR and baseband power from the channel's status, at most every 200 ms |
-//! | measurement channels (1.1) | a spectrum2 channel per plan that stationd polls itself, `BIN_COUNT`, `RESOLUTION_BW` and `SPECTRUM_AVG` fixed for its life, hopped by `RADIO_FREQUENCY` in place on radiod's placement grid, closed with `LIFETIME` 1 ([`measure`]) |
+//! | measurement channels (§4.1) | a spectrum2 channel per plan that stationd polls itself, `BIN_COUNT`, `RESOLUTION_BW` and `SPECTRUM_AVG` fixed for its life, hopped by `RADIO_FREQUENCY` in place on radiod's placement grid, closed with `LIFETIME` 1 ([`measure`]) |
 //!
 //! The reported `ChannelOpened.audio` is what radiod actually runs: its
 //! `OUTPUT_SAMPRATE` (48 kHz for `wfm`, which radiod forces only once the
@@ -32,9 +33,11 @@
 //! counts front-end overloads (`AD_OVER` increases) and sends
 //! `Event{FRONTEND_OVERLOAD}` at most every [`OVERLOAD_EVENT_INTERVAL`].
 //!
-//! radiod does not report its tuner's range, whether the tuner is locked,
-//! or which runtime controls its driver has, so capabilities advertise no
-//! front-end controls and `hardware_range` equals the tunable range.
+//! radiod does not report its tuner's range or which runtime controls its
+//! driver has, so capabilities advertise only `can_retune` (the pinned
+//! drivers take a frequency change and nothing else live) and
+//! `hardware_range` equals the tunable range; stationd widens it to the
+//! receiver's profile.
 
 pub mod group;
 pub mod map;
@@ -49,8 +52,8 @@ use std::time::Duration;
 
 use futures_util::StreamExt as _;
 use station_backend::{
-    AudioStream, Backend, BackendError, ChannelId, EventStream, Health, MeasurementChannel,
-    MeasurementGrid, MeasurementId, RowStream, Spectrum, SubscriptionId,
+    AudioStream, Backend, BackendCapabilities, BackendError, ChannelId, EventStream, Health,
+    MeasurementChannel, MeasurementGrid, MeasurementId, RowStream, Spectrum, SubscriptionId,
 };
 use station_proto::v1;
 use tokio::sync::{OnceCell, broadcast};
@@ -160,7 +163,8 @@ struct State {
     subscriptions: BTreeMap<SubscriptionId, Subscription>,
     opening_channels: BTreeSet<ChannelId>,
     opening_subscriptions: BTreeSet<SubscriptionId>,
-    /// stationd's measurement channels (protocol 1.1), outside listener capacity.
+    /// stationd's measurement channels (station protocol §4.1), outside
+    /// listener capacity.
     measurements: BTreeMap<MeasurementId, Arc<tokio::sync::Mutex<measure::Measurement>>>,
     /// Monitor intervals in which `AD_OVER` grew, since start.
     overloads_total: u64,
@@ -581,6 +585,7 @@ impl Ka9qBackend {
             .and_then(|st| map::covered_range(&st, g.bins));
         let subscribed = v1::WaterfallSubscribed {
             subscription_id: req.subscription_id,
+            receiver_id: req.receiver_id,
             range: Some(covered.unwrap_or(g.covered)),
             bins: g.bins,
             row_interval_ms,
@@ -656,6 +661,7 @@ fn opened_from(
     }
     Ok(v1::ChannelOpened {
         channel_id: req.channel_id,
+        receiver_id: req.receiver_id,
         frequency_hz: st
             .as_ref()
             .and_then(|s| s.radio_frequency_hz)
@@ -671,6 +677,15 @@ fn opened_from(
             frame_duration_ms,
         }),
     })
+}
+
+/// What every ka9q backend reports in `Hello.backend`: ka9q-radio at the
+/// pinned commit, known before any radiod answers.
+pub fn backend_info() -> v1::BackendInfo {
+    v1::BackendInfo {
+        kind: v1::BackendKind::Ka9qRadio as i32,
+        version: format!("ka9q-radio {}", &tags::UPSTREAM_COMMIT[..12]),
+    }
 }
 
 /// The monitor task: runs [`Ka9qBackend::tick`] every [`MONITOR_INTERVAL`]
@@ -690,13 +705,10 @@ async fn monitor(inner: Weak<Inner>) {
 #[async_trait::async_trait]
 impl Backend for Ka9qBackend {
     fn info(&self) -> v1::BackendInfo {
-        v1::BackendInfo {
-            kind: v1::BackendKind::Ka9qRadio as i32,
-            version: format!("ka9q-radio {}", &tags::UPSTREAM_COMMIT[..12]),
-        }
+        backend_info()
     }
 
-    async fn capabilities(&self) -> Result<v1::Capabilities, BackendError> {
+    async fn capabilities(&self) -> Result<BackendCapabilities, BackendError> {
         let client = self.client().await?;
         let st = self.frontend_status(&client).await?;
         map::capabilities(&st)

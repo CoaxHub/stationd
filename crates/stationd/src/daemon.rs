@@ -29,7 +29,6 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use station_backend::Backend;
 use station_proto::backoff::{Backoff, Decision, Policy};
 use station_proto::{limits, v1};
 use tokio::sync::{mpsc, watch};
@@ -38,11 +37,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::config::{Config, CredentialsMode, Endpoint, LocalPolicy};
+use crate::config::{Config, CredentialsMode, Endpoint};
 use crate::credentials::{self, CredentialSource, Credentials, CredentialsError};
 use crate::dispatch::truncate_utf8;
 use crate::measure::{FixedLoad, LoadSource, MeasureClock, ProcLoad, SystemClock};
 use crate::outbound::{DropCounters, QueueLimits};
+use crate::receivers::{Driver, ReceiverOptions, ReceiverPaths, Receivers};
 use crate::renew::{self, ApiRenewal, RenewalOptions, RenewalStatus, Signal, UnixClock};
 use crate::session::{self, End};
 use crate::state::StateDir;
@@ -89,6 +89,8 @@ pub struct RunOptions {
     /// `[measurements] ignore_host_load` (development builds) does the same
     /// for the binary.
     pub measure_load: Arc<dyn LoadSource>,
+    /// How often the receivers' units and the USB devices are looked at.
+    pub receivers: ReceiverOptions,
 }
 
 impl Default for RunOptions {
@@ -108,6 +110,7 @@ impl Default for RunOptions {
             renew_timeout: crate::station_api::RENEW_TIMEOUT,
             measure_clock: Arc::new(SystemClock),
             measure_load: Arc::new(ProcLoad),
+            receivers: ReceiverOptions::default(),
         }
     }
 }
@@ -128,6 +131,7 @@ impl fmt::Debug for RunOptions {
             .field("renew_timeout", &self.renew_timeout)
             .field("measure_clock", &self.measure_clock)
             .field("measure_load", &self.measure_load)
+            .field("receivers", &self.receivers)
             .finish_non_exhaustive()
     }
 }
@@ -248,8 +252,8 @@ impl Link {
 /// Everything a session needs, shared across connections.
 pub(crate) struct Ctx {
     pub credentials: Arc<dyn CredentialSource>,
-    pub policy: Arc<LocalPolicy>,
-    pub backend: Arc<dyn Backend>,
+    /// The station's receivers; they outlive every connection.
+    pub receivers: Receivers,
     pub boot_id: u64,
     pub started: tokio::time::Instant,
     pub drops: Arc<DropCounters>,
@@ -281,9 +285,15 @@ pub struct DaemonHandle {
     station_id: Uuid,
     gateway_url: String,
     boot_id: u64,
+    receivers: Receivers,
 }
 
 impl DaemonHandle {
+    /// The station's receivers.
+    pub fn receivers(&self) -> Receivers {
+        self.receivers.clone()
+    }
+
     /// A receiver of the connection state.
     pub fn state(&self) -> watch::Receiver<ConnectionState> {
         self.state.clone()
@@ -352,21 +362,22 @@ impl Drop for DaemonHandle {
 }
 
 /// Loads the credentials `config` names and starts the daemon on the
-/// current runtime.
+/// current runtime, running the receivers with `driver`.
 pub fn spawn(
     config: &Config,
-    backend: Arc<dyn Backend>,
+    driver: Driver,
     options: RunOptions,
 ) -> Result<DaemonHandle, RunError> {
-    spawn_with(credentials::source(config), config, backend, options)
+    spawn_with(credentials::source(config), config, driver, options)
 }
 
 /// Starts the daemon with credentials from `source` (re-read before every
-/// connect attempt). Fails if they cannot be loaded now.
+/// connect attempt). Fails if they cannot be loaded now. The receivers of
+/// the applied set start first, before the first connection (§9).
 pub fn spawn_with(
     source: Arc<dyn CredentialSource>,
     config: &Config,
-    backend: Arc<dyn Backend>,
+    driver: Driver,
     options: RunOptions,
 ) -> Result<DaemonHandle, RunError> {
     finish_interrupted_swap(config);
@@ -391,9 +402,10 @@ pub fn spawn_with(
         boot_id,
         "stationd starting"
     );
-    let (ctx, options) = context(source, config, backend, options);
+    let (ctx, options) = context(source, config, driver, options);
     link.publish(&ctx.observed);
     let observed = ctx.observed.subscribe();
+    let receivers = ctx.receivers.clone();
     let task = tokio::spawn(run_loop(
         ctx,
         link,
@@ -411,6 +423,7 @@ pub fn spawn_with(
         station_id,
         gateway_url: first.gateway.url,
         boot_id,
+        receivers,
     })
 }
 
@@ -418,7 +431,7 @@ pub fn spawn_with(
 /// revoked. State changes are published on `state`.
 pub async fn run(
     config: &Config,
-    backend: Arc<dyn Backend>,
+    driver: Driver,
     options: RunOptions,
     shutdown: CancellationToken,
     state: watch::Sender<ConnectionState>,
@@ -426,7 +439,7 @@ pub async fn run(
     finish_interrupted_swap(config);
     let source = credentials::source(config);
     let link = Link::new(&source.load()?)?;
-    let (ctx, options) = context(source, config, backend, options);
+    let (ctx, options) = context(source, config, driver, options);
     link.publish(&ctx.observed);
     let (error_tx, _) = watch::channel(None);
     run_loop(ctx, link, options, shutdown, state, error_tx).await
@@ -453,7 +466,7 @@ pub(crate) struct LoopOptions {
 fn context(
     credentials: Arc<dyn CredentialSource>,
     config: &Config,
-    backend: Arc<dyn Backend>,
+    driver: Driver,
     options: RunOptions,
 ) -> (Arc<Ctx>, LoopOptions) {
     let control = StationApi::from_config(config).map(|mut api| {
@@ -474,10 +487,18 @@ fn context(
         Arc::clone(&options.measure_load)
     };
     let (observed, _) = watch::channel(Observed::default());
+    let receivers = Receivers::new(
+        ReceiverPaths {
+            store: config.receivers_path(),
+            usb_devices: config.usb_devices.clone(),
+            packaged: config.flavour.packaged,
+        },
+        driver,
+        options.receivers,
+    );
     let ctx = Arc::new(Ctx {
         credentials,
-        policy: Arc::new(config.policy.clone()),
-        backend,
+        receivers,
         boot_id: options.boot_id.unwrap_or_else(rand::random::<u64>),
         started: tokio::time::Instant::now(),
         drops: Arc::default(),
@@ -688,6 +709,9 @@ async fn run_loop(
     state: watch::Sender<ConnectionState>,
     last_error: watch::Sender<Option<String>>,
 ) -> Result<(), RunError> {
+    // §9: the applied receivers run before the tunnel is up, and while it
+    // is down.
+    ctx.receivers.start().await;
     // The sender stays here too, so `recv` never reports a closed channel.
     let (signal_tx, mut signals) = mpsc::channel(4);
     let _renewal = options

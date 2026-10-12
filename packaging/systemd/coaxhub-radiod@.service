@@ -1,18 +1,20 @@
 # SPDX-License-Identifier: GPL-3.0-only
 #
-# The bundled ka9q-radio radiod, driving the station's SDR. Its config is rendered from the SDR profile in
-# /etc/coaxhub/stationd.toml before every start; it is never edited by hand.
+# The bundled ka9q-radio radiod of one receiver: coaxhub-radiod@<receiver_id>.service.
+# Its config is rendered from the receiver's profile and receivers.json before
+# every start; it is never edited by hand. stationd starts, restarts and stops
+# the instances over D-Bus (the polkit rule); nothing enables them.
 # Only stationd talks to it, over multicast on the loopback interface.
 
 [Unit]
-Description=CoaxHub station radio (bundled ka9q-radio radiod)
+Description=CoaxHub station receiver %i (bundled ka9q-radio radiod)
 Documentation=https://github.com/CoaxHub/stationd/blob/main/docs/packaging.md
 
 [Service]
 Type=simple
 User=coaxhub-radiod
 Group=coaxhub-radiod
-RuntimeDirectory=coaxhub-radiod
+RuntimeDirectory=coaxhub-radiod/%i
 RuntimeDirectoryMode=0755
 StateDirectory=coaxhub-radiod
 StateDirectoryMode=0755
@@ -20,9 +22,11 @@ StateDirectoryMode=0755
 # flag on lo; without it radiod exits (radiod notes §2). `+`: this one
 # command runs as root, outside the sandbox below.
 ExecStartPre=+ip link set dev lo multicast on
-# Render radiod.conf from the owner's SDR profile and the package's templates.
-ExecStartPre=/usr/bin/stationd backend-config --out /run/coaxhub-radiod/radiod.conf
-ExecStart=/usr/lib/coaxhub/radiod/radiod /run/coaxhub-radiod/radiod.conf
+# Render this receiver's radiod.conf from its profile's template and
+# receivers.json (the serial, the centre, the settings and the multicast
+# groups of its slot).
+ExecStartPre=/usr/bin/stationd backend-config --receiver %i
+ExecStart=/usr/lib/coaxhub/radiod/radiod /run/coaxhub-radiod/%i/radiod.conf
 Restart=on-failure
 RestartSec=5
 
@@ -53,6 +57,3 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 SystemCallArchitectures=native
 UMask=0022
-
-[Install]
-WantedBy=multi-user.target

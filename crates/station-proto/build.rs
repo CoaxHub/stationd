@@ -11,6 +11,7 @@ const PROTO_FILES: &[&str] = &[
     "coaxhub/station/v1/gateway.proto",
     "coaxhub/station/v1/measure.proto",
     "coaxhub/station/v1/media.proto",
+    "coaxhub/station/v1/receivers.proto",
     "coaxhub/station/v1/status.proto",
 ];
 

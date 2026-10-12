@@ -8,9 +8,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use station_backend::{Backend, FakeBackend};
+use station_backend::Backend;
 use station_conformance::{BoxError, Exit, StationUnderTest, Target};
 use station_proto::backoff::Policy;
+use stationd::receivers::{Driver, FakeBackends, FakeUnits, ReceiverOptions, SharedBackend};
 use stationd::{Config, DaemonHandle, RunError, RunOptions};
 
 /// Short intervals matching `ScenarioConfig::fast()`.
@@ -40,37 +41,31 @@ pub fn fast_options_scaled(scale: u32) -> RunOptions {
             scale,
         )),
         // An idle host: measuring never pauses for the load of the machine
-        // running the tests (the measurement design §4.1).
+        // running the tests (station protocol §4.1).
         measure_load: Arc::new(stationd::measure::FixedLoad::idle()),
+        // Units and SDRs looked at often (ScenarioConfig::fast's 3 s).
+        receivers: ReceiverOptions {
+            poll: Duration::from_millis(20),
+            hardware_poll: Duration::from_millis(50),
+        },
         ..RunOptions::default()
     }
 }
 
-/// The `stationd.toml` for `target`: static `[credentials]` and the fake
-/// backend (development builds only), state under the work dir.
+/// The `stationd.toml` for `target`: static `[credentials]`, the fake
+/// backend on the target's simulated SDRs (development builds only), state
+/// under the work dir.
 pub fn config_toml(target: &Target) -> String {
-    let ops: Vec<String> = target
-        .policy
-        .admin_op_names()
-        .iter()
-        .map(|n| format!("{n:?}"))
-        .collect();
     format!(
-        "allow_frontend_control = {}\nallowed_admin_ops = [{}]\nmax_channels = {}\n\
-         max_waterfall_subscriptions = {}\nstate_dir = {:?}\n\
-         [measurements]\nenabled = {}\n\
+        "state_dir = {:?}\n\
          [credentials]\ngateway_url = {:?}\ncert = {:?}\nkey = {:?}\ngateway_ca = {:?}\n\
-         [backend]\nkind = \"fake\"\n",
-        target.policy.allow_frontend_control,
-        ops.join(", "),
-        target.policy.max_channels,
-        target.policy.max_waterfall_subscriptions,
+         [backend]\nkind = \"fake\"\nusb_devices = {:?}\n",
         target.work_dir.join("state"),
-        target.policy.measurements,
         target.gateway_url,
         target.cert,
         target.key,
         target.gateway_ca,
+        target.usb_devices,
     )
 }
 
@@ -83,6 +78,17 @@ pub fn write_config(target: &Target) -> PathBuf {
 
 pub fn load(path: &Path) -> Config {
     Config::load(path).expect("valid config")
+}
+
+/// Fake backends and units, sharing nothing with other tests.
+pub fn fake_driver() -> (Driver, FakeBackends, FakeUnits) {
+    let backends = FakeBackends::default();
+    let units = FakeUnits::default();
+    let driver = Driver {
+        backends: Arc::new(backends.clone()),
+        units: Arc::new(units.clone()),
+    };
+    (driver, backends, units)
 }
 
 fn exit_of(result: Result<(), RunError>) -> Exit {
@@ -98,11 +104,12 @@ fn exit_of(result: Result<(), RunError>) -> Exit {
     }
 }
 
-/// stationd running in this process with a `FakeBackend` (the default)
-/// or any other backend.
+/// stationd running in this process with fake backends and units (the
+/// default) or one given backend for every receiver. The driver outlives a
+/// restart of the daemon, as the units of a station outlive stationd.
 pub struct InProcess {
     pub handle: Option<DaemonHandle>,
-    pub backend: Arc<dyn Backend>,
+    pub driver: Driver,
     /// How much faster than real time measuring runs (60 by default).
     pub measure_scale: u32,
     /// The 1-minute load average measuring's pause rule sees (0 by default,
@@ -113,21 +120,29 @@ pub struct InProcess {
 
 impl Default for InProcess {
     fn default() -> Self {
-        Self::with_backend(Arc::new(FakeBackend::default()))
+        Self::with_driver(fake_driver().0)
     }
 }
 
 impl InProcess {
-    /// stationd driving `backend` (the config file still says `fake`: the
-    /// in-process daemon takes the backend directly).
-    pub fn with_backend(backend: Arc<dyn Backend>) -> Self {
+    /// stationd running its receivers with `driver`.
+    pub fn with_driver(driver: Driver) -> Self {
         Self {
             handle: None,
-            backend,
+            driver,
             measure_scale: 60,
             host_load: 0.0,
             exit: None,
         }
+    }
+
+    /// stationd with `backend` for every receiver (the config file still
+    /// says `fake`: the in-process daemon takes the driver directly).
+    pub fn with_backend(backend: Arc<dyn Backend>) -> Self {
+        Self::with_driver(Driver {
+            backends: Arc::new(SharedBackend(backend)),
+            units: Arc::new(FakeUnits::default()),
+        })
     }
 }
 
@@ -139,7 +154,7 @@ impl StationUnderTest for InProcess {
             measure_load: Arc::new(stationd::measure::FixedLoad::on_this_host(self.host_load)),
             ..fast_options_scaled(self.measure_scale)
         };
-        let handle = stationd::spawn(&config, Arc::clone(&self.backend), options)?;
+        let handle = stationd::spawn(&config, self.driver.clone(), options)?;
         assert_eq!(handle.station_id(), target.station_id);
         self.handle = Some(handle);
         self.exit = None;
