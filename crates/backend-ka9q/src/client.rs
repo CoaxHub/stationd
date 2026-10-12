@@ -13,7 +13,10 @@
 //!   commands per channel and silently drops the rest (§4). Every command
 //!   takes the channel's command lock, is sent with a fresh `COMMAND_TAG`,
 //!   and the lock is held until the status reply with that tag arrives or
-//!   [`ClientConfig::command_timeout`] passes.
+//!   [`ClientConfig::command_timeout`] passes. A call cancelled while its
+//!   command is in flight (a spectrum channel's poller, aborted when the
+//!   channel closes) leaves the command recorded under the lock, and the next
+//!   command on that SSRC first waits for its reply or its timeout.
 //! - **Retries.** A command that gets no reply is re-sent up to
 //!   [`ClientConfig::command_retries`] times, each time with a new tag and
 //!   still one at a time. Every command the client sends sets absolute
@@ -680,14 +683,26 @@ async fn rtp_task(socket: UdpSocket, shared: Arc<Shared>) {
 #[derive(Debug)]
 struct ChannelCtx {
     ssrc: u32,
-    cmd_lock: tokio::sync::Mutex<()>,
+    /// The channel's command lock. It holds the command sent and not answered
+    /// yet, which only outlives its [`Core::execute`] when that call was
+    /// cancelled (a spectrum channel's poller aborted by `close`): radiod may
+    /// still have it queued, so the next command waits for its reply first.
+    cmd_lock: tokio::sync::Mutex<Option<InFlight>>,
+}
+
+/// A command sent on a channel and not answered yet: its tag, and when the
+/// sender stops waiting for the reply.
+#[derive(Debug, Clone, Copy)]
+struct InFlight {
+    tag: u32,
+    until: Instant,
 }
 
 impl ChannelCtx {
     fn new(ssrc: u32) -> Arc<Self> {
         Arc::new(Self {
             ssrc,
-            cmd_lock: tokio::sync::Mutex::new(()),
+            cmd_lock: tokio::sync::Mutex::new(None),
         })
     }
 }
@@ -723,7 +738,18 @@ impl Core {
     where
         F: Fn(u32) -> Command,
     {
-        let _guard = ctx.cmd_lock.lock().await;
+        let mut in_flight = ctx.cmd_lock.lock().await;
+        // A cancelled call's command may still be queued in radiod: wait for its
+        // reply, or for as long as its sender would have, before sending another.
+        if let Some(prev) = in_flight.take() {
+            let key = (ctx.ssrc, u64::from(prev.tag));
+            let rx = self.shared.register_waiter(key);
+            let _waiter = WaiterGuard {
+                shared: &self.shared,
+                key,
+            };
+            let _ = tokio::time::timeout_at(prev.until, rx).await;
+        }
         let attempts = self.config.command_retries.saturating_add(1);
         for _ in 0..attempts {
             let tag = self.shared.next_tag();
@@ -735,15 +761,26 @@ impl Core {
                 shared: &self.shared,
                 key,
             };
-            self.ctrl
+            *in_flight = Some(InFlight {
+                tag,
+                until: Instant::now() + self.config.command_timeout,
+            });
+            if let Err(source) = self
+                .ctrl
                 .send_to(&cmd.encode(), self.config.status_addr)
                 .await
-                .map_err(|source| ClientError::Io {
+            {
+                *in_flight = None; // never sent
+                return Err(ClientError::Io {
                     op: "send command",
                     source,
-                })?;
+                });
+            }
             bump(&self.shared.counters.commands_sent);
-            match tokio::time::timeout(self.config.command_timeout, rx).await {
+            let reply = tokio::time::timeout(self.config.command_timeout, rx).await;
+            // Answered, or waited for as long as the policy says: not in flight.
+            *in_flight = None;
+            match reply {
                 Ok(Ok(status)) => return Ok(status),
                 Ok(Err(_)) => return Err(ClientError::Closed),
                 Err(_) => {

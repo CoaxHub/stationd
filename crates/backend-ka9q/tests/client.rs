@@ -268,6 +268,42 @@ async fn commands_are_serialized_per_ssrc() {
     );
 }
 
+/// A command whose call was cancelled (as a spectrum channel's poller is by `close`) is
+/// still queued in radiod: the next command on that SSRC waits for its reply instead of
+/// joining it in the queue.
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_command_is_still_in_flight() {
+    let (fake, client) = setup().await;
+    let ch = Arc::new(client.open_audio_channel(am(10e6)).await.unwrap());
+    let ssrc = ch.ssrc();
+    // The fake holds the first update queued, unanswered, while its call is cancelled.
+    fake.state().hold = true;
+    let update = |hz: f64| {
+        let ch = Arc::clone(&ch);
+        tokio::spawn(async move {
+            ch.update(AudioUpdate {
+                frequency_hz: Some(hz),
+                ..AudioUpdate::default()
+            })
+            .await
+        })
+    };
+    let first = update(10.001e6);
+    assert!(
+        fake.wait_until(Duration::from_millis(50), |s| s.queued(ssrc) == 1)
+            .await
+    );
+    first.abort();
+    // The next update waits for the cancelled one's reply instead of joining it.
+    let second = update(10.002e6);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    fake.state().hold = false;
+    let st = second.await.unwrap().unwrap();
+    assert_eq!(st.radio_frequency_hz, Some(10.002e6));
+    assert_eq!(fake.state().max_queue_depth.get(&ssrc), Some(&1));
+    fake.assert_client_contract();
+}
+
 #[tokio::test(start_paused = true)]
 async fn rtp_is_demultiplexed_by_ssrc() {
     let (fake, client) = setup().await;

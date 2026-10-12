@@ -157,6 +157,8 @@ pub struct FakeState {
     pub drop_replies: u32,
     /// Execute commands but never reply.
     pub mute: bool,
+    /// Take no queued command (they stay queued, counted in `max_queue_depth`).
+    pub hold: bool,
     /// Ignore `RADIO_FREQUENCY` (to provoke a "rejected" open).
     pub ignore_frequency: bool,
     /// Set when the client changed `BIN_COUNT` on a live spectrum channel.
@@ -193,6 +195,11 @@ impl FakeState {
             fe_isreal: true,
             ..Self::default()
         }
+    }
+
+    /// Commands queued on `ssrc`'s channel and not taken yet.
+    pub fn queued(&self, ssrc: u32) -> usize {
+        self.channels.get(&ssrc).map_or(0, |c| c.queue.len())
     }
 }
 
@@ -408,7 +415,8 @@ fn frame(state: &Mutex<FakeState>) -> Outgoing {
         let Some(mut ch) = st.channels.remove(&ssrc) else {
             continue;
         };
-        if let Some((cmd, from)) = ch.queue.pop_front() {
+        let next = if st.hold { None } else { ch.queue.pop_front() };
+        if let Some((cmd, from)) = next {
             if !apply(&mut st, &mut ch, &cmd) {
                 st.crashed = true;
                 return Vec::new();
