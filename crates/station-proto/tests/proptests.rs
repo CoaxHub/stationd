@@ -747,7 +747,13 @@ proptest! {
                 retry_after_ms,
                 refresh_assignment,
             });
-            let cap = if connected_for >= 300 { Duration::from_secs(1) } else { b.next_cap() };
+            let reset = connected_for >= 300;
+            let mut cap = if reset { Duration::from_secs(1) } else { b.next_cap() };
+            // A session that ended with no `Goodbye` and no failure pending
+            // is drawn below 5 s (§2.2).
+            if g.is_none() && (reset || b.failures() == 0) {
+                cap = cap.max(Duration::from_secs(5));
+            }
             let mut rng = move || r;
             match b.on_disconnected(g.as_ref(), now, &mut rng) {
                 Decision::Stop => prop_assert!(b.is_revoked()),
@@ -761,6 +767,7 @@ proptest! {
                             prop_assert!(delay >= retry);
                             prop_assert!(delay <= retry + cap);
                             prop_assert!(cap <= Duration::from_secs(60));
+                            prop_assert!(cap >= Duration::from_secs(1));
                         }
                     }
                 }

@@ -26,6 +26,9 @@ pub fn fast_options_scaled(scale: u32) -> RunOptions {
             initial: Duration::from_millis(50),
             max: Duration::from_millis(300),
             reset_after: Duration::from_secs(300),
+            // The wider first window after a dropped session, scaled like
+            // the rest.
+            after_drop_max: Duration::from_millis(250),
             disabled_retry: Duration::from_millis(700),
             unsupported_version_retry: Duration::from_millis(900),
         },

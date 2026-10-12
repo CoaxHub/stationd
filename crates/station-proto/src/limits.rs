@@ -53,6 +53,12 @@ pub const BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// §2.2: the backoff resets after the station has been connected this long.
 pub const BACKOFF_RESET_AFTER: Duration = Duration::from_secs(5 * 60);
 
+/// §2.2: after an established session drops with no `Goodbye` (the hub
+/// vanished), the first reconnection delay is uniform in `[0, this]` instead
+/// of `[0, BACKOFF_INITIAL]`, so the stations of a restarted hub don't all
+/// retry within its first second.
+pub const RECONNECT_AFTER_DROP_MAX: Duration = Duration::from_secs(5);
+
 /// §2.2: after `Goodbye{DISABLED}` the station retries this often.
 pub const DISABLED_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
@@ -419,6 +425,7 @@ mod tests {
         assert_eq!(MAX_RECEIVERS, 16);
         assert_eq!(MAX_SDRS, 16);
         assert_eq!(DEFAULT_HUB_MAX_RECEIVERS, 6);
+        assert_eq!(RECONNECT_AFTER_DROP_MAX, Duration::from_secs(5));
         assert_eq!(
             BACKOFF_INITIAL * BACKOFF_FACTOR.pow(6),
             Duration::from_secs(64)

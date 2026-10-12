@@ -13,6 +13,14 @@
 //! [`limits::BACKOFF_RESET_AFTER`] (5 min). Restarting the hub therefore
 //! never needs action on the station (NFR-5).
 //!
+//! One exception to the first cap: when an established session ends with no
+//! `Goodbye` (the hub vanished) and no failure is pending, the first delay is
+//! uniform in 0 to [`limits::RECONNECT_AFTER_DROP_MAX`] (5 s), which
+//! spreads the reconnects of a restarted hub. The next failure continues
+//! from the normal cap (2 s), doubling as usual. A failed attempt that never
+//! reached `Welcome`, and a `Goodbye` with or without `retry_after_ms`, keep
+//! the base rule.
+//!
 //! Per `Goodbye` reason:
 //!
 //! | Reason | Delay | Other |
@@ -57,6 +65,9 @@ pub struct Policy {
     pub max: Duration,
     /// Connected at least this long resets the backoff.
     pub reset_after: Duration,
+    /// Cap of the first delay after an established session drops with no
+    /// `Goodbye`.
+    pub after_drop_max: Duration,
     /// Retry interval after `Goodbye{DISABLED}`.
     pub disabled_retry: Duration,
     /// Retry interval after `Goodbye{UNSUPPORTED_VERSION}`.
@@ -69,6 +80,7 @@ impl Default for Policy {
             initial: limits::BACKOFF_INITIAL,
             max: limits::BACKOFF_MAX,
             reset_after: limits::BACKOFF_RESET_AFTER,
+            after_drop_max: limits::RECONNECT_AFTER_DROP_MAX,
             disabled_retry: limits::DISABLED_RETRY_INTERVAL,
             unsupported_version_retry: limits::UNSUPPORTED_VERSION_RETRY_INTERVAL,
         }
@@ -154,11 +166,20 @@ impl Backoff {
         if self.revoked {
             return Decision::Stop;
         }
-        if let Some(since) = self.connected_since.take() {
-            if now.saturating_duration_since(since) >= self.policy.reset_after {
-                self.failures = 0;
+        let was_established = match self.connected_since.take() {
+            Some(since) => {
+                if now.saturating_duration_since(since) >= self.policy.reset_after {
+                    self.failures = 0;
+                }
+                true
             }
-        }
+            None => false,
+        };
+        // An established session that ended with no `Goodbye` is a lost hub
+        // (a crash or a restart): the first retry is spread over a wider
+        // window. A consecutive failure (`failures > 0`) is not that first
+        // retry and follows the exponential backoff.
+        let dropped = was_established && goodbye.is_none() && self.failures == 0;
         let reason = goodbye.and_then(|g| Reason::try_from(g.reason).ok());
         let retry_after = goodbye.map_or(Duration::ZERO, |g| {
             Duration::from_millis(u64::from(g.retry_after_ms))
@@ -184,7 +205,12 @@ impl Backoff {
                 | Reason::DuplicateConnection,
             )
             | None => {
-                let jitter = full_jitter(self.next_cap(), rng);
+                let cap = if dropped {
+                    self.next_cap().max(self.policy.after_drop_max)
+                } else {
+                    self.next_cap()
+                };
+                let jitter = full_jitter(cap, rng);
                 self.failures = self.failures.saturating_add(1);
                 retry_after.saturating_add(jitter)
             }
@@ -244,6 +270,112 @@ mod tests {
         }
         assert_eq!(caps, [1, 2, 4, 8, 16, 32, 60, 60, 60, 60]);
         assert_eq!(b.failures(), 10);
+    }
+
+    #[test]
+    fn first_delay_after_a_dropped_session_is_drawn_below_five_seconds() {
+        let t0 = Instant::now();
+        let mut b = Backoff::default();
+        b.on_connected(t0);
+        // The largest draw: the cap itself, 5 s (not the 1 s base cap).
+        let mut cap_draw = || 5_000;
+        let d = delay(b.on_disconnected(None, t0 + Duration::from_secs(10), &mut cap_draw));
+        assert_eq!(d, limits::RECONNECT_AFTER_DROP_MAX);
+        // The spread reaches beyond the base cap, and zero is possible.
+        let mut b = Backoff::default();
+        b.on_connected(t0);
+        let mut mid = || 3_500;
+        assert_eq!(
+            delay(b.on_disconnected(None, t0, &mut mid)),
+            Duration::from_millis(3_500)
+        );
+        let mut b = Backoff::default();
+        b.on_connected(t0);
+        let mut zero = || 0;
+        assert_eq!(
+            delay(b.on_disconnected(None, t0, &mut zero)),
+            Duration::ZERO
+        );
+        // A draw is reduced modulo the window: never above 5 s.
+        let mut b = Backoff::default();
+        b.on_connected(t0);
+        let mut max = max_rng();
+        assert!(delay(b.on_disconnected(None, t0, &mut max)) <= limits::RECONNECT_AFTER_DROP_MAX);
+        // Later failures continue from the base: cap 2 s, then 4 s.
+        assert_eq!(b.failures(), 1);
+        assert_eq!(b.next_cap(), Duration::from_secs(2));
+        let mut cap_draw = || 2_000;
+        assert_eq!(
+            delay(b.on_disconnected(None, t0, &mut cap_draw)),
+            Duration::from_secs(2)
+        );
+        assert_eq!(b.next_cap(), Duration::from_secs(4));
+    }
+
+    #[test]
+    fn dropped_session_after_a_long_run_gets_the_wide_window_again() {
+        let t0 = Instant::now();
+        let mut b = Backoff::default();
+        let mut rng = max_rng();
+        for _ in 0..4 {
+            b.on_disconnected(None, t0, &mut rng);
+        }
+        // Up for 5 minutes: the count resets, so this drop is a first one.
+        b.on_connected(t0);
+        let mut cap_draw = || 5_000;
+        assert_eq!(
+            delay(b.on_disconnected(None, t0 + limits::BACKOFF_RESET_AFTER, &mut cap_draw)),
+            limits::RECONNECT_AFTER_DROP_MAX
+        );
+        // Up for less than 5 minutes after earlier failures: base backoff.
+        let mut b = Backoff::default();
+        b.on_disconnected(None, t0, &mut rng);
+        b.on_connected(t0);
+        let mut cap_draw = || 2_000;
+        assert_eq!(
+            delay(b.on_disconnected(None, t0 + Duration::from_secs(10), &mut cap_draw)),
+            Duration::from_secs(2)
+        );
+        assert_eq!(b.next_cap(), Duration::from_secs(4));
+    }
+
+    #[test]
+    fn a_goodbye_or_a_failed_attempt_keeps_the_base_window() {
+        let t0 = Instant::now();
+        // A failure before the session was established (no `Welcome`).
+        let mut b = Backoff::default();
+        let mut cap_draw = || 1_000;
+        assert_eq!(
+            delay(b.on_disconnected(None, t0, &mut cap_draw)),
+            Duration::from_secs(1)
+        );
+        // The same draw modulo the base window: 5 s becomes 5000 % 1001.
+        let mut b = Backoff::default();
+        let mut five = || 5_000;
+        assert_eq!(
+            delay(b.on_disconnected(None, t0, &mut five)),
+            Duration::from_millis(5_000 % 1_001)
+        );
+        // An established session ended by a refusal with `retry_after_ms`:
+        // the base window plus the hub's wait.
+        for reason in [Reason::Shutdown, Reason::Draining, Reason::Unspecified] {
+            let mut b = Backoff::default();
+            b.on_connected(t0);
+            let mut five = || 5_000;
+            assert_eq!(
+                delay(b.on_disconnected(Some(&goodbye(reason, 7_000)), t0, &mut five)),
+                Duration::from_millis(7_000 + 5_000 % 1_001),
+                "{reason:?}"
+            );
+            // And with no `retry_after_ms` at all.
+            let mut b = Backoff::default();
+            b.on_connected(t0);
+            assert_eq!(
+                delay(b.on_disconnected(Some(&goodbye(reason, 0)), t0, &mut five)),
+                Duration::from_millis(5_000 % 1_001),
+                "{reason:?}"
+            );
+        }
     }
 
     #[test]

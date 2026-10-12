@@ -77,6 +77,7 @@ Station side:
 ### 2.2 Reconnection
 
 - On any disconnect the station backs off exponentially: first cap 1 s, factor 2, at most 60 s, with **full jitter** (the delay is uniform in 0 to the cap). The count resets after 5 minutes connected.
+- **The first delay after a dropped session is wider.** When a session that had reached `Welcome` ends with no `Goodbye` (the connection failed or the hub vanished, as when a hub crashes and restarts) and no failure is pending, the first cap is **5 s** instead of 1 s: the delay is uniform in 0 to 5 s. This spreads the reconnects of all the stations of a restarted hub over several seconds instead of its first one. The cap of the next failure is 2 s and the doubling continues as above. A failed attempt that never reached `Welcome`, and any `Goodbye` (with or without `retry_after_ms`), use the base rule.
 - `Goodbye.retry_after_ms` is **added** to the jittered delay.
 - `DISABLED` waits `max(5 min, retry_after)`. The owner may re-enable the station, so the station keeps trying.
 - `UNSUPPORTED_VERSION` waits `max(6 h, retry_after)` and logs a prominent message asking the owner to update. Neither of these two increases the failure count.
@@ -84,6 +85,7 @@ Station side:
 - `REVOKED`: stop connecting, log an error, report `revoked` in `stationd status` and exit with code 3. The service does not restart on that code. A new enrollment is required.
 - **Restarting a hub never requires action on a station.** A station that loses its tunnel reconnects by itself.
 - A hub that drains sends `Goodbye{DRAINING}` with a random `retry_after_ms`, so stations don't reconnect all at once.
+- A hub that has just started may admit new sessions at a limited rate. It refuses a station over the rate with `Goodbye{SHUTDOWN}` (the reason of a hub that cannot take the station now) and a random `retry_after_ms` of 1 to 15 s, and the station follows the rules above.
 
 ### 2.3 State after reconnect
 
