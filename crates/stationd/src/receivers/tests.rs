@@ -116,6 +116,32 @@ async fn a_set_is_checked_stored_started_and_answered() {
 }
 
 #[tokio::test]
+async fn a_receiver_is_starting_while_its_unit_starts() {
+    let st = Station::new(&STANDARD_SDRS).await;
+    st.units.hold_starts();
+    let receivers = st.receivers.clone();
+    let set = tokio::spawn(async move { receivers.configure(&standard_set()).await });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !st.units.calls().contains(&UnitCall::Start(1)) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the first start");
+    // A status now: both receivers STARTING, never UNSPECIFIED (§5).
+    let health: Vec<(u32, i32)> = st
+        .receivers
+        .health(|_| 0)
+        .iter()
+        .map(|r| (r.receiver_id, r.state))
+        .collect();
+    assert_eq!(health, [(1, S::Starting as i32), (2, S::Starting as i32)]);
+    assert_eq!(st.receivers.summaries()[0].state, "starting");
+    st.units.release_starts();
+    set.await.expect("task").expect("set");
+}
+
+#[tokio::test]
 async fn a_refused_set_changes_nothing() {
     let st = Station::standard().await;
     let mut events = st.receivers.subscribe();

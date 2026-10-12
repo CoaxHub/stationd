@@ -11,8 +11,8 @@
 //!   one stops, an unchanged one is left alone.
 //! - **A receiver** is its unit ([`units`]: `coaxhub-radiod@<id>.service`) and
 //!   its backend (one [`Backend`] each, from a [`BackendFactory`]). Its state:
-//!   - `STARTING` from its unit's start until its backend answers
-//!     (`Backend::capabilities`);
+//!   - `STARTING` from when it is added, or its unit restarts, until its
+//!     backend answers (`Backend::capabilities`);
 //!   - `RUNNING` while its unit runs the same invocation;
 //!   - `FAILED` when its unit failed or stopped, its backend could not be
 //!     created, or its SDR doesn't offer its model and profile, with the
@@ -320,10 +320,12 @@ struct Rx {
 }
 
 impl Rx {
+    /// A receiver just added: `STARTING`, never `UNSPECIFIED`, which a
+    /// status must not carry (§5).
     fn new(config: StoredReceiver) -> Self {
         Self {
             config,
-            state: State::Unspecified,
+            state: State::Starting,
             detail: String::new(),
             backend: None,
             invocation: None,

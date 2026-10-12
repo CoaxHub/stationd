@@ -216,13 +216,16 @@ struct FakeState {
     runs: u64,
     failing: HashMap<u32, String>,
     calls: Vec<UnitCall>,
+    held: bool,
 }
 
 /// Units in memory: a start makes a unit active at once, unless the test
-/// made it fail ([`FakeUnits::fail`]). Clones share the units.
+/// made it fail ([`FakeUnits::fail`]) or holds starts
+/// ([`FakeUnits::hold_starts`]). Clones share the units.
 #[derive(Debug, Clone, Default)]
 pub struct FakeUnits {
     state: Arc<Mutex<FakeState>>,
+    released: Arc<tokio::sync::Notify>,
 }
 
 impl FakeUnits {
@@ -262,6 +265,18 @@ impl FakeUnits {
         self.locked().calls.clone()
     }
 
+    /// Holds every start, once asked for, until [`FakeUnits::release_starts`]:
+    /// a slow `systemctl start`.
+    pub fn hold_starts(&self) {
+        self.locked().held = true;
+    }
+
+    /// Lets the held starts and the next ones go on.
+    pub fn release_starts(&self) {
+        self.locked().held = false;
+        self.released.notify_waiters();
+    }
+
     fn run(s: &mut FakeState, id: u32) {
         let next = if let Some(d) = s.failing.get(&id) {
             UnitState::Failed { detail: d.clone() }
@@ -278,8 +293,15 @@ impl FakeUnits {
 #[async_trait::async_trait]
 impl Units for FakeUnits {
     async fn start(&self, id: u32) -> Result<(), String> {
+        self.locked().calls.push(UnitCall::Start(id));
+        loop {
+            let released = self.released.notified();
+            if !self.locked().held {
+                break;
+            }
+            released.await;
+        }
         let mut s = self.locked();
-        s.calls.push(UnitCall::Start(id));
         if !matches!(s.units.get(&id), Some(UnitState::Active { .. })) {
             Self::run(&mut s, id);
         }
