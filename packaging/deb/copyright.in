@@ -12,8 +12,10 @@ Comment:
  under /usr/lib/coaxhub/radiod/). The corresponding source is published next
  to this package in the CoaxHub APT repository as
  ka9q-radio-@KA9Q_SHORT@.tar.gz (SHA-256 @KA9Q_TARBALL_SHA256@),
- and the scripts that build it are in the CoaxHub/stationd repository
- (packaging/). radiod was built with ARCHOPTS "@ARCHOPTS@".
+ with these patches, applied in order and published next to it:
+@KA9Q_PATCHES@
+ The scripts that build it, and the patches, are in the CoaxHub/stationd
+ repository (packaging/). radiod was built with ARCHOPTS "@ARCHOPTS@".
  .
  It also bundles osmocom librtlsdr @RTLSDR_VERSION@, built from commit
  @RTLSDR_COMMIT@

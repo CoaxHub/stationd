@@ -13,7 +13,8 @@
 #              source tarball (named context `rtlsdr`, its SHA-256 checked):
 #              the same library on every suite, private to the package
 #   radiod     ka9q-radio at the pinned commit, from the published source
-#              tarball (named context `ka9q`), with ARCHOPTS overridden and
+#              tarball (named context `ka9q`) with our patches applied
+#              (packaging/patches/ka9q-radio/), with ARCHOPTS overridden and
 #              the package's private paths compiled in; its rtlsdr.so links
 #              the private librtlsdr, found through its RUNPATH
 #   stationd   stationd --features packaged (named context `rootca` holds
@@ -90,6 +91,7 @@ ARG KA9Q_SUMMARY
 ARG KA9Q_REMOTE=https://github.com/ka9q/ka9q-radio.git
 ARG RADIOD_ARCHOPTS=
 COPY --from=ka9q ka9q-radio-*.tar.gz /src/
+COPY packaging/patches/ka9q-radio /src/ka9q-patches
 COPY --from=librtlsdr /opt/rtlsdr /opt/rtlsdr
 # config_paths.h is written here rather than by upstream's Makefile rule,
 # which asks git (the tarball has no .git): same values, and the private
@@ -97,13 +99,22 @@ COPY --from=librtlsdr /opt/rtlsdr /opt/rtlsdr
 RUN set -eu; \
     short="$(printf %.8s "${KA9Q_COMMIT}")"; \
     tar -xzf "/src/ka9q-radio-${short}.tar.gz" -C /src; \
+    # Our patches (packaging/patches/ka9q-radio/, in order), each of which must apply
+    # exactly; radiod -V names them after the branch.
+    branch=" (coaxhub-stationd)"; applied=; \
+    for p in /src/ka9q-patches/*.patch; do \
+      [ -e "$p" ] || continue; \
+      patch -d "/src/ka9q-radio-${short}" -p1 --batch --forward --no-backup-if-mismatch < "$p"; \
+      n="$(basename "$p")"; applied="${applied:+${applied},}${n%%-*}"; \
+    done; \
+    [ -z "${applied}" ] || branch=" (coaxhub-stationd, patches ${applied})"; \
     cd "/src/ka9q-radio-${short}/src"; \
     lib=/usr/lib/coaxhub/radiod; \
     { printf '#ifndef _CONFIG_PATHS_H\n#define _CONFIG_PATHS_H 1\n'; \
       printf '#define CONFDIR "%s"\n#define STATEDIR "%s"\n' "$lib" /var/lib/coaxhub-radiod; \
       printf '#define PKGDATADIR "%s"\n#define PKGLIBDIR "%s"\n' "$lib" "$lib"; \
       printf '#define GIT_HASH "%s"\n#define GIT_TIME "%s"\n' "${KA9Q_COMMIT}" "${KA9Q_COMMIT_TIME}"; \
-      printf '#define GIT_BRANCH " (coaxhub-stationd)"\n#define GIT_SUMMARY "%s"\n' "${KA9Q_SUMMARY}"; \
+      printf '#define GIT_BRANCH "%s"\n#define GIT_SUMMARY "%s"\n' "${branch}" "${KA9Q_SUMMARY}"; \
       printf '#define GIT_VERSION "%s"\n#define GIT_REMOTE_URL "%s"\n#endif\n' "${short}" "${KA9Q_REMOTE}"; \
     } > config_paths.h; \
     touch config_paths.h; \

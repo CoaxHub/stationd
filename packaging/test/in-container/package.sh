@@ -81,6 +81,7 @@ check_contains "the blacklist names dvb_usb_rtl28xxu" "blacklist dvb_usb_rtl28xx
 copyright="$(cat /usr/share/doc/coaxhub-stationd/copyright)"
 check_contains "copyright names the ka9q-radio commit" "${KA9Q_COMMIT}" "${copyright}"
 check_contains "copyright names the source tarball" "ka9q-radio-${KA9Q_COMMIT:0:8}.tar.gz" "${copyright}"
+check_contains "copyright names radiod's patches" "  ka9q-radio-${KA9Q_COMMIT:0:8}-0001-" "${copyright}"
 check_contains "copyright: GPL-3.0-only" "License: GPL-3.0-only" "${copyright}"
 check_contains "copyright names the rtl-sdr commit" "${RTLSDR_COMMIT}" "${copyright}"
 check_contains "copyright names the rtl-sdr tarball" "rtl-sdr-${RTLSDR_COMMIT:0:8}.tar.gz" "${copyright}"
@@ -211,6 +212,7 @@ check_contains "radiod.conf is receiver 11's" "status = 239.77.3.6" "$(cat /run/
 # ---------------------------------------------------------------- radiod
 out="$(/usr/lib/coaxhub/radiod/radiod -V 2>&1)"
 check_contains "radiod -V reports the pinned commit" "${KA9Q_COMMIT}" "${out}"
+check_contains "radiod -V names our patches" "(coaxhub-stationd, patches 0001" "${out}"
 for f in /usr/lib/coaxhub/radiod/radiod /usr/lib/coaxhub/radiod/rtlsdr.so \
     /usr/lib/coaxhub/radiod/librtlsdr.so.0 /usr/bin/stationd; do
     check_lacks "${f##*/}: every shared library resolves" "not found" "$(ldd "${f}" 2>&1)"

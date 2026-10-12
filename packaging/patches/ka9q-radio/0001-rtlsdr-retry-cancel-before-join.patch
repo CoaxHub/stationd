@@ -1,0 +1,59 @@
+SPDX-License-Identifier: GPL-3.0-only
+Subject: rtlsdr: retry rtlsdr_cancel_async() before joining the read thread
+Forwarded: not yet (ka9q-radio upstream)
+
+radiod starts the RTL-SDR front end on its first channel and stops it when the last
+channel closes (radio.c, close_chan(), which holds Channel_list_mutex while it calls
+Frontend.shutdown). rtlsdr_shutdown() calls rtlsdr_cancel_async() once and joins the
+read thread. librtlsdr's rtlsdr_cancel_async() only cancels a stream that is already
+RUNNING; called earlier it does nothing and returns -2. When the last channel closes
+within milliseconds of the first one starting the front end (a client that probes
+with a channel and deletes it at once), the cancel is lost, rtlsdr_read_async()
+streams on, pthread_join() never returns, and radiod stops answering commands while
+it still reads samples.
+
+This retries the cancel every millisecond until it takes, or until the read thread's
+rtlsdr_read_async() has returned on its own.
+
+--- a/src/rtlsdr.c
++++ b/src/rtlsdr.c
+@@ -82,6 +82,7 @@
+ 
+   pthread_t read_thread;
+   _Atomic enum state state;
++  atomic_bool read_done; // read_thread's rtlsdr_read_async() has returned
+ };
+ 
+ static char const *Rtlsdr_keys[] = {
+@@ -266,6 +267,7 @@
+   stick_core();
+   rtlsdr_reset_buffer(sdr->device);
+   int r = rtlsdr_read_async(sdr->device,rx_callback,frontend,0,16*16384); // blocks
++  atomic_store(&sdr->read_done,true);
+   if(r == 0)
+     return NULL;
+ 
+@@ -285,6 +287,7 @@
+     usleep(10000); // 10 ms
+   }
+   sdr->scale = scale_AD(frontend); // set scaling now that we know the forward FFT size
++  atomic_store(&sdr->read_done,false);
+   pthread_create(&sdr->read_thread,NULL,rtlsdr_read_thread,sdr);
+   atomic_store(&sdr->state,RUNNING);
+   fprintf(stderr,"rtlsdr running\n");
+@@ -304,7 +307,14 @@
+       return 0;
+     usleep(10000);
+   }
+-  rtlsdr_cancel_async(sdr->device);
++  // rtlsdr_cancel_async() only cancels a stream that is already running. Called before
++  // the read thread's rtlsdr_read_async() gets there (the last channel closed right after
++  // the first one started the front end), it does nothing and returns -2, the thread
++  // streams on, and pthread_join() never returns, with Channel_list_mutex held by
++  // close_chan(): radiod stops answering commands. So retry until the cancel takes, or
++  // until rtlsdr_read_async() has returned on its own.
++  while(rtlsdr_cancel_async(sdr->device) != 0 && !atomic_load(&sdr->read_done))
++    usleep(1000); // 1 ms
+   pthread_join(sdr->read_thread,NULL);
+   atomic_store(&sdr->state,STOPPED);
+   fprintf(stderr,"rtlsdr stopped\n");

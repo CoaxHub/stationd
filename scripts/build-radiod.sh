@@ -4,8 +4,11 @@
 # Build and install ka9q-radio `radiod` (signal-generator and RTL-SDR front ends) and
 # the upstream client tools we use for testing, inside a development container.
 #
-# Idempotent: re-running with the same pinned commit and an existing install
-# only re-checks the apt packages and the loopback multicast flag.
+# radiod is the pinned commit with the patches in packaging/patches/ka9q-radio/ applied,
+# as the package builds it (packaging/deb/Dockerfile), so tests run the radiod that ships.
+#
+# Idempotent: re-running with the same pinned commit, the same patches and an existing
+# install only re-checks the apt packages and the loopback multicast flag.
 #
 # Layout (override with environment variables):
 #   KA9Q_SRC     source clone      default: ~/.cache/coaxhub/ka9q-radio
@@ -26,6 +29,8 @@ readonly KA9Q_REPO="https://github.com/ka9q/ka9q-radio.git"
 readonly KA9Q_COMMIT="384b269aaf5e9ee1015185ae7c0cdd60f4d2ecbd"
 KA9Q_SRC="${KA9Q_SRC:-${HOME}/.cache/coaxhub/ka9q-radio}"
 KA9Q_PREFIX="${KA9Q_PREFIX:-${HOME}/.local/opt/ka9q-radio}"
+KA9Q_PATCHES="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/packaging/patches/ka9q-radio"
+readonly KA9Q_PATCHES
 
 # Minimal Debian (bookworm) packages to build radiod + sig_gen.so + tools.
 # radiod links -lopus -lfftw3f(_threads) -liniparser -lusb-1.0 -lbsd;
@@ -86,20 +91,33 @@ fetch_source() {
     mkdir -p "$(dirname "${KA9Q_SRC}")"
     git clone --quiet "${KA9Q_REPO}" "${KA9Q_SRC}"
   fi
-  if [[ "$(git -C "${KA9Q_SRC}" rev-parse HEAD)" != "${KA9Q_COMMIT}" ]]; then
-    if ! git -C "${KA9Q_SRC}" cat-file -e "${KA9Q_COMMIT}^{commit}" 2>/dev/null; then
-      log "fetching ${KA9Q_COMMIT}"
-      git -C "${KA9Q_SRC}" fetch --quiet origin
-    fi
-    log "checking out ${KA9Q_COMMIT}"
-    git -C "${KA9Q_SRC}" -c advice.detachedHead=false checkout --quiet --force "${KA9Q_COMMIT}"
+  if ! git -C "${KA9Q_SRC}" cat-file -e "${KA9Q_COMMIT}^{commit}" 2>/dev/null; then
+    log "fetching ${KA9Q_COMMIT}"
+    git -C "${KA9Q_SRC}" fetch --quiet origin
   fi
+  # Always from a clean checkout, so the patches apply once and nothing else is left.
+  git -C "${KA9Q_SRC}" -c advice.detachedHead=false checkout --quiet --force "${KA9Q_COMMIT}"
+  local patch
+  for patch in "${KA9Q_PATCHES}"/*.patch; do
+    [[ -e "${patch}" ]] || continue
+    log "applying ${patch##*/}"
+    git -C "${KA9Q_SRC}" apply "${patch}"
+  done
+}
+
+# The patches' digest, for the install stamp: a new or changed patch rebuilds radiod.
+patches_digest() {
+  local patches=("${KA9Q_PATCHES}"/*.patch)
+  [[ -e "${patches[0]}" ]] || { echo none; return; }
+  cat "${patches[@]}" | sha256sum | cut -c1-16
 }
 
 build_and_install() {
   local stamp="${KA9Q_PREFIX}/.coaxhub-ka9q-commit"
-  # The stamp records the commit and the driver set, so adding a driver triggers a rebuild.
-  local want="${KA9Q_COMMIT} ${DRIVERS[*]}"
+  # The stamp records the commit, the patches and the driver set, so a change to any of
+  # them triggers a rebuild.
+  local want
+  want="${KA9Q_COMMIT} patches-$(patches_digest) ${DRIVERS[*]}"
   if [[ "${force_rebuild}" == false && -f "${stamp}" && "$(cat "${stamp}")" == "${want}" \
     && -x "${KA9Q_PREFIX}/sbin/radiod" ]]; then
     log "ka9q-radio ${KA9Q_COMMIT:0:12} already installed in ${KA9Q_PREFIX}"

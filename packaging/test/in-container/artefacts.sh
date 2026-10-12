@@ -59,6 +59,16 @@ check_contains "copyright names the tarball's SHA-256" "$(sha256sum "${tarball}"
     "$(cat "${x}/usr/share/doc/coaxhub-stationd/copyright")"
 check_contains "the tarball holds radiod's source" "ka9q-radio-384b269a/src/radio.c" \
     "$(tar -tzf "${tarball}")"
+# Our patches to radiod (packaging/patches/ka9q-radio/), part of its corresponding source:
+# next to the tarball, and each named in copyright with its SHA-256.
+patches=(/test/pkg/ka9q-radio-384b269a-*.patch)
+check "radiod's patches are next to the package" test -e "${patches[0]}"
+for patch in "${patches[@]}"; do
+    [[ -e "${patch}" ]] || continue
+    check_contains "copyright names ${patch##*/} with its SHA-256" \
+        "${patch##*/} (SHA-256 $(sha256sum "${patch}" | cut -d' ' -f1))" \
+        "$(cat "${x}/usr/share/doc/coaxhub-stationd/copyright")"
+done
 # The corresponding source of the bundled librtlsdr (GPL).
 tarball=/test/pkg/rtl-sdr-619ac318.tar.gz
 check "the rtl-sdr source tarball is next to the package" test -f "${tarball}"

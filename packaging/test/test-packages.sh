@@ -31,6 +31,10 @@ artefacts() {
         docker cp "$(package_for "${suite}" "${arch}")" "${name}:/test/pkg/" >/dev/null
     done
     docker cp "${PACKAGES}/${suite}/ka9q-radio-384b269a.tar.gz" "${name}:/test/pkg/" >/dev/null
+    local patch
+    for patch in "${PACKAGES}/${suite}"/ka9q-radio-384b269a-*.patch; do
+        [[ -e "${patch}" ]] && docker cp "${patch}" "${name}:/test/pkg/" >/dev/null
+    done
     docker cp "${PACKAGES}/${suite}/rtl-sdr-619ac318.tar.gz" "${name}:/test/pkg/" >/dev/null
     run_in "${name}" "${TEST_DIR}/in-container/artefacts.sh" "${suite}" amd64 &&
         run_in "${name}" "${TEST_DIR}/in-container/artefacts.sh" "${suite}" arm64

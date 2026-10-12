@@ -49,15 +49,24 @@ install -D -m 0644 "${src}/modprobe/coaxhub-stationd.conf" "${root}/usr/lib/modp
 install -d "${doc}"
 short="${KA9Q_COMMIT:0:8}"
 archopts="$(cat "${in}/radiod/ARCHOPTS")"
+# radiod's patches, as published next to the source tarball: ka9q-radio-<short>-<name>.
+patches_list="$(mktemp)"
+for p in "${src}"/patches/ka9q-radio/*.patch; do
+    [[ -e "${p}" ]] || continue
+    printf 'ka9q-radio-%s-%s (SHA-256 %s)\n' "${short}" "${p##*/}" "$(sha256sum "${p}" | cut -d' ' -f1)"
+done >"${patches_list}"
+[[ -s "${patches_list}" ]] || echo "(none)" >"${patches_list}"
 sed -e "s|@COAXHUB_DOMAIN@|${COAXHUB_DOMAIN}|g" -e "s|@KA9Q_COMMIT@|${KA9Q_COMMIT}|g" \
     -e "s|@KA9Q_SHORT@|${short}|g" -e "s|@KA9Q_TARBALL_SHA256@|${KA9Q_TARBALL_SHA256}|g" \
     -e "s|@RTLSDR_VERSION@|${RTLSDR_VERSION}|g" -e "s|@RTLSDR_COMMIT@|${RTLSDR_COMMIT}|g" \
     -e "s|@RTLSDR_SHORT@|${RTLSDR_COMMIT:0:8}|g" \
     -e "s|@RTLSDR_TARBALL_SHA256@|${RTLSDR_TARBALL_SHA256}|g" \
     -e "s|@ARCHOPTS@|${archopts}|g" -e '/^#/d' "${src}/deb/copyright.in" |
-    awk -v crates="${in}/stationd/rust-crates.txt" '
+    awk -v crates="${in}/stationd/rust-crates.txt" -v patches="${patches_list}" '
         $0 == "@RUST_CRATES@" { while ((getline line < crates) > 0) print "  " line; next }
+        $0 == "@KA9Q_PATCHES@" { while ((getline line < patches) > 0) print "  " line; next }
         { print }' >"${doc}/copyright"
+rm -f "${patches_list}"
 chmod 0644 "${doc}/copyright"
 
 # ---------------------------------------------------------------- control

@@ -20,7 +20,9 @@
 #
 # Output (target/packages/<suite>/):
 #   coaxhub-stationd_<version>_<arch>.deb
-#   ka9q-radio-<commit8>.tar.gz   the radiod corresponding source (GPL)
+#   ka9q-radio-<commit8>.tar.gz   the radiod corresponding source (GPL), with
+#   ka9q-radio-<commit8>-<name>.patch  each patch the build applies to it
+#                                 (packaging/patches/ka9q-radio/)
 #   rtl-sdr-<commit8>.tar.gz      the librtlsdr corresponding source (GPL)
 #
 # Caches: the ka9q-radio and rtl-sdr commits in target/packaging/ka9q-radio.git
@@ -126,6 +128,14 @@ main() {
     fetch_source ka9q-radio "${KA9Q_REPO}" "${KA9Q_COMMIT}" ka9q-src
     local KA9Q_COMMIT_TIME="${SOURCE_TIME}" KA9Q_SUMMARY="${SOURCE_SUMMARY}"
     local KA9Q_TARBALL_SHA256="${SOURCE_SHA256}"
+    # radiod's patches are part of its corresponding source: next to the tarball, named
+    # for the commit they apply to, and none left from an earlier build.
+    rm -f "${packages}/${suite}"/ka9q-radio-*.patch
+    local p
+    for p in "${station}"/packaging/patches/ka9q-radio/*.patch; do
+        [[ -e "${p}" ]] || continue
+        cp -p "${p}" "${packages}/${suite}/ka9q-radio-${KA9Q_COMMIT:0:8}-${p##*/}"
+    done
     fetch_source rtl-sdr "${RTLSDR_REPO}" "${RTLSDR_COMMIT}" rtl-sdr-src
     local RTLSDR_TARBALL_SHA256="${SOURCE_SHA256}"
 
