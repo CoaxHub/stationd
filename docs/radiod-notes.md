@@ -104,6 +104,12 @@ The modulation source:
 - Upstream's example uses `wwvsim`, which is not in the repo.
 - Without a source, the modulation silently falls back to an unmodulated carrier.
 
+Keyed carrier (`testdata/radiod-siggen-cw.conf`, the dev stack's `--backend siggen`; the tests keep the AM tone above):
+- `sig_gen` computes each sample as `(dc + m) * amplitude * carrier` (`sig_gen.c` `proc_sig_gen`), `m` being the source's stream scaled to −1 … +1 and `dc` being 1 for `modulation = am` and 0 for `dsb`. With `dsb`, a source that holds 0 switches the carrier off and a constant level switches it on, so the stream is the key. There is no keying parameter, the carrier cannot be switched from outside, and `modulation = cw` means unmodulated: the source is ignored.
+- The source is a `sh -c` loop around `sox`: CQ CQ DE LU1JGU in Morse at 18 WPM (a unit is 3200 samples at 48 kHz, 66.7 ms; PARIS timing), repeating with a pause. A key-down element is a constant level (`synth … sine 0 0 90`, scaled by `vol 1.6` to about 0.94 of full scale) with half-sine edges of 6 ms, then a unit of silence. The carrier sits at 7.030 MHz, −20 dBFS while the key is down, with the same −30 dBFS noise; a receiver in CW mode hears it against its beat-frequency oscillator.
+- The loop must end when radiod closes the pipe: the front end's stop `pclose()`s the source and waits for it. radiod runs the source with SIGPIPE ignored, and `sox` then prints "Broken pipe" and exits **0**, so the loop pipes each `sox` through `cat`, whose exit status (1) ends it. Without that the loop spins and radiod hangs in the front end's stop.
+- The line of the config is limited to 1023 characters by iniparser, with no double quote in it.
+
 Dynamic channels:
 - They are enabled because `data =` is set.
 - The template preset is `preset = am`: linear demod, 12 kHz, ±5 kHz, envelope detector, AGC.
