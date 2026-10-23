@@ -50,6 +50,9 @@ pub const FAKE_CARRIERS_HZ: [u64; 6] = [
     7_040_000, 7_074_000, 7_255_000, 14_074_000, 14_230_000, 98_000_000,
 ];
 
+/// The fake's CW pitch, Hz: radiod's `cwu` preset's (radiod-notes.md §10).
+pub const FAKE_CW_PITCH_HZ: u32 = 500;
+
 /// The fake's measurement placement grid, Hz from the front-end centre (as
 /// radiod's with 500 Hz bins).
 pub const FAKE_MEASUREMENT_GRID_HZ: u64 = 1_000;
@@ -205,6 +208,7 @@ impl FakeConfig {
                     min_row_interval_ms: 50,
                     max_subscriptions: 4,
                 }),
+                cw_pitch_hz: FAKE_CW_PITCH_HZ,
             },
             frontend: v1::FrontendState {
                 receiver_id: 0,
@@ -1206,9 +1210,11 @@ mod tests {
             codecs: caps.codecs.clone(),
             waterfall: caps.waterfall,
             measurements: None,
+            cw_pitch_hz: caps.cw_pitch_hz,
         };
         let sanitized = sanitize_capabilities(&station, 0).expect("valid capabilities");
         assert!(sanitized.clamped.is_empty());
+        assert_eq!(sanitized.capabilities.cw_pitch_hz, FAKE_CW_PITCH_HZ);
         assert_eq!(
             caps.receiver.tunable_range,
             Some(v1::FrequencyRange {

@@ -129,6 +129,10 @@ pub const MAX_DETAIL_BYTES: usize = 256;
 /// §5 Strings: `ReceiverCapabilities.sdr_model`, in bytes.
 pub const MAX_SDR_MODEL_BYTES: usize = 64;
 
+/// §5 `Capabilities.cw_pitch_hz`: the pitches the hub accepts, in Hz. A
+/// claim outside it is dropped (read as 0, "not reported"), never clamped.
+pub const CW_PITCH_HZ: std::ops::RangeInclusive<u32> = 200..=1200;
+
 /// §5 Strings: at most this many `FrontendControls.antenna_ports` entries.
 pub const MAX_ANTENNA_PORTS: usize = 8;
 

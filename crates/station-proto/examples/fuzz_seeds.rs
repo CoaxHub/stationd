@@ -111,6 +111,7 @@ fn station_message_seeds(dir: &Path) -> Res<()> {
                 max_noise_bands: 32,
                 method_version: 1,
             }),
+            cw_pitch_hz: 500,
         }),
     );
     let sdr = |serial: &str, product: &str, models: Vec<v1::ModelOption>, receiver_id| v1::Sdr {

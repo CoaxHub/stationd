@@ -95,6 +95,8 @@ async fn a_set_is_checked_stored_started_and_answered() {
     let controls = hf.frontend.clone().expect("controls");
     assert!(controls.can_retune && !controls.has_gain);
     assert_eq!(caps.receivers[1].sdr_model, "RTL-SDR Blog V4");
+    // The CW pitch is station-wide: both receivers agree (the fake's 500 Hz).
+    assert_eq!(caps.cw_pitch_hz, 500);
     assert_eq!(
         caps.waterfall.map(|w| w.max_subscriptions),
         Some(limits::waterfall_subscriptions_claim(2))

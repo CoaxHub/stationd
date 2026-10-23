@@ -52,6 +52,9 @@ const RECEIVER_CONTROLS: ControlsFields = ControlsFields {
 /// [`limits::MAX_WATERFALL_SUBSCRIPTIONS`], `measurements.max_noise_bands`
 /// above [`limits::MAX_NOISE_BANDS`] (§5.2).
 ///
+/// Dropped (set to 0, "not reported", and listed in `clamped`):
+/// `cw_pitch_hz` outside [`limits::CW_PITCH_HZ`].
+///
 /// Whether each receiver is one the hub configured is the session's check
 /// ([`super::Session`]); overlap is not a violation (§5.1).
 pub fn sanitize_capabilities(
@@ -103,6 +106,12 @@ pub fn sanitize_capabilities(
             "capabilities.measurements.max_noise_bands",
             &mut clamped,
         );
+    }
+
+    // A claim for display: out of bounds it is dropped, not clamped.
+    if out.cw_pitch_hz != 0 && !limits::CW_PITCH_HZ.contains(&out.cw_pitch_hz) {
+        out.cw_pitch_hz = 0;
+        clamped.push("capabilities.cw_pitch_hz");
     }
 
     Ok(SanitizedCapabilities {

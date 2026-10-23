@@ -291,6 +291,7 @@ pub fn capabilities() -> v1::Capabilities {
             max_subscriptions: 4,
         }),
         measurements: None,
+        cw_pitch_hz: 500,
     }
 }
 

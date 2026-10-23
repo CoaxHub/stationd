@@ -132,6 +132,10 @@ pub struct BackendCapabilities {
     pub codecs: Vec<i32>,
     /// Its waterfall; `None` when it has none.
     pub waterfall: Option<v1::WaterfallLimits>,
+    /// The audio pitch in Hz of a carrier tuned exactly on the frequency in
+    /// CW mode (`Capabilities.cw_pitch_hz`); 0 when the backend doesn't
+    /// know it.
+    pub cw_pitch_hz: u32,
 }
 
 /// Backend and front-end health, for `StationStatus` (§9).

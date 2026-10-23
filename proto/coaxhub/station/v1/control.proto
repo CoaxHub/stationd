@@ -27,6 +27,16 @@ message Capabilities {
   // The station can measure (measure.proto). Absent: it can't, and the hub
   // sends it no plan.
   MeasurementLimits measurements = 5;
+  // The audio pitch in Hz of a carrier tuned exactly on the frequency in
+  // MODE_CW: the offset the station's CW demodulator puts the tone at
+  // (radiod's `cwu` preset). Station-wide, like `modes`: every receiver
+  // uses the same preset. A claim for display (a CW decoder in a listener's
+  // browser looks for the tone there); never used for scheduling. 0 = not
+  // reported. Outside 200 to 1200 Hz the hub drops it (as 0). The tone
+  // rises with the signal's frequency (upper-sideband CW, as radiod's `cwu`
+  // does): a signal d Hz above the tuned frequency is heard at
+  // cw_pitch_hz + d.
+  uint32 cw_pitch_hz = 6;
 }
 
 // One running receiver: one SDR with its own backend.

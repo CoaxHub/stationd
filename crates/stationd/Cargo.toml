@@ -1,6 +1,6 @@
 [package]
 name = "stationd"
-description = "CoaxHub station daemon: outbound mTLS gRPC tunnel to the hub, and the station's receivers (station protocol 2.0)"
+description = "CoaxHub station daemon: outbound mTLS gRPC tunnel to the hub, and the station's receivers (station protocol 2.1)"
 version = "0.2.2"
 edition.workspace = true
 license.workspace = true

@@ -50,6 +50,7 @@ pub mod v1 {
     include!(concat!(env!("OUT_DIR"), "/coaxhub.station.v1.rs"));
 }
 
-/// The protocol version this crate implements: `coaxhub.station.v1`, 2.0
-/// (station-protocol §3): a station has receivers.
-pub const PROTOCOL_VERSION: v1::ProtocolVersion = v1::ProtocolVersion { major: 2, minor: 0 };
+/// The protocol version this crate implements: `coaxhub.station.v1`, 2.1
+/// (station-protocol §3). Major 2: a station has receivers. Minor 1 added
+/// `Capabilities.cw_pitch_hz`.
+pub const PROTOCOL_VERSION: v1::ProtocolVersion = v1::ProtocolVersion { major: 2, minor: 1 };

@@ -102,6 +102,7 @@ async fn capabilities_and_health_from_radiod_status() {
         codecs: caps.codecs.clone(),
         waterfall: caps.waterfall,
         measurements: None,
+        cw_pitch_hz: caps.cw_pitch_hz,
     };
     let sanitized = sanitize_capabilities(&station, 0).unwrap();
     assert!(sanitized.clamped.is_empty(), "{:?}", sanitized.clamped);

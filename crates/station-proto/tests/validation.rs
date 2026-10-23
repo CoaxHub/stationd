@@ -1701,6 +1701,31 @@ fn nonsense_capabilities_are_violations() {
     assert!(sanitize_capabilities(&bare, 0).is_ok());
 }
 
+/// §5 `Capabilities.cw_pitch_hz`: a claim for display. In bounds it is kept,
+/// absent (0) it stays absent, and outside 200 to 1200 Hz it is dropped to 0
+/// and listed, never a violation and never clamped.
+#[test]
+fn cw_pitch_out_of_bounds_is_dropped() {
+    for (claim, kept) in [
+        (0, 0),
+        (200, 200),
+        (500, 500),
+        (1200, 1200),
+        (199, 0),
+        (1201, 0),
+        (u32::MAX, 0),
+    ] {
+        let caps = v1::Capabilities {
+            cw_pitch_hz: claim,
+            ..capabilities()
+        };
+        let sanitized = sanitize_capabilities(&caps, 0).expect("not a violation");
+        assert_eq!(sanitized.capabilities.cw_pitch_hz, kept, "claim {claim}");
+        let listed = sanitized.clamped.contains(&"capabilities.cw_pitch_hz");
+        assert_eq!(listed, claim != 0 && kept == 0, "claim {claim}");
+    }
+}
+
 #[test]
 fn overlapping_receivers_are_not_a_violation() {
     let t0 = Instant::now();

@@ -14,10 +14,11 @@ use common::*;
 use proptest::prelude::*;
 use prost::Message as _;
 use station_proto::backoff::{Backoff, Decision};
+use station_proto::limits;
 use station_proto::v1::{self, request::Command, response::Payload, station_message::Body};
 use station_proto::validate::{
     Session, Verdict, check_message, check_receiver_set, decode_station_message, decompress_row,
-    predicted_tunable_range, ranges_overlap,
+    predicted_tunable_range, ranges_overlap, sanitize_capabilities,
 };
 
 fn text() -> BoxedStrategy<String> {
@@ -165,9 +166,16 @@ fn capabilities() -> BoxedStrategy<v1::Capabilities> {
             ),
             proptest::option::of((any::<u32>(), any::<u32>(), any::<u32>())),
             proptest::option::of((0u32..40, 0u32..3)),
+            // Absent, a believable pitch, the edges of the bounds, anything.
+            prop_oneof![
+                2 => Just(0u32),
+                3 => 200u32..=1200,
+                2 => prop_oneof![Just(199u32), Just(200), Just(1200), Just(1201)],
+                2 => any::<u32>(),
+            ],
         )
             .prop_map(
-                |(receivers, (modes, codecs), wf, measurements)| v1::Capabilities {
+                |(receivers, (modes, codecs), wf, measurements, cw_pitch_hz)| v1::Capabilities {
                     receivers,
                     modes,
                     codecs,
@@ -184,6 +192,7 @@ fn capabilities() -> BoxedStrategy<v1::Capabilities> {
                             method_version,
                         }
                     }),
+                    cw_pitch_hz,
                 },
             )
     })
@@ -655,6 +664,26 @@ proptest! {
         let is_hello = matches!(m.body, Some(Body::Hello(_)));
         if check_message(&m, 0).is_err() && !is_hello {
             prop_assert!(matches!(s.check(&m, t0), Verdict::Violation(_)));
+        }
+    }
+
+    /// §5 `Capabilities.cw_pitch_hz`: whatever the claim, it is no violation,
+    /// and what the hub keeps is 0 or inside the bounds (a claim inside them
+    /// is kept as it is, one outside is dropped and listed).
+    #[test]
+    fn a_cw_pitch_claim_is_kept_in_bounds_or_dropped(claim in any::<u32>()) {
+        let caps = v1::Capabilities { cw_pitch_hz: claim, ..common::capabilities() };
+        let sanitized = sanitize_capabilities(&caps, 0).expect("a pitch claim is no violation");
+        let kept = sanitized.capabilities.cw_pitch_hz;
+        prop_assert!(kept == 0 || limits::CW_PITCH_HZ.contains(&kept));
+        if limits::CW_PITCH_HZ.contains(&claim) {
+            prop_assert_eq!(kept, claim);
+        } else {
+            prop_assert_eq!(kept, 0);
+            prop_assert_eq!(
+                sanitized.clamped.contains(&"capabilities.cw_pitch_hz"),
+                claim != 0
+            );
         }
     }
 

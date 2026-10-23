@@ -819,6 +819,16 @@ pub async fn answers_get_capabilities(
         ensure(ranges.windows(2).all(|w| w[0] <= w[1]), || {
             format!("receivers not in frequency order: {ranges:?}")
         })?;
+        ensure(
+            caps.cw_pitch_hz == 0 || limits::CW_PITCH_HZ.contains(&caps.cw_pitch_hz),
+            || {
+                format!(
+                    "cw_pitch_hz {} is neither 0 nor within {:?} (§5)",
+                    caps.cw_pitch_hz,
+                    limits::CW_PITCH_HZ
+                )
+            },
+        )?;
         if let Some(w) = caps.waterfall {
             ensure(
                 w.max_subscriptions <= limits::waterfall_subscriptions_claim(caps.receivers.len()),

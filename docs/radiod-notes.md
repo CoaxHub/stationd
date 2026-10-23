@@ -430,6 +430,7 @@ From the pinned `presets.conf`:
 | LSB | `lsb` | linear | 12 kHz | −3000 .. −50 Hz |
 | CW | `cwu` | linear, 500 Hz tone | 12 kHz | ±200 Hz |
 
+- The CW tone is the `cwu` preset's offset, 500 Hz in the pinned file the package ships. `cwu` is upper-sideband CW: the tone rises with the signal's frequency, as `Capabilities.cw_pitch_hz` states. radiod's channel status doesn't carry it, so `backend_ka9q::backend::map::CW_PITCH_HZ` states it and the station reports it as `Capabilities.cw_pitch_hz`; a pinned commit whose `cwu` differs changes that constant with the pin.
 - There is also an `nfm` preset (±6.25 kHz). `fm` is used for NFM because it is upstream's "standard flat narrow band FM", and the hub always sends its own filter edges anyway.
 - Every preset sets `mono = yes`. The backend also sends `OUTPUT_CHANNELS 1`, which for `wfm` turns FM stereo decoding off (`radio_status.c`, `OUTPUT_CHANNELS`), so every channel is mono Opus.
 - Presets do not set `encoding`, so a `PRESET` on a live channel keeps Opus. A preset does reset the sample rate, passband and demodulator, so a mode change re-sends the channel's full configuration after `PRESET` (which radiod applies first).

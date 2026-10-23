@@ -23,8 +23,8 @@ fn v(major: u32, minor: u32) -> ProtocolVersion {
 }
 
 #[test]
-fn protocol_version_is_two_zero() {
-    assert_eq!(PROTOCOL_VERSION, v(2, 0));
+fn protocol_version_is_two_one() {
+    assert_eq!(PROTOCOL_VERSION, v(2, 1));
     assert_eq!(station_proto::limits::SUPPORTED_MAJORS, [2]);
 }
 
@@ -67,8 +67,10 @@ fn hub_negotiation_matrix() {
             ),
         }
     }
+    // A station at 2.0 (before `cw_pitch_hz`) is spoken to at 2.0.
     assert_eq!(negotiate(&hello_with(2, 0)), Ok(v(2, 0)));
-    assert_eq!(negotiate(&hello_with(2, 4)), Ok(v(2, 0)));
+    assert_eq!(negotiate(&hello_with(2, 1)), Ok(v(2, 1)));
+    assert_eq!(negotiate(&hello_with(2, 4)), Ok(v(2, 1)));
     // Major 2 only: an older or newer major is told to update.
     for (major, minor) in [(1, 0), (1, 1), (3, 0), (0, 9)] {
         assert_eq!(
@@ -115,7 +117,8 @@ fn station_welcome_matrix() {
         }
     }
     assert!(negotiate_welcome(&welcome(Some(v(2, 0)))).is_ok());
-    assert!(negotiate_welcome(&welcome(Some(v(2, 1)))).is_err());
+    assert!(negotiate_welcome(&welcome(Some(v(2, 1)))).is_ok());
+    assert!(negotiate_welcome(&welcome(Some(v(2, 2)))).is_err());
     assert!(negotiate_welcome(&welcome(Some(v(1, 1)))).is_err());
     assert!(negotiate_welcome(&welcome(Some(v(3, 0)))).is_err());
 }
@@ -149,7 +152,7 @@ fn session_rejects_unsupported_versions_without_a_strike() {
         s.check(&msg(Body::Hello(hello_with(2, 9))), t0),
         Verdict::Accept
     );
-    assert_eq!(s.negotiated_version(), Some(v(2, 0)));
+    assert_eq!(s.negotiated_version(), Some(v(2, 1)));
 }
 
 fn command(kind: CommandKind) -> Command {

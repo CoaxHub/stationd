@@ -97,7 +97,7 @@ All channels, subscriptions and the measurement plan (§4.1) belong to **one con
 
 ## 3. Version negotiation
 
-- `ProtocolVersion{major, minor}`. This document describes **2.0**; the package name stays `coaxhub.station.v1`.
+- `ProtocolVersion{major, minor}`. This document describes **2.1**; the package name stays `coaxhub.station.v1`. Minor 1 added `Capabilities.cw_pitch_hz` (§4.2), an optional field, as minor 1 of major 1 added measurements.
 - The station sends its version in `Hello`; the hub answers with `Welcome` carrying the version it will speak, or with `Goodbye{UNSUPPORTED_VERSION}`. Both sides use the lower minor.
 - **Minor** bumps only add things: optional fields, enum values (a new SDR model or profile, §4.2), `oneof` members. Receivers of a message **must ignore unknown fields** and **treat unknown enum values as unsupported**: answer `UNSUPPORTED`, don't disconnect.
 - **Major** bumps may break. Hubs speak major 2 only and answer any other with `Goodbye{UNSUPPORTED_VERSION}`. Once a major 3 exists, a hub supports major 2 beside it for a migration window of at least 6 months.
@@ -240,7 +240,8 @@ The station says what is plugged in and what its package allows for each SDR; th
 
 **Receivers in the other messages.**
 
-- `Capabilities.receivers` lists the running receivers in frequency order, each with its tunable and hardware ranges, sample rate, channel limit, front-end controls and `sdr_model`. The station-wide fields (`modes`, `codecs`, `waterfall`, `measurements`) apply to all of them; `waterfall.max_subscriptions` counts subscriptions across receivers.
+- `Capabilities.receivers` lists the running receivers in frequency order, each with its tunable and hardware ranges, sample rate, channel limit, front-end controls and `sdr_model`. The station-wide fields (`modes`, `codecs`, `waterfall`, `measurements`, `cw_pitch_hz`) apply to all of them; `waterfall.max_subscriptions` counts subscriptions across receivers.
+- `Capabilities.cw_pitch_hz` is the audio pitch of a carrier tuned exactly on the frequency in `MODE_CW`: the tone the station's CW demodulator produces. The tone rises with the signal's frequency (upper-sideband CW, as radiod's `cwu` preset): a signal `d` Hz above the tuned frequency is heard at `cw_pitch_hz + d`, which is how a listener's decoder finds the signal and how "tune to the signal" moves the dial. A demodulator that works the other way reports 0. It is station-wide because the CW preset is (every receiver's radiod loads the same presets file), like `modes`. It is a claim for display only: a CW decoder in a listener's browser looks for the tone there. 0 or absent means the station does not report it. The hub keeps a value from 200 to 1200 Hz and drops any other (reads it as 0), never clamps it, and it is no violation. A station whose receivers disagree reports 0.
 - `OpenChannel`, `SubscribeWaterfall` and `SetFrontend` name a running receiver; anything else is `NOT_FOUND`. Their answers echo it, and `FrontendState` carries it.
 - `SetFrontend` changes only what the receiver's `FrontendControls` offer live. A setting its backend can't change while running is part of the receiver's configuration instead: the hub sends a new `ConfigureReceivers`, which restarts that receiver.
 - `StationStatus.receivers` reports every configured receiver: its state, its backend's and front end's health, its channels and its backend's CPU.
@@ -266,7 +267,7 @@ Three strikes within 24 hours quarantine the station. A quarantined station is r
 | `ChannelSignal` | channel open, ≤ 5/s per channel, floats finite | drop excess; NaN or inf → violation |
 | `StationStatus` | ≤ 1 per `status_interval_ms` / 2; floats finite; ≤ 16 receivers, each configured, once | drop excess; more or unknown receivers → violation |
 | `Event` | ≤ 10/s, burst 50; referenced IDs must be open (or just closed within 5 s); `receiver_id` one the hub configured | drop excess |
-| `Capabilities` | ≤ 16 receivers, each configured, once; per receiver `tunable_range` ⊆ `hardware_range`, `max_channels` ≤ 64; no two tunable ranges overlapping; `max_bins` ≤ 16,384; ranges ≤ 6 GHz; `measurements.max_noise_bands` ≤ 32 | clamp to hub limits; nonsense ranges → violation; overlap: §5.1 |
+| `Capabilities` | ≤ 16 receivers, each configured, once; per receiver `tunable_range` ⊆ `hardware_range`, `max_channels` ≤ 64; no two tunable ranges overlapping; `max_bins` ≤ 16,384; ranges ≤ 6 GHz; `measurements.max_noise_bands` ≤ 32; `cw_pitch_hz` 0 or 200–1200 | clamp to hub limits; `cw_pitch_hz` outside its bounds dropped (0); nonsense ranges → violation; overlap: §5.1 |
 | `Hardware` | ≤ 16 SDRs; each model and profile a known value; `profiles` lists each profile once, and every profile an SDR offers is among them; `center_range` inside 6 GHz with the default inside it; `receiver_id`, when present, one the hub configured | violation |
 | `ReceiversConfigured` | each receiver of the set once, nothing else; a specified state | violation |
 | `ClockState` | `synchronized` false, `max_error_ms` > 100, or the hub's offset estimate > 250 ms | keep, mark the clock suspect |
@@ -298,6 +299,7 @@ These refine the table above.
 - **Capabilities, clamp versus violation.**
   - Violation: `start > end`; a range starting above 6 GHz; a tunable range not inside the hardware range; missing ranges; `UNSPECIFIED` entries in `modes` or `codecs`; a receiver the hub didn't configure, or one twice.
   - Clamp: range ends to 6 GHz; `max_channels` to 64; `max_bins` to 16,384; `max_subscriptions` to 16.
+  - Drop: a `cw_pitch_hz` outside 200–1200 Hz is read as 0 (not reported), logged with the clamps.
   - **Receivers beyond the hub's limit** (`[limits] max_receivers`, 6 by default) are ignored, highest IDs first. The hub never configures more, so this only meets a station that kept an older set.
   - **Overlapping receivers** are not a violation (a front end can drift, or settle after a retune): the hub keeps the one with the lower `receiver_id` and treats the other as offline until the overlap ends, and tells the owner why. The limit applies first, then the overlap rule in ascending ID order: a receiver is offline only when it overlaps one the hub keeps, so in a chain where 1 overlaps 2 and 2 overlaps 3 but 1 and 3 don't overlap, 1 and 3 are served.
   - Two ranges **overlap** when they share more than an end: a range that ends where another starts touches it and doesn't overlap it.

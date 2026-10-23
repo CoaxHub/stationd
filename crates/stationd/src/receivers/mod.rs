@@ -880,6 +880,9 @@ impl Receivers {
         let mut modes: Option<Vec<i32>> = None;
         let mut codecs: Option<Vec<i32>> = None;
         let mut waterfall: Option<v1::WaterfallLimits> = None;
+        // One preset file serves every radiod, so the receivers agree; if
+        // they don't (or one doesn't know), nothing is claimed.
+        let mut cw_pitch: Option<u32> = None;
         for (id, profile, backend) in running {
             let caps = match backend.capabilities().await {
                 Ok(c) => c,
@@ -895,6 +898,10 @@ impl Receivers {
             };
             keep(&mut modes, &caps.modes);
             keep(&mut codecs, &caps.codecs);
+            cw_pitch = Some(match cw_pitch {
+                Some(acc) if acc != caps.cw_pitch_hz => 0,
+                _ => caps.cw_pitch_hz,
+            });
             if let Some(w) = caps.waterfall {
                 waterfall = Some(match waterfall {
                     Some(acc) => v1::WaterfallLimits {
@@ -921,6 +928,7 @@ impl Receivers {
                 max_noise_bands: limits::MAX_NOISE_BANDS,
                 method_version: limits::MEASURE_METHOD_VERSION,
             }),
+            cw_pitch_hz: cw_pitch.unwrap_or(0),
         }
     }
 

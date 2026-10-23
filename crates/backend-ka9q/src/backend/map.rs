@@ -42,6 +42,16 @@ pub const SQUELCH_HYSTERESIS_DB: f32 = 1.0;
 /// Reported SNRs are clamped to this range, dB.
 const SNR_LIMIT_DB: f64 = 100.0;
 
+/// The audio pitch in Hz of a carrier tuned exactly on the frequency in CW
+/// mode: the tone of the `cwu` preset in the `presets.conf` the package pins
+/// and ships (radiod-notes.md §10), reported as `Capabilities.cw_pitch_hz`.
+/// `cwu` is upper-sideband CW, so the tone rises with the signal's frequency
+/// (a signal `d` Hz above the tuned frequency is heard at pitch + `d`), the
+/// convention `Capabilities.cw_pitch_hz` states (station-protocol.md §4.2).
+/// radiod's channel status doesn't carry it, so a new pinned commit whose
+/// preset differs changes this constant.
+pub const CW_PITCH_HZ: u32 = 500;
+
 /// The radiod preset for `mode` (the pinned `presets.conf`):
 ///
 /// | Mode | Preset | radiod demodulator |
@@ -258,6 +268,7 @@ pub fn capabilities(st: &ChannelStatus) -> Option<BackendCapabilities> {
             min_row_interval_ms: MIN_ROW_INTERVAL_MS,
             max_subscriptions: MAX_SUBSCRIPTIONS,
         }),
+        cw_pitch_hz: CW_PITCH_HZ,
     })
 }
 
@@ -634,6 +645,7 @@ mod tests {
             codecs: caps.codecs.clone(),
             waterfall: caps.waterfall,
             measurements: None,
+            cw_pitch_hz: caps.cw_pitch_hz,
         };
         let sanitized = station_proto::validate::sanitize_capabilities(&station, 0).unwrap();
         assert!(sanitized.clamped.is_empty(), "{:?}", sanitized.clamped);
@@ -645,6 +657,8 @@ mod tests {
                 .is_some_and(|f| f.can_retune && !f.has_gain)
         );
         assert_eq!(caps.modes.len(), 6);
+        assert_eq!(caps.cw_pitch_hz, 500);
+        assert_eq!(sanitized.capabilities.cw_pitch_hz, 500);
         let fe = frontend_state(&siggen());
         assert_eq!(fe.center_frequency_hz, 6_000_000);
         assert_eq!(fe.gain_db, 0.0);
