@@ -36,7 +36,7 @@ jobs:
         run: rustup toolchain install
       - name: Install protoc (station-proto's build.rs runs it) and jq (the license boundary)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev jq
-      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2
         with:
           tool: cargo-nextest,cargo-deny
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -91,7 +91,7 @@ jobs:
         run: rustup toolchain install nightly --profile minimal
       - name: Install protoc (station-proto's build.rs runs it)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
-      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2
         with:
           tool: cargo-fuzz
       - name: Fuzz each target for 60 s
