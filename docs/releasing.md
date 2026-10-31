@@ -39,7 +39,7 @@ The build is deterministic in its timestamps: every file's modification time is 
 
 ## Verifying a package
 
-Packages from the APT repository are verified by `apt` against the repository's signing key. The fingerprint of that key is published on the website's [station page](https://coaxhub.com/docs/station). The installer pins the same fingerprint and refuses a key file that holds any other key, or a second one.
+Packages from the APT repository are verified by `apt` against the repository's signing key. The fingerprint of that key is published on the website's [station security page](https://coaxhub.com/docs/station-security). The installer pins the same fingerprint and refuses a key file that holds any other key, or a second one.
 
 To verify a package you downloaded from a GitHub release:
 

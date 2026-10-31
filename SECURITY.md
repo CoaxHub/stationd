@@ -60,4 +60,4 @@ You can build the package yourself ([docs/packaging.md](docs/packaging.md)). A s
 - It has no CoaxHub signature. Only packages from the signed CoaxHub APT repository carry one, and [docs/releasing.md](docs/releasing.md) says how to verify them. Nothing in this repository holds a signing key.
 - A build without `--features packaged`, which is what a plain `cargo build` makes, is a development build. It accepts static credentials, custom endpoints and a fake backend, so it is not for a station on the network.
 
-The installer and its checks are described at [https://coaxhub.com/docs/station](https://coaxhub.com/docs/station). The fingerprint of the repository's signing key is published there.
+The installer and its checks are described at [https://coaxhub.com/docs/station](https://coaxhub.com/docs/station). The fingerprint of the repository's signing key is published at [https://coaxhub.com/docs/station-security](https://coaxhub.com/docs/station-security).
