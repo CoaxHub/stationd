@@ -2,12 +2,16 @@
 //! Each receiver's backend process as a unit: started, restarted, stopped
 //! and watched (station-protocol §9).
 //!
-//! - [`Systemd`]: `coaxhub-radiod@<receiver_id>.service`, through
-//!   `systemctl`, which calls systemd's D-Bus API (`StartUnit`,
-//!   `RestartUnit`, `StopUnit`); the package's polkit rule lets the
-//!   `coaxhub` user do exactly that for those units. `systemctl show` reads
-//!   the unit's state, which needs no authorization, and the unit's cgroup
-//!   its CPU time.
+//! - [`Helper`]: `coaxhub-radiod@<receiver_id>.service` under systemd, as a
+//!   packaged station runs it. `start`, `restart` and `stop` go to
+//!   `coaxhub-helper` on its socket (docs/packaging.md §4): `stationd` is
+//!   not root and asks nobody's permission, so a root helper that does
+//!   exactly those three things for those units does them. The reads are
+//!   [`Systemd`]'s: `systemctl show` reads the unit's state, which needs no
+//!   authorization, and the unit's cgroup its CPU time.
+//! - [`Systemd`]: the same units through `systemctl` alone (`start`,
+//!   `restart` and `stop` need the caller to be allowed by systemd), and the
+//!   reads [`Helper`] uses.
 //! - [`FakeUnits`]: in memory, for tests and development stations with the
 //!   fake backend.
 //! - [`ExternalUnits`]: a radiod of the developer's own, always running;
@@ -15,11 +19,13 @@
 
 use std::collections::HashMap;
 use std::fmt::{self, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use coaxhub_helper::protocol::{self as helper, Reply, Request, Verb};
 use station_proto::limits;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::dispatch::truncate_utf8;
 
@@ -119,6 +125,134 @@ impl Systemd {
             .await
             .map(drop)
     }
+
+    /// One property of a unit (`systemctl show --value`), trimmed.
+    pub async fn property(&self, unit: &str, property: &str) -> Result<String, String> {
+        self.systemctl(&["show", "--value", &format!("--property={property}"), unit])
+            .await
+            .map(|v| v.trim().to_owned())
+    }
+}
+
+/// How long a call to the helper may take: more than the helper's worst
+/// case, which `RuntimeMaxSec=15` in its unit ends
+/// ([`helper::RUNTIME_MAX`]), so that stationd never gives up on a request
+/// the helper still carries out and reports the receiver `failed` meanwhile.
+pub const HELPER_TIMEOUT: Duration = Duration::from_secs(helper::RUNTIME_MAX.as_secs() + 5);
+
+/// Why a call to the helper failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallError {
+    /// In words for the owner.
+    pub text: String,
+    /// The helper refused this user (the socket's mode, or its peer check),
+    /// as opposed to not answering.
+    pub denied: bool,
+}
+
+impl CallError {
+    fn other(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            denied: false,
+        }
+    }
+}
+
+/// The receivers' units under systemd, started, restarted and stopped by
+/// `coaxhub-helper` and read like [`Systemd`] does.
+#[derive(Debug, Clone)]
+pub struct Helper {
+    /// The helper's socket ([`helper::SOCKET_PATH`]).
+    pub socket: PathBuf,
+    /// Where the reads go.
+    pub systemd: Systemd,
+    /// How long a call may take.
+    pub timeout: Duration,
+}
+
+impl Default for Helper {
+    fn default() -> Self {
+        Self {
+            socket: PathBuf::from(helper::SOCKET_PATH),
+            systemd: Systemd::default(),
+            timeout: HELPER_TIMEOUT,
+        }
+    }
+}
+
+impl Helper {
+    /// A helper at `socket` (tests, `doctor`).
+    pub fn at(socket: &Path) -> Self {
+        Self {
+            socket: socket.to_owned(),
+            ..Self::default()
+        }
+    }
+
+    /// Sends `request` and reads the answer. `Err` says why, in words for
+    /// the owner: it reaches `receiver_state` and the station's page.
+    pub async fn call(&self, request: Request) -> Result<(), String> {
+        self.send(request).await.map_err(|e| e.text)
+    }
+
+    /// [`Helper::call`] with the failure's kind.
+    pub async fn send(&self, request: Request) -> Result<(), CallError> {
+        let work = async {
+            let mut stream = tokio::net::UnixStream::connect(&self.socket)
+                .await
+                .map_err(|e| CallError {
+                    text: format!(
+                        "cannot reach coaxhub-helper ({}): {e}; run sudo stationd doctor",
+                        self.socket.display()
+                    ),
+                    denied: e.kind() == std::io::ErrorKind::PermissionDenied,
+                })?;
+            stream
+                .write_all(request.encode().as_bytes())
+                .await
+                .map_err(|e| {
+                    CallError::other(format!("coaxhub-helper ({}): {e}", self.socket.display()))
+                })?;
+            let mut answer = Vec::new();
+            // One short line; never more than a reply can be.
+            (&mut stream)
+                .take(1024)
+                .read_to_end(&mut answer)
+                .await
+                .map_err(|e| {
+                    CallError::other(format!("coaxhub-helper ({}): {e}", self.socket.display()))
+                })?;
+            Ok::<_, CallError>(answer)
+        };
+        let answer = tokio::time::timeout(self.timeout, work)
+            .await
+            .map_err(|_| CallError::other("coaxhub-helper timed out"))??;
+        if answer.is_empty() {
+            return Err(CallError::other(
+                "coaxhub-helper closed the connection without an answer",
+            ));
+        }
+        match Reply::parse(&String::from_utf8_lossy(&answer)) {
+            Some(Reply::Ok) => Ok(()),
+            Some(Reply::Error(detail)) => Err(CallError {
+                denied: detail == helper::NOT_PERMITTED,
+                text: truncate_utf8(&detail, limits::MAX_DETAIL_BYTES),
+            }),
+            None => Err(CallError::other(
+                "coaxhub-helper answered something unexpected",
+            )),
+        }
+    }
+
+    /// Asks the helper to answer `ok` (it runs nothing).
+    pub async fn ping(&self) -> Result<(), CallError> {
+        self.send(Request::Ping).await
+    }
+
+    async fn unit(&self, verb: Verb, id: u32) -> Result<(), String> {
+        self.call(Request::Unit { verb, id }).await
+    }
 }
 
 /// The state of a unit from `systemctl show`'s `key=value` lines.
@@ -189,6 +323,29 @@ impl Units for Systemd {
             .join(unit_name(id))
             .join("cpu.stat");
         parse_cpu_stat(&std::fs::read_to_string(path).ok()?)
+    }
+}
+
+#[async_trait::async_trait]
+impl Units for Helper {
+    async fn start(&self, id: u32) -> Result<(), String> {
+        self.unit(Verb::Start, id).await
+    }
+
+    async fn restart(&self, id: u32) -> Result<(), String> {
+        self.unit(Verb::Restart, id).await
+    }
+
+    async fn stop(&self, id: u32) -> Result<(), String> {
+        self.unit(Verb::Stop, id).await
+    }
+
+    async fn state(&self, id: u32) -> UnitState {
+        self.systemd.state(id).await
+    }
+
+    fn cpu_usage_usec(&self, id: u32) -> Option<u64> {
+        self.systemd.cpu_usage_usec(id)
     }
 }
 
@@ -399,6 +556,11 @@ mod tests {
             parse_show(&show("inactive", "dead", "success", "0"), 3),
             UnitState::Inactive
         );
+        // A unit whose ExecCondition= said no is skipped: inactive, result success.
+        assert_eq!(
+            parse_show(&show("inactive", "dead", "success", "0"), 3),
+            UnitState::Inactive
+        );
         assert_eq!(parse_show("", 3), UnitState::Inactive);
         assert_eq!(unit_name(12), "coaxhub-radiod@12.service");
     }
@@ -433,7 +595,7 @@ mod tests {
         let e = units.start(1).await.expect_err("no systemctl");
         assert!(e.contains("cannot run systemctl"), "{e}");
         assert!(matches!(units.state(1).await, UnitState::Failed { .. }));
-        // A systemctl that refuses (polkit says no, the unit is missing).
+        // A systemctl that refuses (the unit is missing).
         let units = Systemd {
             systemctl: PathBuf::from("false"),
             ..Systemd::default()
@@ -444,6 +606,122 @@ mod tests {
             "{e}"
         );
         assert!(units.stop(2).await.is_err());
+    }
+
+    /// Serves a socket in `dir`: `answer` gets each request line and returns
+    /// the bytes to send back (`None`: hang). Returns the socket's path and
+    /// the request lines seen.
+    fn fake_helper(
+        dir: &Path,
+        answer: impl Fn(&str) -> Option<Vec<u8>> + Send + 'static,
+    ) -> (PathBuf, Arc<Mutex<Vec<String>>>) {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let path = dir.join("helper.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut line = String::new();
+                BufReader::new(&stream).read_line(&mut line).expect("line");
+                log.lock().expect("lock").push(line.clone());
+                match answer(&line) {
+                    Some(bytes) => {
+                        let _ = stream.write_all(&bytes);
+                    }
+                    None => std::thread::sleep(Duration::from_secs(5)),
+                }
+            }
+        });
+        (path, seen)
+    }
+
+    #[tokio::test]
+    async fn the_helper_is_asked_for_start_restart_and_stop() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (socket, seen) = fake_helper(tmp.path(), |line| {
+            Some(if line == "restart 9\n" {
+                b"error systemctl --no-block restart coaxhub-radiod@9.service: Unit not found.\n"
+                    .to_vec()
+            } else {
+                b"ok\n".to_vec()
+            })
+        });
+        let units = Helper::at(&socket);
+        units.start(3).await.expect("start");
+        units.stop(3).await.expect("stop");
+        units.ping().await.expect("ping");
+        let e = units.restart(9).await.expect_err("refused");
+        assert_eq!(
+            e,
+            "systemctl --no-block restart coaxhub-radiod@9.service: Unit not found."
+        );
+        assert_eq!(
+            *seen.lock().expect("lock"),
+            ["start 3\n", "stop 3\n", "ping\n", "restart 9\n"]
+        );
+    }
+
+    #[test]
+    fn timeouts_agree_with_the_helper() {
+        // stationd waits longer than the helper can possibly take.
+        assert!(HELPER_TIMEOUT > helper::RUNTIME_MAX);
+        assert_eq!(helper::MAX_RECEIVER_UNITS, limits::MAX_RECEIVERS);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_of_the_user_is_told_from_no_answer() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (socket, _) = fake_helper(tmp.path(), |_| Some(b"error not permitted\n".to_vec()));
+        let e = Helper::at(&socket).ping().await.expect_err("refused");
+        assert!(e.denied, "{e:?}");
+        let e = Helper::at(&tmp.path().join("none.sock"))
+            .ping()
+            .await
+            .expect_err("no socket");
+        assert!(!e.denied, "{e:?}");
+    }
+
+    #[tokio::test]
+    async fn the_helper_not_answering_is_reported() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        // No socket at all.
+        let missing = tmp.path().join("none.sock");
+        let e = Helper::at(&missing).start(1).await.expect_err("no socket");
+        assert!(e.starts_with("cannot reach coaxhub-helper ("), "{e}");
+        assert!(e.contains("none.sock"), "{e}");
+        assert!(e.ends_with("; run sudo stationd doctor"), "{e}");
+        // Closed without a word.
+        let dir = tmp.path().join("a");
+        std::fs::create_dir(&dir).expect("mkdir");
+        let (socket, _) = fake_helper(&dir, |_| Some(Vec::new()));
+        let e = Helper::at(&socket).stop(1).await.expect_err("closed");
+        assert_eq!(e, "coaxhub-helper closed the connection without an answer");
+        // Something else.
+        let dir = tmp.path().join("b");
+        std::fs::create_dir(&dir).expect("mkdir");
+        let (socket, _) = fake_helper(&dir, |_| Some(b"maybe\n".to_vec()));
+        let e = Helper::at(&socket).stop(1).await.expect_err("odd");
+        assert_eq!(e, "coaxhub-helper answered something unexpected");
+        // A long detail is cut to the protocol's limit.
+        let dir = tmp.path().join("c");
+        std::fs::create_dir(&dir).expect("mkdir");
+        let (socket, _) = fake_helper(&dir, |_| {
+            Some(format!("error {}\n", "x".repeat(900)).into_bytes())
+        });
+        let e = Helper::at(&socket).stop(1).await.expect_err("long");
+        assert!(e.len() <= limits::MAX_DETAIL_BYTES, "{}", e.len());
+        // Hangs.
+        let dir = tmp.path().join("d");
+        std::fs::create_dir(&dir).expect("mkdir");
+        let (socket, _) = fake_helper(&dir, |_| None);
+        let units = Helper {
+            timeout: Duration::from_millis(200),
+            ..Helper::at(&socket)
+        };
+        let e = units.start(1).await.expect_err("timeout");
+        assert_eq!(e, "coaxhub-helper timed out");
     }
 
     #[tokio::test]

@@ -1,9 +1,10 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-only
 #
-# coaxhub-stationd prerm: on removal stops stationd and then every receiver's
-# radiod instance (coaxhub-radiod@<receiver_id>.service). An upgrade leaves
-# them running; the new postinst restarts them.
+# coaxhub-stationd prerm: on removal stops stationd, then every receiver's
+# radiod instance (coaxhub-radiod@<receiver_id>.service), then the helper's
+# socket (and any connection it is serving). An upgrade leaves them running;
+# the new postinst restarts them.
 set -e
 
 case "$1" in
@@ -12,6 +13,8 @@ remove | deconfigure)
 		systemctl stop stationd.service || true
 		# A pattern: systemctl matches it against the loaded units.
 		systemctl stop 'coaxhub-radiod@*.service' || true
+		systemctl stop coaxhub-helper.socket || true
+		systemctl stop 'coaxhub-helper@*.service' || true
 	fi
 	;;
 upgrade | failed-upgrade) ;;

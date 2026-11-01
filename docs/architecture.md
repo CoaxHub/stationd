@@ -14,7 +14,7 @@ This document describes `stationd` from the station's side: what it connects to,
   │   ├─ tunnel client (reconnects with backoff and jitter)                 │
   │   ├─ request handler, checked by the package's fixed rules              │
   │   ├─ hardware report; applied receiver set (receivers.json)             │
-  │   ├─ starts and stops the receivers' units over D-Bus (polkit rule)     │
+  │   ├─ starts and stops the receivers' units through coaxhub-helper      │
   │   ├─ backend adapter ── one ka9q-radio client per receiver              │
   │   │                     (TLV control, RTP Opus, spectrum)               │
   │   ├─ waterfall quantizer and zstd                                       │
@@ -101,6 +101,7 @@ One package, `coaxhub-stationd`, built for `arm64` and `amd64`:
 | Path | Contents |
 |---|---|
 | `/usr/bin/stationd` | the daemon |
+| `/usr/lib/coaxhub/coaxhub-helper` | the root helper `stationd` asks to start, restart and stop the receivers' units (below), private and not on `PATH` |
 | `/usr/lib/coaxhub/radiod/` | the pinned ka9q-radio build (`radiod`, its drivers and presets) and the pinned osmocom librtlsdr its RTL-SDR driver links, private and not on `PATH`; their GPL source is published with each release |
 | `/usr/share/coaxhub/radiod-templates/` | radiod config templates, one per SDR profile (`rtlsdr`, `rtlsdr-hf`, `rtlsdr-v4`) |
 | `/var/lib/coaxhub/stationd/` | state: key, certificate, chain, CA bundle, assignment, station ID (mode 0700) |
@@ -109,7 +110,7 @@ One package, `coaxhub-stationd`, built for `arm64` and `amd64`:
 | `/run/coaxhub-radiod/<receiver_id>/radiod.conf` | one receiver's radiod config, rendered at every start of its unit |
 | `stationd.service` | the daemon, as user `coaxhub` |
 | `coaxhub-radiod@.service` | the template unit: one instance per receiver, `coaxhub-radiod@<receiver_id>.service`, as user `coaxhub-radiod`; `stationd` starts and stops the instances |
-| `/usr/share/polkit-1/rules.d/coaxhub-stationd.rules` | lets `stationd` start, restart and stop those instances, and nothing else |
+| `coaxhub-helper.socket`, `coaxhub-helper@.service` | the helper's socket (`/run/coaxhub-helper.sock`, `root:coaxhub 0660`) and the per-connection service it starts, as root, sandboxed; its boundary is its parser |
 
 A packaged station has no configuration file ([station protocol §7](station-protocol.md#7-what-the-station-keeps)). What the owner chooses lives in the web app, and the hub sends it as typed requests.
 
@@ -120,7 +121,7 @@ radiod is an implementation detail. The owner never writes its configuration, an
 1. **The station reports its SDRs.** `stationd` reads the USB SDRs from sysfs (vendor and product IDs, manufacturer, product and serial strings, the port; no device access is needed) and answers `GetHardware`. It raises `Event{HARDWARE_CHANGED}` when one is plugged in or removed. For each SDR it adds the models and profiles its package's table allows, and it lists every profile the package has with what each can do ([station protocol §4.2](station-protocol.md#42-hardware-and-receivers)). Strings from the SDR are display-only claims.
 2. **The owner sets up receivers in the web app**, one per SDR they want to use: the model (from the list the station gave), the band or centre, an antenna and a label. The control plane stores only models and profiles the hardware report allows, and predicts each receiver's tunable range from the profile's span so it can refuse overlapping receivers. A receiver keeps its SDR's serial while the SDR is unplugged, so the set can be sent again and edited.
 3. **The hub sends `ConfigureReceivers`** on every connection and whenever the set changes: for each receiver its ID, its SDR's serial, model, profile, centre and front-end settings, as enums, numbers and a serial. `stationd` checks the whole set against the package's rules and refuses it, changing nothing, if one is broken. A receiver whose SDR is not plugged in is accepted when its profile is one the package has and its centre and settings fit it; its model is checked against the SDR when the SDR appears.
-4. **`stationd` applies the difference.** It writes the set to `receivers.json`, then starts, restarts or stops `coaxhub-radiod@<receiver_id>.service` through systemd's D-Bus API. Before every start the unit runs `stationd backend-config --receiver <receiver_id>`, which renders that receiver's radiod config from the profile's template and `receivers.json` into `/run/coaxhub-radiod/<receiver_id>/radiod.conf`. It reports each receiver's state (`STARTING`, `RUNNING`, `FAILED` with the reason, `NO_DEVICE` while its SDR is not plugged in) as `Event{RECEIVER_STATE}`, and starts a `NO_DEVICE` receiver by itself when its SDR is plugged in.
+4. **`stationd` applies the difference.** It writes the set to `receivers.json`, then starts, restarts or stops `coaxhub-radiod@<receiver_id>.service` by asking `coaxhub-helper` ([hardening](#hardening)). Before every start the unit runs `stationd backend-config --receiver <receiver_id>`, which renders that receiver's radiod config from the profile's template and `receivers.json` into `/run/coaxhub-radiod/<receiver_id>/radiod.conf`. It reports each receiver's state (`STARTING`, `RUNNING`, `FAILED` with the reason, `NO_DEVICE` while its SDR is not plugged in) as `Event{RECEIVER_STATE}`, and starts a `NO_DEVICE` receiver by itself when its SDR is plugged in.
 5. **At boot**, `stationd` starts every receiver in `receivers.json` before it connects, so the receivers run while the tunnel is down. A setting saved while the station is offline is applied when it returns.
 
 Each receiver has a **local slot** (0–15) that `stationd` keeps for the receiver's life on this station. The slot fixes the receiver's multicast groups on loopback (status `239.77.<slot>.6:5006`, data `239.77.<slot>.4:5004`, TTL 0); the hub and the control plane never see it. `stationd` connects only to the bundled radiod instances. Each release pins one radiod commit: the one the TLV tag table was generated from. It also pins one librtlsdr, the same on every suite, new enough for the RTL-SDR Blog V4 ([packaging.md](packaging.md#the-bundled-librtlsdr)).
@@ -151,7 +152,7 @@ The hardware report lists every profile of the package, each with its centre ran
 ## Hardening
 
 - Every receiver's radiod runs as the same user, `coaxhub-radiod`, from the one template unit, with USB access to the SDRs and `CAP_SYS_NICE`. A udev rule gives the RTL-SDRs to that user's group alone, and the package blacklists the `dvb_usb_rtl28xxu` kernel driver. Its network is limited to loopback and multicast.
-- `stationd.service` runs with `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, restricted address families (`AF_UNIX` is kept for the system bus), an empty capability bounding set and write access to `/var/lib/coaxhub` only. It waits for the clock to synchronise, because TLS would fail without it. It never runs as root. It reaches systemd over the system bus, and a polkit rule allows the `coaxhub` user to start, restart and stop the units matching `coaxhub-radiod@[0-9]+.service`, those three verbs only.
+- `stationd.service` runs with `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, restricted address families (`AF_UNIX` is kept for the helper's socket and the system bus), an empty capability bounding set and write access to `/var/lib/coaxhub` only. It waits for the clock to synchronise, because TLS would fail without it. It never runs as root and asks no polkit. It reads its receivers' units' state from systemd, which needs no authorization, and **starts, restarts and stops them through `coaxhub-helper`**: a small root program on a socket only the `coaxhub` user and root can connect to. The helper takes one line of at most 64 bytes, `start`, `restart` or `stop` and a receiver number (or `ping`), checks it against fixed rules and the peer's UID, and runs `systemctl --no-block <verb> coaxhub-radiod@<number>.service` and nothing else. It writes no file, reads none that stationd can write, has no network, and runs sandboxed with no capability, but the sandbox is not what limits it (root on systemd's private socket is root): the small, fuzzed parser and the fixed argument list are. It also refuses to start or restart a unit while 16 other receiver units are running ([packaging §4](packaging.md#coaxhub-helpersocket-and-coaxhub-helperservice)). Starting the receivers needs no polkit on any system.
 - `RestartPreventExitStatus=3` keeps a revoked or unenrolled station from restarting in a loop.
 
 ## The `stationd` commands
@@ -181,12 +182,12 @@ The hub cannot:
 - **Run a shell or any command.** There is no such request.
 - **Write files other than the station's own.** `stationd` writes radiod configs only from the package's templates with values it has checked, and its own state. It takes no configuration text and no paths.
 - **Reach the owner's network.** The hub sends nothing to be fetched, forwarded or connected to.
-- **Start any other unit.** The polkit rule names `coaxhub-radiod@<number>.service` and three verbs.
+- **Start any other unit.** The helper runs three verbs, on `coaxhub-radiod@<number>.service` only.
 - **Use an SDR, model or profile the package doesn't offer** for it. A Blog V4 can't be given a profile that hears nothing, and an SDR the table doesn't know can't be configured.
 - **Send a request the station doesn't know.** An unknown command or enum value is answered `UNSUPPORTED`.
 - **Read the key.** It never leaves the station.
 
-**Admin operations** are typed: `restart_stationd`, `restart_backend`, `update` and `reboot_host`. They are not implemented yet: whether and how they ship is not decided, and there is no allow-list for them on the station. `stationd` itself never runs as root: an operation that needs privilege would go through a separate helper that allows only those specific invocations. This repository does not yet ship that helper, so these operations are not available on an installed station.
+**Admin operations** are typed: `restart_stationd`, `restart_backend`, `update` and `reboot_host`. They are not implemented yet: whether and how they ship is not decided, and there is no allow-list for them on the station. `stationd` itself never runs as root: an operation that needs privilege would be a new verb of `coaxhub-helper`, the station's one privileged door, with its own fixed rules (there is no second helper). The helper has only the verbs above today, so these operations are not available on an installed station.
 
 **The owner keeps the last word on the computer.** `stationd` is GPL software they can read, change or stop, and `sudo apt remove coaxhub-stationd` ends it.
 

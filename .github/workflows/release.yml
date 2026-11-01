@@ -48,6 +48,7 @@ jobs:
       - name: Build the packages with the production root
         run: COAXHUB_ROOT_CA=packaging/roots/coaxhub-production.pem packaging/build-all.sh
       - run: packaging/test/test-packages.sh
+      - run: packaging/test/test-systemd.sh
       - run: packaging/test/test-installer.sh
       - name: Collect the assets
         run: |

@@ -168,7 +168,8 @@ pub enum Command {
         config: ConfigArg,
     },
     /// Render one receiver's radiod config from receivers.json (its unit
-    /// runs this before every start).
+    /// runs this before every start; with `--check` it only says whether the
+    /// config can be rendered, as the unit's `ExecCondition=`).
     BackendConfig {
         #[command(flatten)]
         #[allow(missing_docs)]
@@ -183,6 +184,11 @@ pub enum Command {
         /// The template directory (default: the package's).
         #[arg(long)]
         templates: Option<PathBuf>,
+        /// Render it and throw it away: exit 0 if the receiver is in
+        /// receivers.json and its config renders, else a refusal. Writes
+        /// and prints nothing.
+        #[arg(long, conflicts_with = "out")]
+        check: bool,
     },
     /// Validate stationd.toml, the credentials and the applied receivers,
     /// then exit (development builds).
@@ -456,10 +462,15 @@ pub fn backend_config(
     receiver: u32,
     out: Option<&Path>,
     templates: Option<&Path>,
+    check: bool,
 ) -> Result<Option<String>, CommandError> {
     let config = arg.load()?;
     let rx = backend_config::find(&config.receivers_path(), receiver, config.flavour.packaged)?;
     let dir = templates.map_or_else(|| config.flavour.templates_dir(), Path::to_path_buf);
+    if check {
+        backend_config::render_receiver(&dir, &rx)?;
+        return Ok(None);
+    }
     let out = out.map_or_else(|| backend_config::default_out(receiver), Path::to_path_buf);
     if out == Path::new("-") {
         return Ok(Some(backend_config::render_receiver(&dir, &rx)?));
@@ -538,7 +549,15 @@ pub fn main(command: Command, runtime: &tokio::runtime::Runtime) -> ExitCode {
             receiver,
             out,
             templates,
-        } => backend_config(&config, receiver, out.as_deref(), templates.as_deref()).map(|text| {
+            check,
+        } => backend_config(
+            &config,
+            receiver,
+            out.as_deref(),
+            templates.as_deref(),
+            check,
+        )
+        .map(|text| {
             if let Some(t) = text {
                 print!("{t}");
             }
@@ -610,8 +629,27 @@ mod tests {
                 config: ConfigArg::at(DEFAULT_CONFIG_PATH),
                 receiver: 11,
                 out: None,
-                templates: None
+                templates: None,
+                check: false
             }
+        );
+        let c = Cli::try_parse_from(["stationd", "backend-config", "--receiver", "11", "--check"])
+            .expect("check");
+        assert!(matches!(
+            c.command,
+            Command::BackendConfig { check: true, .. }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "stationd",
+                "backend-config",
+                "--receiver",
+                "11",
+                "--check",
+                "--out",
+                "-"
+            ])
+            .is_err()
         );
         assert!(Cli::try_parse_from(["stationd", "backend-config"]).is_err());
         assert!(Cli::try_parse_from(["stationd", "backend-config", "--receiver", "x"]).is_err());

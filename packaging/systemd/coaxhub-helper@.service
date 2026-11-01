@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# coaxhub-helper: one short-lived instance per connection on
+# coaxhub-helper.socket. It runs as root, because starting a unit takes root
+# (or polkit, which this package does not use). It reads one line from the socket, checks it
+# (docs/packaging.md §4: a verb of start, restart, stop or ping and a receiver
+# number, from the coaxhub user or root), runs `systemctl --no-block <verb>
+# coaxhub-radiod@<number>.service` and answers ok or the error.
+#
+# Root on systemd's private socket is root: this sandbox narrows what a
+# hijacked process could do by other means, but it is not what keeps the
+# helper to three verbs. That is the parser: one short line, a fixed argv, a
+# canonical number, the peer's UID checked first, no unsafe code.
+
+[Unit]
+Description=CoaxHub station helper (connection %i)
+Documentation=https://github.com/CoaxHub/stationd/blob/main/docs/packaging.md
+# An instance that is killed (RuntimeMaxSec) does not stay loaded as failed.
+CollectMode=inactive-or-failed
+
+[Service]
+ExecStart=/usr/lib/coaxhub/coaxhub-helper
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+RuntimeMaxSec=15
+
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectProc=invisible
+ProcSubset=pid
+InaccessiblePaths=-/etc/shadow -/etc/gshadow -/var/lib/coaxhub -/var/lib/coaxhub-radiod
+# AF_UNIX: the connection, and systemd's private socket. No network.
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+UMask=0077

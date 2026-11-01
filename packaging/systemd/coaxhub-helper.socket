@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# coaxhub-helper's socket: the door through which stationd (user coaxhub, no
+# capability) asks for the receivers' units to be started, restarted and
+# stopped. Each connection runs one coaxhub-helper@.service instance as root.
+# Only the coaxhub user and root can connect: the socket is root:coaxhub 0660,
+# and the helper checks the peer's UID again (SO_PEERCRED).
+#
+# No [Install] section: nobody enables this socket. stationd.service pulls it
+# in (Wants=), so enabling stationd is all an owner ever does.
+
+[Unit]
+Description=CoaxHub station helper socket (starts the receivers' units for stationd)
+Documentation=https://github.com/CoaxHub/stationd/blob/main/docs/packaging.md
+
+[Socket]
+ListenStream=/run/coaxhub-helper.sock
+SocketUser=root
+SocketGroup=coaxhub
+SocketMode=0660
+Accept=yes
+# At most 4 connections served at once (stationd asks one thing at a time).
+MaxConnections=4
+# systemd's own default, 200 connections in 2 s, set here so that it is
+# documented and tested: stationd never comes near it, and a socket that hits
+# it fails until stationd.service is restarted (which wants it again).
+TriggerLimitIntervalSec=2s
+TriggerLimitBurst=200
+RemoveOnStop=yes

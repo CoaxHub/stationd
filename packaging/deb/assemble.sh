@@ -6,7 +6,8 @@
 #
 # Usage: assemble.sh IN PKGSRC OUT
 #   IN      radiod/{radiod,rtlsdr.so,librtlsdr.so.0,presets.conf,ARCHOPTS} and
-#           stationd/{stationd,rust-crates.txt}, built by the earlier stages
+#           stationd/{stationd,coaxhub-helper,rust-crates.txt}, built by the
+#           earlier stages
 #   PKGSRC  packaging
 #   OUT     where the .deb goes
 # Environment: ARCH, SUITE, VERSION, COAXHUB_DOMAIN, KA9Q_COMMIT,
@@ -29,6 +30,9 @@ doc="${root}/usr/share/doc/${PACKAGE}"
 
 # ---------------------------------------------------------------- files
 install -D -m 0755 "${in}/stationd/stationd" "${root}/usr/bin/stationd"
+# The root helper stationd asks to start the receivers' units: not on PATH,
+# started by coaxhub-helper@.service for each connection on its socket.
+install -D -m 0755 "${in}/stationd/coaxhub-helper" "${root}/usr/lib/coaxhub/coaxhub-helper"
 install -D -m 0755 "${in}/radiod/radiod" "${root}/usr/lib/coaxhub/radiod/radiod"
 # rtlsdr.so finds the private librtlsdr.so.0 beside it through its RUNPATH.
 install -m 0644 "${in}/radiod/rtlsdr.so" "${in}/radiod/librtlsdr.so.0" "${in}/radiod/presets.conf" \
@@ -39,10 +43,8 @@ install -m 0644 "${src}/radiod-templates/rtlsdr.conf" "${src}/radiod-templates/r
     "${src}/radiod-templates/rtlsdr-v4.conf" "${root}/usr/share/coaxhub/radiod-templates/"
 install -d "${root}/usr/lib/systemd/system"
 install -m 0644 "${src}/systemd/stationd.service" "${src}/systemd/coaxhub-radiod@.service" \
+    "${src}/systemd/coaxhub-helper.socket" "${src}/systemd/coaxhub-helper@.service" \
     "${root}/usr/lib/systemd/system/"
-# What lets stationd (user coaxhub) start and stop the receivers' units.
-install -D -m 0644 "${src}/polkit/coaxhub-stationd.rules" \
-    "${root}/usr/share/polkit-1/rules.d/coaxhub-stationd.rules"
 install -D -m 0644 "${src}/udev/72-coaxhub-rtlsdr.rules" "${root}/usr/lib/udev/rules.d/72-coaxhub-rtlsdr.rules"
 install -D -m 0644 "${src}/modprobe/coaxhub-stationd.conf" "${root}/usr/lib/modprobe.d/coaxhub-stationd.conf"
 
@@ -73,7 +75,7 @@ chmod 0644 "${doc}/copyright"
 install -d -m 0755 "${root}/DEBIAN"
 install -m 0755 "${src}/deb/postinst" "${src}/deb/prerm" "${src}/deb/postrm" "${root}/DEBIAN/"
 
-# Shared-library dependencies of the four ELF objects, for the target
+# Shared-library dependencies of the five ELF objects, for the target
 # architecture (dpkg-shlibdeps wants a debian/control to exist). The private
 # librtlsdr.so.0 is in this package's tree (${root}, which has a DEBIAN
 # directory), where dpkg-shlibdeps finds it through rtlsdr.so's RUNPATH: it
@@ -87,6 +89,7 @@ printf 'Source: stationd\n\nPackage: %s\nArchitecture: any\n' "${PACKAGE}" \
     # rtlsdr.so has symbols no library defines: --warnings=0 silences that.
     dpkg-architecture -a"${ARCH}" -c dpkg-shlibdeps -O --warnings=0 \
         "${root}/usr/bin/stationd" \
+        "${root}/usr/lib/coaxhub/coaxhub-helper" \
         "${root}/usr/lib/coaxhub/radiod/radiod" \
         "${root}/usr/lib/coaxhub/radiod/rtlsdr.so" \
         "${root}/usr/lib/coaxhub/radiod/librtlsdr.so.0"
@@ -108,7 +111,7 @@ Version: ${VERSION}
 Architecture: ${ARCH}
 Maintainer: CoaxHub <packages@${COAXHUB_DOMAIN}>
 Installed-Size: ${installed_size}
-Depends: ${shlib_depends}, adduser, iproute2, polkitd | policykit-1
+Depends: ${shlib_depends}, adduser, iproute2, dbus | dbus-system-bus
 Recommends: systemd-timesyncd | time-daemon
 Section: hamradio
 Priority: optional
@@ -123,8 +126,9 @@ Description: CoaxHub station daemon with its bundled SDR receiver
  ${RTLSDR_VERSION} for RTL-SDR dongles (the RTL-SDR Blog V4 included), under
  /usr/lib/coaxhub/radiod. Each receiver's radiod runs as its own
  sandboxed service instance (coaxhub-radiod@<receiver>), started by
- stationd and configured from the receivers set up in the CoaxHub web app,
- and is not put on PATH.
+ stationd through a small root helper (coaxhub-helper, on a socket only
+ stationd and root can use; no polkit) and configured from the receivers set
+ up in the CoaxHub web app, and is not put on PATH.
  .
  Built for Debian ${SUITE} and the CoaxHub service at ${COAXHUB_DOMAIN}.
 CONTROL

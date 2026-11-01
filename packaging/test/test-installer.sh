@@ -6,14 +6,22 @@
 # container (in-container/installer.sh). Needs the amd64 and arm64 packages
 # in target/packages (packaging/build-all.sh); no bind mounts, no host ports.
 #
-# Usage: packaging/test/test-installer.sh [--quick]   (--quick: bookworm only)
+# Usage: packaging/test/test-installer.sh [--quick] [--suite bookworm|trixie]
+#        (--quick: bookworm only)
 
 export TEST_NAME=test-installer
 # shellcheck source-path=SCRIPTDIR source=lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 suites=(bookworm trixie)
-[[ "${1:-}" == --quick ]] && suites=(bookworm)
+while (($#)); do
+    case "$1" in
+    --quick) suites=(bookworm) ;;
+    --suite) suites=("${2:?bookworm|trixie}"); shift ;;
+    *) die "usage: $0 [--quick] [--suite bookworm|trixie]" ;;
+    esac
+    shift
+done
 run="coaxhub-insttest-$$"
 
 installer_test() {

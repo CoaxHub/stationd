@@ -34,9 +34,12 @@ check_eq "the package is installed" "install ok installed" \
 check "dpkg --verify: files match md5sums" test -z "$(dpkg --verify coaxhub-stationd 2>&1)"
 check_lacks "the suite's librtlsdr is not installed with it" "ok installed" \
     "$(dpkg-query -W -f='${Status}\n' 'librtlsdr*' 2>&1)"
-# stationd starts the receivers' units over the system bus, which polkit authorizes.
-check "polkit is installed with it (Depends: polkitd | policykit-1)" \
-    bash -c "dpkg-query -W -f='\${Status}' polkitd policykit-1 2>/dev/null | grep -q 'ok installed'"
+# stationd starts the receivers' units through coaxhub-helper; systemctl show
+# reads their state over the system bus, so the bus comes with it, polkit not.
+check_lacks "polkit is not installed with it" "ok installed" \
+    "$(dpkg-query -W -f='${Status}\n' polkitd policykit-1 2>&1)"
+check "the system bus is installed with it (Depends: dbus | dbus-system-bus)" \
+    bash -c "dpkg-query -W -f='\${Status}' dbus 2>/dev/null | grep -q 'ok installed'"
 
 # Users.
 for user in coaxhub coaxhub-radiod; do
@@ -57,7 +60,8 @@ check_eq "/var/lib/coaxhub/receivers is empty on a new station" "" "$(ls -A /var
 check_eq "/var/lib/coaxhub-radiod" "755 coaxhub-radiod coaxhub-radiod" "$(mode_owner /var/lib/coaxhub-radiod)"
 
 # Files and modes.
-for f in "755 /usr/bin/stationd" "755 /usr/lib/coaxhub/radiod/radiod" \
+for f in "755 /usr/bin/stationd" "755 /usr/lib/coaxhub/coaxhub-helper" \
+    "755 /usr/lib/coaxhub/radiod/radiod" \
     "644 /usr/lib/coaxhub/radiod/rtlsdr.so" "644 /usr/lib/coaxhub/radiod/librtlsdr.so.0" \
     "644 /usr/lib/coaxhub/radiod/presets.conf" \
     "644 /usr/share/coaxhub/radiod-templates/rtlsdr.conf" \
@@ -65,7 +69,8 @@ for f in "755 /usr/bin/stationd" "755 /usr/lib/coaxhub/radiod/radiod" \
     "644 /usr/share/coaxhub/radiod-templates/rtlsdr-v4.conf" \
     "644 /usr/lib/systemd/system/stationd.service" \
     "644 /usr/lib/systemd/system/coaxhub-radiod@.service" \
-    "644 /usr/share/polkit-1/rules.d/coaxhub-stationd.rules" \
+    "644 /usr/lib/systemd/system/coaxhub-helper.socket" \
+    "644 /usr/lib/systemd/system/coaxhub-helper@.service" \
     "644 /usr/lib/udev/rules.d/72-coaxhub-rtlsdr.rules" \
     "644 /usr/lib/modprobe.d/coaxhub-stationd.conf" \
     "644 /usr/share/doc/coaxhub-stationd/copyright"; do
@@ -73,6 +78,8 @@ for f in "755 /usr/bin/stationd" "755 /usr/lib/coaxhub/radiod/radiod" \
 done
 check "no development-only template (siggen)" test ! -e /usr/share/coaxhub/radiod-templates/siggen.conf
 check_not "radiod is not on PATH" command -v radiod
+check_not "coaxhub-helper is not on PATH" command -v coaxhub-helper
+check "no polkit rule is shipped" test ! -e /usr/share/polkit-1/rules.d/coaxhub-stationd.rules
 check "no coaxhub-radiod.service (only the template)" test ! -e /usr/lib/systemd/system/coaxhub-radiod.service
 check_eq "the package has no conffile" "" "$(dpkg-query -W -f='${Conffiles}' coaxhub-stationd)"
 check "the package ships nothing under /etc/coaxhub" test ! -e /etc/coaxhub
@@ -104,22 +111,38 @@ check_eq "stationd status exits 3 when not enrolled" 3 "$(exit_code stationd sta
 check_eq "stationd run exits 3 when not enrolled (as coaxhub)" 3 \
     "$(exit_code runuser -u coaxhub -- stationd run)"
 
-# ---------------------------------------------------------------- polkit
-# stationd (user coaxhub) starts, restarts and stops coaxhub-radiod@<digits>.service
-# over D-Bus, and nothing else. The rule is JavaScript run by polkitd, so it
-# is checked as text here (the container has no system bus).
-rule="$(cat /usr/share/polkit-1/rules.d/coaxhub-stationd.rules)"
-rule_code="$(grep -v '^[[:space:]]*//' <<<"${rule}")"
-check_eq "polkit rule: one rule" 1 "$(grep -c 'polkit.addRule' <<<"${rule_code}")"
-check_contains "polkit rule: the user coaxhub" 'subject.user == "coaxhub"' "${rule_code}"
-check_contains "polkit rule: the manage-units action" 'action.id == "org.freedesktop.systemd1.manage-units"' "${rule_code}"
-check_contains "polkit rule: the unit pattern" '/^coaxhub-radiod@[0-9]+\.service$/.test(action.lookup("unit"))' "${rule_code}"
-check_contains "polkit rule: exactly the three verbs" '["start", "stop", "restart"].indexOf(action.lookup("verb")) >= 0' "${rule_code}"
-check_eq "polkit rule: allows (YES) once" 1 "$(grep -c 'polkit.Result.YES' <<<"${rule_code}")"
-check_eq "polkit rule: no other result" 0 "$(grep -c 'polkit.Result.\(AUTH\|NO\|NOT_HANDLED\)\|return true' <<<"${rule_code}")"
-for other in reload kill enable disable "reload-or-restart" "try-restart" "reset-failed"; do
-    check_lacks "polkit rule: not the verb ${other}" "\"${other}\"" "${rule_code}"
-done
+# ---------------------------------------------------------------- helper
+# stationd (user coaxhub) asks coaxhub-helper, on its socket, to start, restart
+# and stop coaxhub-radiod@<digits>.service, and nothing else. What the helper
+# does with a request is tested under a real systemd (test-systemd.sh); here its
+# units are read as text, and the binary is started the way nothing should
+# start it.
+socket_unit="$(grep -v '^[[:space:]]*#' /usr/lib/systemd/system/coaxhub-helper.socket)"
+check_contains "helper socket: /run/coaxhub-helper.sock" "ListenStream=/run/coaxhub-helper.sock" "${socket_unit}"
+check_contains "helper socket: owner root" "SocketUser=root" "${socket_unit}"
+check_contains "helper socket: group coaxhub" "SocketGroup=coaxhub" "${socket_unit}"
+check_contains "helper socket: mode 0660" "SocketMode=0660" "${socket_unit}"
+check_contains "helper socket: one instance per connection" "Accept=yes" "${socket_unit}"
+check_contains "helper socket: at most 4 connections" "MaxConnections=4" "${socket_unit}"
+check_contains "helper socket: trigger limit interval" "TriggerLimitIntervalSec=2s" "${socket_unit}"
+check_contains "helper socket: trigger limit burst" "TriggerLimitBurst=200" "${socket_unit}"
+check_lacks "helper socket: nobody enables it (no [Install])" "[Install]" "${socket_unit}"
+helper_unit="$(grep -v '^[[:space:]]*#' /usr/lib/systemd/system/coaxhub-helper@.service)"
+check_contains "helper unit: runs the helper" "ExecStart=/usr/lib/coaxhub/coaxhub-helper" "${helper_unit}"
+check_contains "helper unit: the connection is its standard input" "StandardInput=socket" "${helper_unit}"
+check_contains "helper unit: no capability" $'CapabilityBoundingSet=\n' "${helper_unit}"$'\n'
+check_contains "helper unit: NoNewPrivileges" "NoNewPrivileges=yes" "${helper_unit}"
+check_contains "helper unit: the file system is read-only" "ProtectSystem=strict" "${helper_unit}"
+check_contains "helper unit: unix sockets only" "RestrictAddressFamilies=AF_UNIX" "${helper_unit}"
+check_contains "helper unit: a run time limit stationd waits longer than" "RuntimeMaxSec=15" "${helper_unit}"
+check_contains "helper unit: collected when it ends" "CollectMode=inactive-or-failed" "${helper_unit}"
+check_contains "helper unit: no network namespace access" "PrivateNetwork=yes" "${helper_unit}"
+check_contains "helper unit: no view of other processes" "ProtectProc=invisible" "${helper_unit}"
+check_lacks "helper unit: no [Install]" "[Install]" "${helper_unit}"
+# Started from a shell, not from its socket, it says so and does nothing.
+helper_out="$(/usr/lib/coaxhub/coaxhub-helper </dev/null 2>&1)"
+check_eq "coaxhub-helper without a socket exits 1" 1 "$(exit_code /usr/lib/coaxhub/coaxhub-helper </dev/null)"
+check_contains "coaxhub-helper without a socket says where it runs from" "coaxhub-helper.socket" "${helper_out}"
 
 # ---------------------------------------------------------------- backend-config
 # The applied receiver set, as stationd writes it after ConfigureReceivers
@@ -179,6 +202,16 @@ check_contains "rtlsdr-v4: the centre" "frequency = 14200000" "${rendered}"
 check_contains "rtlsdr-v4: its description" 'description = "RTL-SDR Blog V4"' "${rendered}"
 check_eq "a receiver that is not in receivers.json is refused (exit 2)" 2 \
     "$(exit_code stationd backend-config --receiver 99 --out -)"
+# --check is the unit's ExecCondition: the same verdict, no output, no file.
+check_eq "backend-config --check: a receiver in receivers.json passes" 0 \
+    "$(exit_code stationd backend-config --receiver 11 --check)"
+check_eq "backend-config --check prints nothing" "" "$(stationd backend-config --receiver 11 --check 2>&1)"
+check_eq "backend-config --check: an unknown receiver is refused (exit 2)" 2 \
+    "$(exit_code stationd backend-config --receiver 99 --check)"
+check_eq "backend-config --check: receiver 0 is refused (exit 2)" 2 \
+    "$(exit_code stationd backend-config --receiver 0 --check)"
+check_eq "backend-config --check and --out together are a usage error (exit 2)" 2 \
+    "$(exit_code stationd backend-config --receiver 11 --check --out -)"
 check_eq "receiver 0 is refused (exit 2)" 2 "$(exit_code stationd backend-config --receiver 0 --out -)"
 # A packaged build refuses the development-only siggen profile.
 put_receivers_json <<'JSON'
@@ -236,11 +269,11 @@ printf '# radiod without an SDR said:\n%s\n' "$(tail -n 5 <<<"${out}" | sed 's/^
 # ---------------------------------------------------------------- systemd
 if [[ "${MODE}" == with-systemd ]]; then
     # The template unit is verified through an instance of it.
-    for unit in stationd.service coaxhub-radiod@1.service; do
+    for unit in stationd.service coaxhub-radiod@1.service coaxhub-helper.socket coaxhub-helper@0-1.service; do
         check "systemd-analyze verify ${unit}" systemd-analyze verify "${unit}"
     done
-    # systemd's own exposure score (0 best, 10 worst); both are "OK" today.
-    for limit in "stationd.service 2.5" "coaxhub-radiod@1.service 4.5"; do
+    # systemd's own exposure score (0 best, 10 worst); all "OK" today.
+    for limit in "stationd.service 2.5" "coaxhub-radiod@1.service 4.5" "coaxhub-helper@0-1.service 3.0"; do
         read -r unit max <<<"${limit}"
         score="$(systemd-analyze security --offline=true "${unit}" 2>&1 |
             sed -n 's/.*Overall exposure level for .*: \([0-9.]*\) .*/\1/p')"
@@ -253,11 +286,15 @@ if [[ "${MODE}" == with-systemd ]]; then
     check_contains "stationd.service: RestartPreventExitStatus=3" "RestartPreventExitStatus=3" "${unit}"
     check_contains "stationd.service: after time-sync.target" "time-sync.target" "${unit}"
     check_lacks "stationd.service: does not depend on radiod" "coaxhub-radiod" "$(grep -v '^#' <<<"${unit}")"
-    check_contains "stationd.service: AF_UNIX stays for the system bus" \
+    check_contains "stationd.service: AF_UNIX stays for the helper's socket and the system bus" \
         "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK" "${unit}"
+    check_contains "stationd.service: wants the helper's socket" "Wants=coaxhub-helper.socket" "${unit}"
+    check_contains "stationd.service: after the helper's socket" "After=coaxhub-helper.socket" "${unit}"
     unit="$(cat /usr/lib/systemd/system/coaxhub-radiod@.service)"
     check_contains "coaxhub-radiod@.service: a runtime directory per receiver" \
         "RuntimeDirectory=coaxhub-radiod/%i" "${unit}"
+    check_contains "coaxhub-radiod@.service: a receiver with no renderable config is not started or retried" \
+        "ExecCondition=/usr/bin/stationd backend-config --receiver %i --check" "${unit}"
     check_contains "coaxhub-radiod@.service: renders the receiver's config first" \
         "ExecStartPre=/usr/bin/stationd backend-config --receiver %i" "${unit}"
     check_contains "coaxhub-radiod@.service: starts radiod on that config" \
@@ -293,7 +330,8 @@ check "apt-get remove" apt_quiet remove coaxhub-stationd
 check "remove: stationd is gone" test ! -e /usr/bin/stationd
 check "remove: /usr/lib/coaxhub is gone" test ! -e /usr/lib/coaxhub
 check "remove: the units are gone" test ! -e /usr/lib/systemd/system/stationd.service
-check "remove: the polkit rule is gone" test ! -e /usr/share/polkit-1/rules.d/coaxhub-stationd.rules
+check "remove: the helper is gone" test ! -e /usr/lib/coaxhub/coaxhub-helper
+check "remove: the helper's units are gone" test ! -e /usr/lib/systemd/system/coaxhub-helper.socket
 check_eq "remove: the credentials stay" marker "$(cat /var/lib/coaxhub/stationd/key.pem 2>&1)"
 check_eq "remove: the receiver set stays" "${receivers_before}" "$(cat /var/lib/coaxhub/receivers/receivers.json 2>&1)"
 check "remove: the users stay" getent passwd coaxhub
@@ -304,7 +342,8 @@ check_eq "purge: dpkg forgets the package" "" "$(dpkg-query -W -f='${Status}' co
 for path in /etc/coaxhub /var/lib/coaxhub /var/lib/coaxhub/receivers /var/lib/coaxhub-radiod \
     /usr/lib/coaxhub /usr/share/coaxhub /usr/share/doc/coaxhub-stationd /run/coaxhub-radiod \
     /usr/lib/udev/rules.d/72-coaxhub-rtlsdr.rules /usr/lib/modprobe.d/coaxhub-stationd.conf \
-    /usr/share/polkit-1/rules.d/coaxhub-stationd.rules; do
+    /usr/lib/systemd/system/coaxhub-helper.socket /usr/lib/systemd/system/coaxhub-helper@.service \
+    /run/coaxhub-helper.sock; do
     check "purge: ${path} is gone" test ! -e "${path}"
 done
 for name in coaxhub coaxhub-radiod; do

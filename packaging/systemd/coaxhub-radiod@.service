@@ -3,7 +3,7 @@
 # The bundled ka9q-radio radiod of one receiver: coaxhub-radiod@<receiver_id>.service.
 # Its config is rendered from the receiver's profile and receivers.json before
 # every start; it is never edited by hand. stationd starts, restarts and stops
-# the instances over D-Bus (the polkit rule); nothing enables them.
+# the instances through coaxhub-helper; nothing enables them.
 # Only stationd talks to it, over multicast on the loopback interface.
 
 [Unit]
@@ -22,6 +22,12 @@ StateDirectoryMode=0755
 # flag on lo; without it radiod exits (radiod notes §2). `+`: this one
 # command runs as root, outside the sandbox below.
 ExecStartPre=+ip link set dev lo multicast on
+# A receiver that is not in receivers.json, or whose config cannot be rendered,
+# is not started, and not retried: ExecCondition= ends a start without
+# failing the unit, and Restart=on-failure does not restart it. (Without it, a
+# request for an id the station does not have would fail the renderer every
+# 5 s for ever.) The renderer is the same program, run as this unit's user.
+ExecCondition=/usr/bin/stationd backend-config --receiver %i --check
 # Render this receiver's radiod.conf from its profile's template and
 # receivers.json (the serial, the centre, the settings and the multicast
 # groups of its slot).

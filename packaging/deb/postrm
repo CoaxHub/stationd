@@ -5,7 +5,8 @@
 # applied receiver set and the users, so reinstalling needs no new enrollment
 # and the receivers start again. `purge` removes all of them:
 # /var/lib/coaxhub (the station key and certificate, and receivers/),
-# /var/lib/coaxhub-radiod, the users, and stationd's enablement.
+# /var/lib/coaxhub-radiod, the users, and stationd's enablement. The
+# helper's socket has no enablement link: nobody enables it.
 set -e
 
 TIME_WAIT_MARKER=/var/lib/coaxhub/.enabled-time-wait-sync
@@ -40,6 +41,7 @@ purge)
 		systemctl disable --quiet systemd-time-wait-sync.service 2>/dev/null || true
 	fi
 	rm -rf /var/lib/coaxhub /var/lib/coaxhub-radiod /run/coaxhub /run/coaxhub-radiod
+	rm -f /run/coaxhub-helper.sock
 	remove_system_user coaxhub
 	remove_system_user coaxhub-radiod
 	if [ -d /run/systemd/system ]; then

@@ -9,10 +9,14 @@
 # - Enables systemd-time-wait-sync.service, which stationd.service waits for.
 # - Applies the udev rule to RTL-SDR dongles already plugged in.
 # - On upgrade, restarts the units that were running (stationd and the
-#   coaxhub-radiod@ instances). On a fresh install it starts and enables
-#   nothing: the station is not enrolled yet, and stationd would exit 3. The
-#   installer (or the owner) enrolls it and enables stationd.service; stationd
-#   starts the instances.
+#   coaxhub-radiod@ instances), after restarting coaxhub-helper.socket if it
+#   is active (a changed socket unit applies now) and starting it when
+#   stationd runs (stationd.service wants it, and 0.2.x did not know it). A
+#   0.2.x package's polkit rule is removed: nothing uses polkit any more. On a
+#   fresh install it starts and enables nothing: the station is not enrolled
+#   yet, and stationd would exit 3. The installer (or the owner) enrolls it and
+#   enables stationd.service; stationd pulls in the helper's socket and starts
+#   the instances through it.
 set -e
 
 UNITS="stationd.service coaxhub-radiod@*.service"
@@ -71,9 +75,25 @@ configure)
 		echo "coaxhub-stationd: it is now blacklisted; run 'sudo rmmod dvb_usb_rtl28xxu' or reboot." >&2
 	fi
 
+	if [ -n "$2" ]; then
+		# An upgrade from 0.2.x: dpkg removes its polkit rule (the package no
+		# longer ships it); make sure of it.
+		rm -f /usr/share/polkit-1/rules.d/coaxhub-stationd.rules
+	fi
+
 	if systemd_running; then
 		systemctl daemon-reload || true
 		if [ -n "$2" ]; then
+			# The helper's socket first: the new stationd asks it at once. An
+			# upgrade from a version that has the helper restarts an active
+			# socket, so that a changed socket unit (mode, group, limits)
+			# applies now and not at the next boot; the gap is milliseconds.
+			systemctl try-restart coaxhub-helper.socket || true
+			# From 0.2.x, which did not know it: start it when stationd runs.
+			# (On a restart of stationd.service, Wants= would start it too.)
+			if systemctl is-active --quiet stationd.service; then
+				systemctl start coaxhub-helper.socket || true
+			fi
 			# Upgrade: restart what was running, nothing else. UNITS is a
 			# list with a pattern: systemctl matches it against the loaded
 			# units, so the shell splits the list but must not expand it

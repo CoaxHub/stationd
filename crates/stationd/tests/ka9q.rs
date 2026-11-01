@@ -404,6 +404,7 @@ async fn doctor_checks_radiod_the_sdrs_and_the_receivers() {
         usb_devices: Some(usb.clone()),
         now_unix_s: 0,
         timeout,
+        ..Environment::default()
     };
     let level = |checks: &[doctor::Check], name: &str| {
         checks

@@ -12,14 +12,24 @@
 #      paths, stationd and radiod checks, systemd-analyze verify, reinstall,
 #      remove and purge.
 #
-# Usage: packaging/test/test-packages.sh [--quick]   (--quick: bookworm only)
+# The same package under a real systemd is test-systemd.sh.
+#
+# Usage: packaging/test/test-packages.sh [--quick] [--suite bookworm|trixie]
+#        (--quick: bookworm only)
 
 export TEST_NAME=test-packages
 # shellcheck source-path=SCRIPTDIR source=lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 suites=(bookworm trixie)
-[[ "${1:-}" == --quick ]] && suites=(bookworm)
+while (($#)); do
+    case "$1" in
+    --quick) suites=(bookworm) ;;
+    --suite) suites=("${2:?bookworm|trixie}"); shift ;;
+    *) die "usage: $0 [--quick] [--suite bookworm|trixie]" ;;
+    esac
+    shift
+done
 run="coaxhub-pkgtest-$$"
 
 artefacts() {

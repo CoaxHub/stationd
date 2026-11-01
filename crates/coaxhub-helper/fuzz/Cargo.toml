@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# cargo-fuzz targets for coaxhub-helper (the request parser of the root helper).
+# Nightly only: run with `scripts/fuzz.sh [seconds]`.
+# Its own workspace, so the stable station workspace never builds it.
+[package]
+name = "coaxhub-helper-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-only"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+coaxhub-helper = { path = ".." }
+libfuzzer-sys = "0.4.13"
+
+[[bin]]
+name = "request"
+path = "fuzz_targets/request.rs"
+test = false
+doc = false
+bench = false

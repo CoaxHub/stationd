@@ -61,7 +61,7 @@ use crate::measure::StopReason;
 use crate::profile::ProfileId;
 
 pub use self::store::{Model, StoredReceiver, StoredSet};
-pub use self::units::{ExternalUnits, FakeUnits, Systemd, UnitState, Units};
+pub use self::units::{CallError, ExternalUnits, FakeUnits, Helper, Systemd, UnitState, Units};
 
 use v1::ReceiverState as State;
 
@@ -217,11 +217,12 @@ pub struct Driver {
 }
 
 impl Driver {
-    /// The bundled radiod under systemd, as a packaged station runs.
+    /// The bundled radiod under systemd, started through `coaxhub-helper`,
+    /// as a packaged station runs it.
     pub fn bundled() -> Self {
         Self {
             backends: Arc::new(Ka9qBackends::default()),
-            units: Arc::new(Systemd::default()),
+            units: Arc::new(Helper::default()),
         }
     }
 

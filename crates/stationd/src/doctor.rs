@@ -8,6 +8,7 @@
 //! | `enrollment` | the credentials are missing or unusable |
 //! | `sdrs` | never: the SDRs it sees, a warning when there is no RTL-SDR (a station runs without one until it arrives) |
 //! | `receivers` | `receivers.json` is unusable; a warning per receiver whose SDR is missing |
+//! | `helper` | `coaxhub-helper` (the root helper that starts the receivers' units) does not answer `ping` on its socket (a warning when this user may not use the socket: run doctor with `sudo`); skipped for the fake and external backends |
 //! | `radiod` | a receiver's radiod does not answer on its slot's status group within 3 s |
 //! | `enroll` | DNS or the TLS handshake with the enrollment service fails, against the `CoaxHub` root (a warning once enrolled) |
 //! | `station-api` | the mTLS handshake with `StationControl` fails, against the gateway CA bundle (a warning: the station keeps running on its stored assignment, and renewal retries) |
@@ -31,7 +32,7 @@ use crate::hardware::{self, Hardware};
 use crate::local_status::{
     self, RuntimeStatus, describe_receiver, describe_skew, format_duration, format_utc,
 };
-use crate::receivers::StoredSet;
+use crate::receivers::{CallError, Helper, StoredSet};
 use crate::tls::{self, Connector};
 
 /// The outcome of one check.
@@ -89,6 +90,8 @@ pub struct Environment {
     /// The USB devices; `None`: the configuration's
     /// (`/sys/bus/usb/devices`).
     pub usb_devices: Option<PathBuf>,
+    /// The root helper's socket; `None`: `/run/coaxhub-helper.sock`.
+    pub helper_socket: Option<PathBuf>,
     /// Now, Unix seconds.
     pub now_unix_s: i64,
     /// Per network check.
@@ -99,6 +102,7 @@ impl Default for Environment {
     fn default() -> Self {
         Self {
             usb_devices: None,
+            helper_socket: None,
             now_unix_s: crate::local_status::unix_now(),
             timeout: Duration::from_secs(3),
         }
@@ -148,6 +152,7 @@ pub async fn run_config(config: &Config, source: &str, env: &Environment) -> Vec
         }
         Err(e) => out.push(check("receivers", Level::Fail, e.to_string())),
     }
+    out.push(helper(&config.backend, env).await);
     out.push(enroll_endpoint(config, creds.is_some(), env.timeout).await);
     out.extend(mtls_checks(config, creds.as_ref(), env.timeout).await);
     out.push(clock(creds.as_ref(), env.now_unix_s));
@@ -247,6 +252,59 @@ fn receivers(set: &StoredSet, hw: &Hardware, daemon: Option<&RuntimeStatus>) -> 
             check("receivers", level, detail)
         })
         .collect()
+}
+
+/// Whether `coaxhub-helper` answers `ping`: the door `stationd` starts the
+/// receivers' units through (packaging.md §4).
+async fn helper(backend: &BackendConfig, env: &Environment) -> Check {
+    if !matches!(backend, BackendConfig::Bundled) {
+        return check(
+            "helper",
+            Level::Skip,
+            "fake or external backend (development)",
+        );
+    }
+    let units = env
+        .helper_socket
+        .as_deref()
+        .map_or_else(Helper::default, Helper::at);
+    let socket = units.socket.display().to_string();
+    let answer = tokio::time::timeout(env.timeout, units.ping())
+        .await
+        .unwrap_or_else(|_| {
+            Err(CallError {
+                text: "coaxhub-helper timed out".to_owned(),
+                denied: false,
+            })
+        });
+    let Err(why) = answer else {
+        return check("helper", Level::Pass, format!("answers on {socket}"));
+    };
+    let denied = why.denied;
+    let why = why.text;
+    let why = why.trim_end_matches("; run sudo stationd doctor");
+    if denied {
+        return check(
+            "helper",
+            Level::Warn,
+            format!(
+                "this user may not use {socket} (only root and the coaxhub user may); run \
+                 `sudo stationd doctor`"
+            ),
+        );
+    }
+    let mut detail = format!("the helper does not answer: {why}");
+    if env.helper_socket.is_none() {
+        if let Ok(state) = units
+            .systemd
+            .property("coaxhub-helper.socket", "ActiveState")
+            .await
+        {
+            let _ = write!(detail, "; coaxhub-helper.socket is {state}");
+        }
+    }
+    detail.push_str("; without it no receiver can start. Fix: sudo systemctl restart stationd");
+    check("helper", Level::Fail, detail)
 }
 
 /// Probes each receiver's radiod.
@@ -587,6 +645,45 @@ mod tests {
         assert_eq!(off.level, Level::Warn, "never a failure");
         assert!(off.detail.contains("90.0 s behind"), "{}", off.detail);
         assert!(off.detail.contains("1970-01-01"), "{}", off.detail);
+    }
+
+    #[tokio::test]
+    async fn helper_checks() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let socket = tmp.path().join("helper.sock");
+        let env = Environment {
+            helper_socket: Some(socket.clone()),
+            timeout: Duration::from_millis(500),
+            ..Environment::default()
+        };
+        let config = BackendConfig::Bundled;
+        // Not a bundled station: nothing to check.
+        assert_eq!(helper(&BackendConfig::Fake, &env).await.level, Level::Skip);
+        // No socket: the fix is named.
+        let c = helper(&config, &env).await;
+        assert_eq!(c.level, Level::Fail, "{c}");
+        assert!(c.detail.contains("does not answer"), "{c}");
+        assert!(c.detail.contains("helper.sock"), "{c}");
+        assert!(c.detail.contains("sudo systemctl restart stationd"), "{c}");
+        assert!(!c.detail.contains("run sudo stationd doctor"), "{c}");
+        // A helper that answers ping.
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        let server = std::thread::spawn(move || {
+            use std::io::{BufRead as _, BufReader, Write as _};
+            for stream in listener.incoming().take(1) {
+                let mut stream = stream.expect("accept");
+                let mut line = String::new();
+                BufReader::new(&stream).read_line(&mut line).expect("line");
+                assert_eq!(line, "ping\n");
+                if stream.write_all(b"ok\n").is_err() {
+                    return;
+                }
+            }
+        });
+        let c = helper(&config, &env).await;
+        assert_eq!(c.level, Level::Pass, "{c}");
+        assert!(c.detail.contains("helper.sock"), "{c}");
+        server.join().expect("server");
     }
 
     #[test]

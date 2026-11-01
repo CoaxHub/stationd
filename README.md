@@ -7,7 +7,7 @@ stationd is the station daemon of [CoaxHub](https://coaxhub.com). It connects an
 **To run a station, see [coaxhub.com/docs/station](https://coaxhub.com/docs/station).** This repository is for building, changing and packaging the software. It holds everything on the station side:
 
 - the **station protocol**, `proto/` and `crates/station-proto/` (MIT): the wire format that the hub and any station implementation build against, with the validation both sides share;
-- **stationd**, `crates/stationd/`, its backend trait, `crates/station-backend/`, and the radiod backend, `crates/backend-ka9q/` (GPL-3.0-only);
+- **stationd**, `crates/stationd/`, its backend trait, `crates/station-backend/`, the radiod backend, `crates/backend-ka9q/`, and `coaxhub-helper`, `crates/coaxhub-helper/`, the root helper through which stationd starts the receivers' units (GPL-3.0-only);
 - **station-conformance**, `crates/station-conformance/` (MIT): a scripted fake hub for testing a station implementation;
 - the Debian package `coaxhub-stationd` (`packaging/`) and the installer (`installer/`), GPL-3.0-only;
 - `scripts/`: radiod built at its pinned commit, the end-to-end runs, fuzzing and the license-boundary check;

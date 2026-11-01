@@ -29,12 +29,13 @@ Files: *
 Copyright: CoaxHub contributors
 License: GPL-3.0-only
 
-Files: usr/bin/stationd
+Files: usr/bin/stationd usr/lib/coaxhub/coaxhub-helper
 Copyright: CoaxHub contributors, and the authors of the crates below
 License: GPL-3.0-only
 Comment:
  stationd statically links these Rust crates (name, version, licence
- expression); each crate's licence is compatible with GPL-3.0-only:
+ expression), and coaxhub-helper a few of them; each crate's licence is
+ compatible with GPL-3.0-only:
 @RUST_CRATES@
 
 Files: usr/lib/coaxhub/radiod/*

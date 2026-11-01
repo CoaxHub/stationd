@@ -18,7 +18,9 @@
 #              the package's private paths compiled in; its rtlsdr.so links
 #              the private librtlsdr, found through its RUNPATH
 #   stationd   stationd --features packaged (named context `rootca` holds
-#              the root certificate built into the binary)
+#              the root certificate built into the binary), and
+#              coaxhub-helper, the root helper on a socket that starts the
+#              receivers' units for it
 #   package    packaging/deb/assemble.sh: the file tree, maintainer
 #              scripts, Depends from dpkg-shlibdeps, dpkg-deb
 #   export     just the .deb, for `docker build --output type=local`
@@ -168,9 +170,11 @@ RUN --mount=type=cache,id=coaxhub-cargo-registry,target=/usr/local/cargo/registr
            AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar \
            COAXHUB_DOMAIN="${COAXHUB_DOMAIN}" COAXHUB_ROOT_CA=/rootca/root.pem; \
     cargo build --release --locked -p stationd --features packaged --target "${triple}"; \
+    cargo build --release --locked -p coaxhub-helper --target "${triple}"; \
     mkdir -p /out; \
     install -m 0755 "target/${triple}/release/stationd" /out/stationd; \
-    "${cross}strip" /out/stationd; \
+    install -m 0755 "target/${triple}/release/coaxhub-helper" /out/coaxhub-helper; \
+    "${cross}strip" /out/stationd /out/coaxhub-helper; \
     # The crates linked into the binary, for the copyright file.
     cargo tree --locked -p stationd --features packaged --target "${triple}" -e normal \
       --prefix none --format '{p} {l}' | sed 's/ (\/build[^)]*)//; s/ (\*)$//' | sort -u > /out/rust-crates.txt

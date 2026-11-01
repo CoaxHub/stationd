@@ -6,6 +6,8 @@
 # and package sizes. Takes the same environment as build-deb.sh
 # (COAXHUB_DOMAIN and COAXHUB_ROOT_CA are required).
 #
+# ARCHES (default "amd64 arm64") limits the architectures built.
+#
 # Usage: packaging/build-all.sh
 
 set -euo pipefail
@@ -14,7 +16,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 packages="${here}/../target/packages"
 summary=()
 for suite in bookworm trixie; do
-    for arch in amd64 arm64; do
+    for arch in ${ARCHES:-amd64 arm64}; do
         start="$(date +%s)"
         "${here}/build-deb.sh" --suite "${suite}" --arch "${arch}"
         deb="$(ls "${packages}/${suite}"/coaxhub-stationd_*_"${arch}".deb)"

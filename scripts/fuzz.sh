@@ -4,7 +4,8 @@
 # Runs every cargo-fuzz target of the station workspace for N seconds each
 # (station-protocol §10): in coaxhub-station-proto, protobuf decoding + hub
 # validator, waterfall decompression and certificate identity; in
-# backend-ka9q, the radiod TLV decoder. CI calls this; it also works locally
+# backend-ka9q, the radiod TLV decoder; in coaxhub-helper, the root helper's
+# request parser. CI calls this; it also works locally
 # locally.
 #
 # Usage: scripts/fuzz.sh [seconds-per-target]     (default 60)
@@ -40,12 +41,13 @@ extra=()
 if [[ "$jobs" -gt 1 ]]; then
     extra+=(-jobs="$jobs" -workers="$jobs")
 fi
-targets="${FUZZ_TARGETS:-station_message waterfall_decompress identity tlv_status}"
+targets="${FUZZ_TARGETS:-station_message waterfall_decompress identity tlv_status request}"
 
 # The crate whose fuzz/ directory holds a target.
 crate_of() {
     case "$1" in
         tlv_status) echo backend-ka9q ;;
+        request) echo coaxhub-helper ;;
         *) echo station-proto ;;
     esac
 }
