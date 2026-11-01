@@ -20,7 +20,9 @@
 # The container recipe: no --privileged, no host device and no udev:
 #   --cgroupns=private --cap-add SYS_ADMIN -e container=docker, tmpfs on /run,
 #   /run/lock and /tmp, and an entrypoint that remounts /sys/fs/cgroup
-#   read-write before exec'ing systemd. The image has systemd and dbus, no
+#   read-write before exec'ing systemd. --security-opt apparmor=unconfined lets
+#   that remount through on AppArmor hosts (Ubuntu, GitHub's runners), whose
+#   docker-default profile denies mount; elsewhere it changes nothing. The image has systemd and dbus, no
 #   polkit, and no /usr/sbin/policy-rc.d (which would stop the package from
 #   starting anything).
 #
@@ -71,7 +73,8 @@ DOCKERFILE
 # start_systemd NAME SUITE: a container with systemd as init, booted.
 start_systemd() {
     local name="$1" suite="$2"
-    docker run -d --name "${name}" --cgroupns=private --cap-add SYS_ADMIN -e container=docker \
+    docker run -d --name "${name}" --cgroupns=private --cap-add SYS_ADMIN \
+        --security-opt apparmor=unconfined -e container=docker \
         --tmpfs /run --tmpfs /run/lock --tmpfs /tmp "coaxhub-systemd-test:${suite}" >/dev/null
     CONTAINERS+=("${name}")
     for _ in $(seq 1 60); do
