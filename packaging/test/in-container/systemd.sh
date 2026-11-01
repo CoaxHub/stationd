@@ -44,6 +44,9 @@ prop() { systemctl show -P "$2" "$1" 2>&1; }
 is_active() { [[ "$(prop "$1" ActiveState)" == active ]]; }
 is_inactive() { [[ "$(prop "$1" ActiveState)" == inactive ]]; }
 is_failed() { [[ "$(prop "$1" ActiveState)" == failed ]]; }
+# runs_stub UNIT: its main process has exec'd the stub. A Type=simple unit is
+# active from the fork, while the child is still systemd's "(sleep)".
+runs_stub() { [[ "$(ps -o comm= -p "$(prop "$1" MainPID)")" == sleep ]]; }
 invocation() { prop "$1" InvocationID; }
 # The receivers' units that exist, and their states.
 radiod_units() { systemctl list-units 'coaxhub-radiod@*' --all --plain --no-legend 2>&1 | awk '{print $1, $3, $4}'; }
@@ -247,8 +250,7 @@ SB
     check_eq "start 11 answered ok" $'ok\n[exit 0]' "$(section start-11 "${out}")"
     check "receiver 11's unit is active" wait_for 10 is_active coaxhub-radiod@11.service
     check_eq "receiver 11 runs as coaxhub-radiod" coaxhub-radiod "$(prop coaxhub-radiod@11.service User)"
-    check_eq "receiver 11's main process is the stub" "/bin/sleep" \
-        "$(ps -o comm= -p "$(prop coaxhub-radiod@11.service MainPID)" | sed 's|^|/bin/|')"
+    check "receiver 11's main process is the stub" wait_for 10 runs_stub coaxhub-radiod@11.service
     inv1="$(invocation coaxhub-radiod@11.service)"
     check "receiver 11 has an invocation" test -n "${inv1}"
 
