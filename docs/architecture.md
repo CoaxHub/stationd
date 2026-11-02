@@ -162,7 +162,7 @@ In a packaged build there is no `--config`. A development build takes `--config`
 - `run`: serves until SIGTERM or SIGINT; a connected station then sends `Event{SHUTTING_DOWN}`, closes the stream and exits 0.
 - `enroll [--token chs_enr_…] [--force]`: generates the key, sends a CSR and the token to the enrollment service and stores the credentials; it refuses an enrolled station without `--force`.
 - `status [--json]`: the enrollment, the certificate and the daemon's state, from `status.json`.
-- `doctor`: checks the credentials and the endpoints, lists the SDRs it sees and reports each receiver's state from the applied set, so a station without its tunnel still explains itself.
+- `doctor`: checks the credentials and the endpoints, lists the SDRs it sees and reports each receiver's state from the applied set, so a station without its tunnel still explains itself. For each RTL-SDR it names the programs that have its USB device open (`/proc/<pid>/fd` against `/dev/bus/usb/<bus>/<device>`) and the kernel driver bound to it (the DVB-T driver `dvb_usb_rtl28xxu`); Linux shows only the caller's own processes, so as a user it says plainly how many other users' processes it could not inspect, and `sudo stationd doctor` sees them all.
 - `unenroll`: deletes the credentials and the assignment, keeps the applied receiver set (`receivers.json`).
 - `backend-config --receiver ID [--out PATH|-] [--templates DIR]`: renders that receiver's radiod config from `receivers.json`. The receiver's unit runs it before every start.
 - `check-config` (development builds only): validates the config file and the credentials without contacting radiod.

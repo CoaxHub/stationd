@@ -15,8 +15,9 @@
 //!     backend answers (`Backend::capabilities`);
 //!   - `RUNNING` while its unit runs the same invocation;
 //!   - `FAILED` when its unit failed or stopped, its backend could not be
-//!     created, or its SDR doesn't offer its model and profile, with the
-//!     reason;
+//!     created, its SDR doesn't offer its model and profile, or its radiod
+//!     keeps stopping in a restart loop ([`RESTARTS_BEFORE_FAILED`]: an SDR
+//!     another program holds, [`RADIOD_CANNOT_OPEN_SDR`]), with the reason;
 //!   - `NO_DEVICE` while its SDR is not on the bus (its unit stopped); it
 //!     starts by itself when the SDR is plugged in.
 //!
@@ -39,7 +40,7 @@
 pub mod store;
 pub mod units;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -61,9 +62,34 @@ use crate::measure::StopReason;
 use crate::profile::ProfileId;
 
 pub use self::store::{Model, StoredReceiver, StoredSet};
-pub use self::units::{CallError, ExternalUnits, FakeUnits, Helper, Systemd, UnitState, Units};
+pub use self::units::{
+    CallError, ExternalUnits, FakeUnits, Helper, RestartLoop, Systemd, UnitState, Units,
+};
 
 use v1::ReceiverState as State;
+
+/// How many times in a row a receiver's radiod may stop and be restarted
+/// by its unit, without once answering, before the receiver is `FAILED`.
+///
+/// A restart takes `RestartSec=5` plus the second radiod needs to fail, so
+/// three is about 20 s: a radiod that fails once on a USB reset, or twice
+/// while another receiver's instance starts, recovers well before it; an SDR
+/// another program holds does not, and the owner then sees the reason within
+/// half a minute instead of `STARTING` for ever. The unit keeps restarting
+/// meanwhile, so the receiver runs again by itself when the SDR is free.
+pub const RESTARTS_BEFORE_FAILED: u32 = 3;
+
+/// radiod's exit status (`EX_NOINPUT`, sysexits.h) when its front end can't
+/// be opened (`rtlsdr_open` failed: the SDR is held by another program, the
+/// user may not use it, no SDR has the serial) or stops streaming.
+pub const EXIT_NO_INPUT: i32 = 66;
+
+/// A receiver's `detail` when its radiod exits with [`EXIT_NO_INPUT`]
+/// restart after restart: it cannot open the SDR, most often because
+/// another program holds it. Plain words for the owner; `stationd doctor`
+/// names the program.
+pub const RADIOD_CANNOT_OPEN_SDR: &str =
+    "radiod cannot open the SDR; another program on this computer may be using it";
 
 // ------------------------------------------------------------------ backends
 
@@ -109,6 +135,7 @@ impl BackendFactory for Ka9qBackends {
 #[derive(Clone, Default)]
 pub struct FakeBackends {
     made: Arc<Mutex<HashMap<u32, FakeBackend>>>,
+    silent: Arc<Mutex<HashSet<u32>>>,
     wall_clock: Option<station_backend::fake::WallClock>,
 }
 
@@ -127,6 +154,23 @@ impl FakeBackends {
     pub fn with_wall_clock(mut self, clock: station_backend::fake::WallClock) -> Self {
         self.wall_clock = Some(clock);
         self
+    }
+
+    /// Makes the backends of receiver `id`, the ones made from now on and
+    /// the one made last, not answer `capabilities` (a radiod that is up
+    /// but not serving), or answer again.
+    pub fn set_silent(&self, id: u32, silent: bool) {
+        {
+            let mut set = self.silent.lock().unwrap_or_else(PoisonError::into_inner);
+            if silent {
+                set.insert(id);
+            } else {
+                set.remove(&id);
+            }
+        }
+        if let Some(backend) = self.get(id) {
+            backend.set_unreachable(silent);
+        }
     }
 
     /// The backend made last for receiver `id`.
@@ -167,6 +211,14 @@ impl BackendFactory for FakeBackends {
         let mut backend = FakeBackend::new(Self::config(rx));
         if let Some(clock) = &self.wall_clock {
             backend = backend.with_wall_clock(Arc::clone(clock));
+        }
+        if self
+            .silent
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&rx.receiver_id)
+        {
+            backend.set_unreachable(true);
         }
         self.made
             .lock()
@@ -318,6 +370,13 @@ struct Rx {
     invocation: Option<String>,
     forward: Option<AbortHandle>,
     cpu: Option<(u64, std::time::Instant)>,
+    /// The unit's automatic restarts when it last ran (or was started by
+    /// request); the ones after it are the consecutive failures.
+    restarts_base: u32,
+    /// A run of its radiod ended with [`EXIT_NO_INPUT`] since it last ran.
+    saw_no_input: bool,
+    /// `FAILED` because its unit is in a restart loop.
+    looping: bool,
 }
 
 impl Rx {
@@ -332,6 +391,9 @@ impl Rx {
             invocation: None,
             forward: None,
             cpu: None,
+            restarts_base: 0,
+            saw_no_input: false,
+            looping: false,
         }
     }
 
@@ -582,6 +644,9 @@ impl Receivers {
             let old = rx.state;
             rx.state = state;
             rx.detail = truncate_utf8(detail, limits::MAX_DETAIL_BYTES);
+            if state != State::Failed {
+                rx.looping = false;
+            }
             old
         };
         if old == state {
@@ -703,14 +768,80 @@ impl Receivers {
             self.set_state(id, state, &detail);
             return;
         }
+        // A start by request resets the init system's restart counter.
+        if let Some(rx) = self.shared().get(id) {
+            rx.restarts_base = 0;
+            rx.saw_no_input = false;
+            rx.looping = false;
+        }
         let asked = if restart {
             units.restart(id).await
         } else {
             units.start(id).await
         };
         match asked {
-            Ok(()) => self.attach(id).await,
+            Ok(()) => {
+                // Whatever the counter reads now is not a failure of this run.
+                self.note_restarts(id).await;
+                self.attach(id).await;
+            }
             Err(detail) => self.set_state(id, State::Failed, &detail),
+        }
+    }
+
+    /// Takes the unit's automatic restarts so far as the ones to leave
+    /// out of its consecutive failures: it ran, or was just started.
+    async fn note_restarts(&self, id: u32) {
+        let Some(l) = self.inner.driver.units.restart_loop(id).await else {
+            return;
+        };
+        if let Some(rx) = self.shared().get(id) {
+            rx.restarts_base = l.restarts;
+        }
+    }
+
+    /// Looks at `id`'s unit while it waits to restart, and fails the
+    /// receiver when it has done so [`RESTARTS_BEFORE_FAILED`] times in a
+    /// row: radiod exits at once when it can't open its SDR, and a unit
+    /// restarts it for ever.
+    async fn check_restart_loop(&self, id: u32) {
+        let Some(l) = self.inner.driver.units.restart_loop(id).await else {
+            return;
+        };
+        let (failures, no_input) = {
+            let mut s = self.shared();
+            let Some(rx) = s.get(id) else { return };
+            if l.exit_status == Some(EXIT_NO_INPUT) {
+                rx.saw_no_input = true;
+            }
+            // systemd resets the counter when a restart by request runs,
+            // which can be after `bring_up` read it (the request is
+            // `--no-block`): a counter below the base is such a reset, and
+            // the base starts over. (The unit's InvocationID can't tell:
+            // in a loop it changes with every automatic restart.)
+            if l.restarts < rx.restarts_base {
+                rx.restarts_base = 0;
+            }
+            (l.restarts - rx.restarts_base, rx.saw_no_input)
+        };
+        if failures < RESTARTS_BEFORE_FAILED {
+            return;
+        }
+        // Exit status 66 is radiod saying it can't open its SDR (held by
+        // another program, but a permission or a serial can do it too); any
+        // other end is a radiod that keeps stopping for a reason it does
+        // not give, and the SDR is a likely one.
+        let detail = if no_input {
+            RADIOD_CANNOT_OPEN_SDR.to_owned()
+        } else {
+            format!(
+                "its radiod stopped {failures} times in a row; the SDR may be in use by another program on this computer"
+            )
+        };
+        self.take_down(id);
+        self.set_state(id, State::Failed, &detail);
+        if let Some(rx) = self.shared().get(id) {
+            rx.looping = true;
         }
     }
 
@@ -1143,10 +1274,14 @@ impl Receivers {
                     if let Some(rx) = self.shared().get(id) {
                         rx.invocation = Some(invocation);
                     }
+                    self.note_restarts(id).await;
+                    if let Some(rx) = self.shared().get(id) {
+                        rx.saw_no_input = false;
+                    }
                     self.set_state(id, State::Running, "");
                 }
             }
-            UnitState::Activating => {}
+            UnitState::Activating => self.check_restart_loop(id).await,
             UnitState::Failed { detail } => {
                 self.take_down(id);
                 self.set_state(id, State::Failed, &detail);
@@ -1184,16 +1319,37 @@ impl Receivers {
     }
 
     async fn watch_failed(&self, id: u32) {
+        let looping = self.shared().get(id).is_some_and(|r| r.looping);
         let retry = match self.inner.driver.units.state(id).await {
-            UnitState::Active { invocation } => self
-                .shared()
-                .get(id)
-                .is_some_and(|r| r.invocation.as_deref() != Some(invocation.as_str())),
-            UnitState::Activating => true,
+            UnitState::Active { invocation } => {
+                let new = self
+                    .shared()
+                    .get(id)
+                    .is_some_and(|r| r.invocation.as_deref() != Some(invocation.as_str()));
+                // A radiod that was restarting for ever is looked at again
+                // only when it answers: it is up for a second at a time
+                // while its SDR is held, and trying it then would flap the
+                // receiver between `STARTING` and `FAILED`.
+                new && (!looping || self.answers(id).await)
+            }
+            // Waiting to restart: as long as the loop that failed the
+            // receiver goes on, nothing has changed.
+            UnitState::Activating => !looping,
             UnitState::Failed { .. } | UnitState::Inactive => false,
         };
         if retry {
             self.attach(id).await;
+        }
+    }
+
+    /// Whether a backend for `id` gets an answer from its radiod now.
+    async fn answers(&self, id: u32) -> bool {
+        let Some(config) = self.shared().get(id).map(|r| r.config.clone()) else {
+            return false;
+        };
+        match self.inner.driver.backends.backend(&config) {
+            Ok(backend) => backend.capabilities().await.is_ok(),
+            Err(_) => false,
         }
     }
 }

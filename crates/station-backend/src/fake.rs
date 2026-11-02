@@ -266,6 +266,7 @@ struct State {
     measurements: BTreeMap<MeasurementId, FakeMeasurement>,
     measurement_log: Vec<(Instant, MeasurementOp)>,
     measurement_failure: bool,
+    unreachable: bool,
 }
 
 /// A deterministic in-memory backend; see the [module docs](self).
@@ -310,6 +311,7 @@ impl FakeBackend {
                 measurements: BTreeMap::new(),
                 measurement_log: Vec::new(),
                 measurement_failure: false,
+                unreachable: false,
             })),
             events,
             epoch: Instant::now(),
@@ -338,6 +340,12 @@ impl FakeBackend {
     /// Makes every measurement call fail with `BACKEND_ERROR` (or work again).
     pub fn set_measurement_failure(&self, fail: bool) {
         self.state().measurement_failure = fail;
+    }
+
+    /// Makes [`Backend::capabilities`] fail, as for a backend process that
+    /// is not answering (or work again).
+    pub fn set_unreachable(&self, unreachable: bool) {
+        self.state().unreachable = unreachable;
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -501,7 +509,11 @@ impl Backend for FakeBackend {
     }
 
     async fn capabilities(&self) -> Result<BackendCapabilities, BackendError> {
-        Ok(self.state().capabilities.clone())
+        let state = self.state();
+        if state.unreachable {
+            return Err(BackendError::backend("the backend is not answering"));
+        }
+        Ok(state.capabilities.clone())
     }
 
     async fn open_channel(

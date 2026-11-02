@@ -48,6 +48,18 @@ pub enum UnitState {
     },
 }
 
+/// How a unit that its init system restarts after every failure has been
+/// doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestartLoop {
+    /// The automatic restarts since the unit was last started or restarted
+    /// by request (systemd's `NRestarts`).
+    pub restarts: u32,
+    /// How the last run of the main process ended (`ExecMainStatus`), when
+    /// it is known.
+    pub exit_status: Option<i32>,
+}
+
 /// Starts, restarts, stops and watches the receivers' units.
 #[async_trait::async_trait]
 pub trait Units: Send + Sync + fmt::Debug {
@@ -63,6 +75,12 @@ pub trait Units: Send + Sync + fmt::Debug {
     /// The CPU time its processes used so far, microseconds; `None` when
     /// unknown.
     fn cpu_usage_usec(&self, id: u32) -> Option<u64> {
+        let _ = id;
+        None
+    }
+    /// Its automatic restarts and the last exit status; `None` when the
+    /// init system does not count them.
+    async fn restart_loop(&self, id: u32) -> Option<RestartLoop> {
         let _ = id;
         None
     }
@@ -286,6 +304,21 @@ pub fn parse_show(text: &str, id: u32) -> UnitState {
     }
 }
 
+/// The restarts of a unit from `systemctl show`'s `NRestarts` and
+/// `ExecMainStatus` lines; `None` without `NRestarts` (an init system that
+/// does not count them).
+pub fn parse_restart_loop(text: &str) -> Option<RestartLoop> {
+    let get = |key: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
+            .map(str::trim)
+    };
+    Some(RestartLoop {
+        restarts: get("NRestarts")?.parse().ok()?,
+        exit_status: get("ExecMainStatus").and_then(|s| s.parse().ok()),
+    })
+}
+
 #[async_trait::async_trait]
 impl Units for Systemd {
     async fn start(&self, id: u32) -> Result<(), String> {
@@ -324,6 +357,18 @@ impl Units for Systemd {
             .join("cpu.stat");
         parse_cpu_stat(&std::fs::read_to_string(path).ok()?)
     }
+
+    async fn restart_loop(&self, id: u32) -> Option<RestartLoop> {
+        let text = self
+            .systemctl(&[
+                "show",
+                "--property=NRestarts,ExecMainStatus",
+                &unit_name(id),
+            ])
+            .await
+            .ok()?;
+        parse_restart_loop(&text)
+    }
 }
 
 #[async_trait::async_trait]
@@ -346,6 +391,10 @@ impl Units for Helper {
 
     fn cpu_usage_usec(&self, id: u32) -> Option<u64> {
         self.systemd.cpu_usage_usec(id)
+    }
+
+    async fn restart_loop(&self, id: u32) -> Option<RestartLoop> {
+        self.systemd.restart_loop(id).await
     }
 }
 
@@ -372,6 +421,8 @@ struct FakeState {
     units: HashMap<u32, UnitState>,
     runs: u64,
     failing: HashMap<u32, String>,
+    loops: HashMap<u32, RestartLoop>,
+    keep_counter: bool,
     calls: Vec<UnitCall>,
     held: bool,
 }
@@ -414,6 +465,48 @@ impl FakeUnits {
     /// does after a crash): a new run.
     pub fn crash(&self, id: u32) {
         let mut s = self.locked();
+        Self::run(&mut s, id);
+    }
+
+    /// Puts receiver `id`'s unit in a restart loop, as systemd does for a
+    /// radiod that exits at once: waiting to restart, with `restarts`
+    /// automatic restarts so far and `exit_status` the last run's.
+    pub fn start_looping(&self, id: u32, restarts: u32, exit_status: Option<i32>) {
+        let mut s = self.locked();
+        s.loops.insert(
+            id,
+            RestartLoop {
+                restarts,
+                exit_status,
+            },
+        );
+        s.units.insert(id, UnitState::Activating);
+    }
+
+    /// Sets receiver `id`'s restart counter without touching its unit: it
+    /// ran for a long time and crashed `restarts` times over it.
+    pub fn set_restarts(&self, id: u32, restarts: u32) {
+        self.locked().loops.insert(
+            id,
+            RestartLoop {
+                restarts,
+                exit_status: None,
+            },
+        );
+    }
+
+    /// Makes a start or restart by request leave the restart counter as it
+    /// is, as systemd does when it is read before the job has run (the
+    /// requests are `--no-block`); the test sets it afterwards.
+    pub fn keep_counter_on_request(&self, keep: bool) {
+        self.locked().keep_counter = keep;
+    }
+
+    /// Ends the loop: radiod stays up (the program that held the SDR let
+    /// go).
+    pub fn stop_looping(&self, id: u32) {
+        let mut s = self.locked();
+        s.loops.remove(&id);
         Self::run(&mut s, id);
     }
 
@@ -460,6 +553,10 @@ impl Units for FakeUnits {
         }
         let mut s = self.locked();
         if !matches!(s.units.get(&id), Some(UnitState::Active { .. })) {
+            // A start by request resets systemd's restart counter.
+            if !s.keep_counter {
+                s.loops.remove(&id);
+            }
             Self::run(&mut s, id);
         }
         Ok(())
@@ -468,6 +565,9 @@ impl Units for FakeUnits {
     async fn restart(&self, id: u32) -> Result<(), String> {
         let mut s = self.locked();
         s.calls.push(UnitCall::Restart(id));
+        if !s.keep_counter {
+            s.loops.remove(&id);
+        }
         Self::run(&mut s, id);
         Ok(())
     }
@@ -485,6 +585,10 @@ impl Units for FakeUnits {
             .get(&id)
             .cloned()
             .unwrap_or(UnitState::Inactive)
+    }
+
+    async fn restart_loop(&self, id: u32) -> Option<RestartLoop> {
+        self.locked().loops.get(&id).copied()
     }
 }
 
@@ -563,6 +667,27 @@ mod tests {
         );
         assert_eq!(parse_show("", 3), UnitState::Inactive);
         assert_eq!(unit_name(12), "coaxhub-radiod@12.service");
+    }
+
+    #[test]
+    fn restart_counts() {
+        assert_eq!(
+            parse_restart_loop("NRestarts=4\nExecMainStatus=66\n"),
+            Some(RestartLoop {
+                restarts: 4,
+                exit_status: Some(66)
+            })
+        );
+        assert_eq!(
+            parse_restart_loop("NRestarts=0\n"),
+            Some(RestartLoop {
+                restarts: 0,
+                exit_status: None
+            })
+        );
+        // An init system without the counter.
+        assert_eq!(parse_restart_loop("ExecMainStatus=1\n"), None);
+        assert_eq!(parse_restart_loop("NRestarts=x\n"), None);
     }
 
     #[test]

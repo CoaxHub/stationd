@@ -35,6 +35,8 @@
 //! - [`local_status`]: the runtime status file and `stationd status`;
 //!   [`doctor`]: `stationd doctor`; [`backend_config`]: a receiver's radiod
 //!   config from its profile and `receivers.json`.
+//! - [`usb_holders`]: the programs that hold an SDR's USB device, for
+//!   `stationd doctor`.
 //! - [`cli`], [`logging`]: command line and `tracing` setup.
 
 pub mod backend_config;
@@ -60,6 +62,7 @@ pub mod state;
 pub mod station_api;
 pub mod status;
 pub mod tls;
+pub mod usb_holders;
 
 pub use config::Config;
 pub use daemon::{

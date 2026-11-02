@@ -542,6 +542,196 @@ async fn units_that_fail_and_restart() {
 }
 
 #[tokio::test]
+async fn an_sdr_another_program_holds_fails_the_receiver_with_a_plain_reason() {
+    let st = Station::standard().await;
+    let mut events = st.receivers.subscribe();
+    let mut seen = Vec::new();
+    // radiod exits with EX_NOINPUT at once, and its unit restarts it: two
+    // restarts are not yet a failure.
+    st.units.start_looping(1, 2, Some(EXIT_NO_INPUT));
+    until(&mut events, &mut seen, |e| {
+        states(e).contains(&(1, S::Starting))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!states(&drain(&mut events)).contains(&(1, S::Failed)));
+    assert_eq!(st.receivers.summaries()[0].state, "starting");
+    // The third is.
+    st.units
+        .start_looping(1, RESTARTS_BEFORE_FAILED, Some(EXIT_NO_INPUT));
+    seen.clear();
+    until(&mut events, &mut seen, |e| {
+        states(e).contains(&(1, S::Failed))
+    })
+    .await;
+    let failed = seen
+        .iter()
+        .find(|e| e.event.receiver_state == Some(S::Failed as i32))
+        .expect("failed");
+    assert_eq!(failed.event.detail, RADIOD_CANNOT_OPEN_SDR);
+    assert!(failed.event.detail.len() <= limits::MAX_DETAIL_BYTES);
+    assert_eq!(st.receivers.health(|_| 0)[0].detail, RADIOD_CANNOT_OPEN_SDR);
+    // The other receiver is untouched.
+    assert_eq!(st.receivers.summaries()[1].state, "running");
+    // While the loop goes on the receiver stays failed: no flapping.
+    seen.clear();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        drain(&mut events)
+            .iter()
+            .all(|e| e.event.receiver_id != Some(1))
+    );
+    assert_eq!(st.receivers.summaries()[0].state, "failed");
+    // The program lets go: radiod runs, and the receiver with it.
+    st.units.stop_looping(1);
+    until(&mut events, &mut seen, |e| {
+        states(e).contains(&(1, S::Running))
+    })
+    .await;
+    assert_eq!(st.receivers.summaries()[0].detail, "");
+}
+
+#[tokio::test]
+async fn a_radiod_that_keeps_stopping_without_saying_why_fails_the_receiver() {
+    let st = Station::standard().await;
+    let mut events = st.receivers.subscribe();
+    let mut seen = Vec::new();
+    st.units.start_looping(2, 5, Some(1));
+    until(&mut events, &mut seen, |e| {
+        states(e).contains(&(2, S::Failed))
+    })
+    .await;
+    let failed = seen
+        .iter()
+        .find(|e| e.event.receiver_state == Some(S::Failed as i32))
+        .expect("failed");
+    assert!(
+        failed
+            .event
+            .detail
+            .starts_with("its radiod stopped 5 times in a row")
+    );
+    assert!(failed.event.detail.contains("in use by another program"));
+    assert!(failed.event.detail.len() <= limits::MAX_DETAIL_BYTES);
+}
+
+#[tokio::test]
+async fn a_changed_receiver_starts_its_count_of_restarts_over() {
+    let st = Station::standard().await;
+    let mut events = st.receivers.subscribe();
+    let mut seen = Vec::new();
+    st.units.start_looping(1, 5, Some(1));
+    until(&mut events, &mut seen, |e| {
+        states(e).contains(&(1, S::Failed))
+    })
+    .await;
+    // Started by request (the owner changed it): its counter starts over.
+    let mut set = standard_set();
+    set.receivers[0].center_frequency_hz = 7_150_000;
+    st.receivers.configure(&set).await.expect("changed");
+    st.wait_running(&[1]).await;
+    st.units.crash(1);
+    st.wait_running(&[1]).await;
+    assert_eq!(st.receivers.summaries()[0].state, "running");
+}
+
+#[tokio::test]
+async fn only_the_restarts_since_the_last_run_count() {
+    let st = Station::standard().await;
+    let mut events = st.receivers.subscribe();
+    let mut seen = Vec::new();
+    // radiod crashed 40 times over weeks, with the receiver running in
+    // between: the next run takes 40 as its base.
+    st.units.set_restarts(1, 40);
+    st.units.crash(1);
+    until(&mut events, &mut seen, |e| {
+        states(e).ends_with(&[(1, S::Starting), (1, S::Running)])
+    })
+    .await;
+    // Two failures after it are not three.
+    st.units.start_looping(1, 42, Some(EXIT_NO_INPUT));
+    seen.clear();
+    until(&mut events, &mut seen, |e| {
+        states(e).contains(&(1, S::Starting))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!states(&drain(&mut events)).contains(&(1, S::Failed)));
+    assert_eq!(st.receivers.summaries()[0].state, "starting");
+    // The third is.
+    st.units.start_looping(1, 43, Some(EXIT_NO_INPUT));
+    seen.clear();
+    until(&mut events, &mut seen, |e| {
+        states(e).contains(&(1, S::Failed))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_counter_reset_after_it_was_read_does_not_hide_the_failures() {
+    let st = Station::standard().await;
+    let mut events = st.receivers.subscribe();
+    let mut seen = Vec::new();
+    // The owner changes the receiver whose unit has restarted 40 times:
+    // stationd reads 40 right after asking for the restart, and systemd
+    // resets the counter when the job runs, after the read.
+    st.units.set_restarts(1, 40);
+    st.units.keep_counter_on_request(true);
+    let mut set = standard_set();
+    set.receivers[0].center_frequency_hz = 7_150_000;
+    st.receivers.configure(&set).await.expect("changed");
+    st.wait_running(&[1]).await;
+    // Radiod can't open its SDR now: the counter counts from 0 again.
+    st.units.start_looping(1, 1, Some(EXIT_NO_INPUT));
+    until(&mut events, &mut seen, |e| {
+        states(e).contains(&(1, S::Starting))
+    })
+    .await;
+    st.units.start_looping(1, 2, Some(EXIT_NO_INPUT));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!states(&drain(&mut events)).contains(&(1, S::Failed)));
+    st.units
+        .start_looping(1, RESTARTS_BEFORE_FAILED, Some(EXIT_NO_INPUT));
+    seen.clear();
+    until(&mut events, &mut seen, |e| {
+        states(e).contains(&(1, S::Failed))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_radiod_briefly_up_but_not_answering_does_not_flap_a_failed_receiver() {
+    let st = Station::standard().await;
+    let mut events = st.receivers.subscribe();
+    let mut seen = Vec::new();
+    st.units
+        .start_looping(1, RESTARTS_BEFORE_FAILED, Some(EXIT_NO_INPUT));
+    until(&mut events, &mut seen, |e| {
+        states(e).contains(&(1, S::Failed))
+    })
+    .await;
+    // radiod is up for a moment between two failures, and says nothing.
+    st.backends.set_silent(1, true);
+    drain(&mut events);
+    st.units.crash(1);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        drain(&mut events)
+            .iter()
+            .all(|e| e.event.receiver_id != Some(1)),
+        "the receiver changed state"
+    );
+    assert_eq!(st.receivers.summaries()[0].state, "failed");
+    // Once it answers, the receiver runs.
+    st.backends.set_silent(1, false);
+    seen.clear();
+    until(&mut events, &mut seen, |e| {
+        states(e).contains(&(1, S::Running))
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn backend_events_carry_their_receiver() {
     let st = Station::standard().await;
     let mut events = st.receivers.subscribe();

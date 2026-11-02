@@ -8,6 +8,7 @@
 //! | `enrollment` | the credentials are missing or unusable |
 //! | `sdrs` | never: the SDRs it sees, a warning when there is no RTL-SDR (a station runs without one until it arrives) |
 //! | `receivers` | `receivers.json` is unusable; a warning per receiver whose SDR is missing |
+//! | `sdr-holders` | never: per RTL-SDR, the programs that have its USB device open (a warning when one is not this station's own radiod and a receiver is set to use that SDR, or when a receiver on it failed and the look was partial; a program on an SDR no receiver uses is only reported), and the kernel driver bound to it; it says plainly when it could not inspect other users' processes (run doctor with `sudo`) |
 //! | `helper` | `coaxhub-helper` (the root helper that starts the receivers' units) does not answer `ping` on its socket (a warning when this user may not use the socket: run doctor with `sudo`); skipped for the fake and external backends |
 //! | `radiod` | a receiver's radiod does not answer on its slot's status group within 3 s |
 //! | `enroll` | DNS or the TLS handshake with the enrollment service fails, against the `CoaxHub` root (a warning once enrolled) |
@@ -34,6 +35,7 @@ use crate::local_status::{
 };
 use crate::receivers::{CallError, Helper, StoredSet};
 use crate::tls::{self, Connector};
+use crate::usb_holders;
 
 /// The outcome of one check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -92,6 +94,10 @@ pub struct Environment {
     pub usb_devices: Option<PathBuf>,
     /// The root helper's socket; `None`: `/run/coaxhub-helper.sock`.
     pub helper_socket: Option<PathBuf>,
+    /// The processes (`/proc`); `None`: `/proc`.
+    pub proc_dir: Option<PathBuf>,
+    /// The USB device nodes; `None`: `/dev/bus/usb`.
+    pub dev_bus_usb: Option<PathBuf>,
     /// Now, Unix seconds.
     pub now_unix_s: i64,
     /// Per network check.
@@ -103,6 +109,8 @@ impl Default for Environment {
         Self {
             usb_devices: None,
             helper_socket: None,
+            proc_dir: None,
+            dev_bus_usb: None,
             now_unix_s: crate::local_status::unix_now(),
             timeout: Duration::from_secs(3),
         }
@@ -145,13 +153,18 @@ pub async fn run_config(config: &Config, source: &str, env: &Environment) -> Vec
     out.push(sdrs(&hw));
     let daemon =
         RuntimeStatus::read(&config.status_path()).filter(|d| local_status::process_alive(d.pid));
-    match StoredSet::load(&config.receivers_path()) {
+    let applied = match StoredSet::load(&config.receivers_path()) {
         Ok(set) => {
             out.extend(receivers(&set, &hw, daemon.as_ref()));
             out.extend(radiods(config, &set, env.timeout).await);
+            set
         }
-        Err(e) => out.push(check("receivers", Level::Fail, e.to_string())),
-    }
+        Err(e) => {
+            out.push(check("receivers", Level::Fail, e.to_string()));
+            StoredSet::default()
+        }
+    };
+    out.extend(sdr_holders(&hw, usb, env, &applied, daemon.as_ref()));
     out.push(helper(&config.backend, env).await);
     out.push(enroll_endpoint(config, creds.is_some(), env.timeout).await);
     out.extend(mtls_checks(config, creds.as_ref(), env.timeout).await);
@@ -250,6 +263,118 @@ fn receivers(set: &StoredSet, hw: &Hardware, daemon: Option<&RuntimeStatus>) -> 
                 detail.push_str("; its SDR is not plugged in");
             }
             check("receivers", level, detail)
+        })
+        .collect()
+}
+
+/// One line per RTL-SDR plugged in: the programs that have its USB device
+/// open, and the kernel driver bound to it. An SDR serves one program at a
+/// time, so a receiver stuck `failed` (or `starting`) on an SDR another
+/// program holds is told here. Linux shows the open files of the caller's
+/// own processes only (all of them to root), so when other users' processes
+/// were out of sight it says so, and a look that found nothing is not
+/// "nobody has it".
+fn sdr_holders(
+    hw: &Hardware,
+    usb: &std::path::Path,
+    env: &Environment,
+    set: &StoredSet,
+    daemon: Option<&RuntimeStatus>,
+) -> Vec<Check> {
+    let proc_dir = env
+        .proc_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(usb_holders::PROC_DIR));
+    let dev_root = env
+        .dev_bus_usb
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(usb_holders::DEV_BUS_USB));
+    hw.devices
+        .iter()
+        .filter(|d| d.is_rtlsdr())
+        .map(|dev| {
+            let label = if dev.serial.is_empty() {
+                format!("the RTL-SDR at USB port {}", dev.port)
+            } else {
+                format!("SDR {} (USB port {})", dev.serial, dev.port)
+            };
+            let stuck = daemon.is_some_and(|d| {
+                d.receivers.iter().any(|r| {
+                    r.state == "failed" && (r.sdr_serial.is_empty() || r.sdr_serial == dev.serial)
+                })
+            });
+            // Whether a receiver is set to use this SDR: a program holding
+            // one that none uses (an `rtl_tcp` run on purpose on a second
+            // dongle) is information, not a problem.
+            let used = set.receivers.iter().any(|r| {
+                hardware::device_for(&hw.devices, &r.sdr_serial).is_some_and(|d| d.port == dev.port)
+            });
+            let mut level = Level::Pass;
+            let mut detail = label;
+            if let Some(node) = usb_holders::device_node(usb, &dev.port, &dev_root) {
+                let found = usb_holders::holders(&proc_dir, &node);
+                let foreign: Vec<String> = found
+                    .foreign()
+                    .map(|h| format!("{} (process {})", h.name, h.pid))
+                    .collect();
+                let own: Vec<String> = found
+                    .holders
+                    .iter()
+                    .filter_map(|h| h.receiver)
+                    .map(|id| format!("receiver {id}"))
+                    .collect();
+                if !foreign.is_empty() && used {
+                    level = Level::Warn;
+                    let _ = write!(
+                        detail,
+                        ": in use by another program on this computer: {}; close it, and the \
+                         receiver starts again by itself",
+                        foreign.join(", ")
+                    );
+                } else if !foreign.is_empty() {
+                    let _ = write!(
+                        detail,
+                        ": in use by {}; no receiver of this station is set to use this SDR",
+                        foreign.join(", ")
+                    );
+                } else if !own.is_empty() {
+                    let _ = write!(detail, ": used by this station's {}", own.join(", "));
+                } else if found.uninspected > 0 {
+                    // Nothing seen, but not everything could be.
+                    if stuck {
+                        level = Level::Warn;
+                    }
+                    let _ = write!(
+                        detail,
+                        ": no program doctor can see has it open, but {} processes of other \
+                         users could not be inspected; run `sudo stationd doctor` to see them all",
+                        found.uninspected
+                    );
+                } else {
+                    detail.push_str(": no program has it open");
+                }
+            } else {
+                detail.push_str(
+                    ": cannot tell which program has it open (the system does not give its \
+                     USB device number)",
+                );
+            }
+            if let Some(driver) = usb_holders::bound_driver(usb, &dev.port) {
+                if stuck {
+                    level = level.max(Level::Warn);
+                }
+                let _ = write!(detail, "; the kernel driver {driver} is bound to it");
+                if driver == "dvb_usb_rtl28xxu" {
+                    // The DVB-T driver holds an RTL-SDR; the package
+                    // blacklists it for later boots.
+                    let _ = write!(
+                        detail,
+                        " (it holds the SDR until `sudo rmmod {driver}` or a reboot; the \
+                         package blacklists it)"
+                    );
+                }
+            }
+            check("sdr-holders", level, detail)
         })
         .collect()
 }
@@ -684,6 +809,78 @@ mod tests {
         assert_eq!(c.level, Level::Pass, "{c}");
         assert!(c.detail.contains("helper.sock"), "{c}");
         server.join().expect("server");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sdr_holders_name_the_program_and_the_driver() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let usb_dir = tmp.path().join("usb");
+        usb(&usb_dir, "1-1.3", ("0bda", "2838"), "RTL2838UHIDIR", "A1");
+        let env = Environment {
+            proc_dir: Some(tmp.path().join("proc")),
+            dev_bus_usb: Some(PathBuf::from("/dev/bus/usb")),
+            ..Environment::default()
+        };
+        let hw = Hardware::scan(&usb_dir);
+        // A receiver set to use the SDR.
+        let set: StoredSet = serde_json::from_str(
+            r#"{"receivers":[
+                {"receiver_id":1,"slot":0,"sdr_serial":"A1","model":"rtlsdr_other","profile":"rtlsdr","center_frequency_hz":98000000}]}"#,
+        )
+        .expect("set");
+        let proc_dir = tmp.path().join("proc");
+        std::fs::create_dir_all(&proc_dir).expect("mkdir");
+        // Without a bus number the node is not known.
+        let c = &sdr_holders(&hw, &usb_dir, &env, &set, None)[0];
+        assert_eq!(c.level, Level::Pass, "{c}");
+        assert!(c.detail.contains("cannot tell which program"), "{c}");
+        std::fs::write(usb_dir.join("1-1.3/busnum"), "1\n").expect("write");
+        std::fs::write(usb_dir.join("1-1.3/devnum"), "7\n").expect("write");
+        let c = &sdr_holders(&hw, &usb_dir, &env, &set, None)[0];
+        assert_eq!(c.level, Level::Pass, "{c}");
+        assert!(c.detail.ends_with("no program has it open"), "{c}");
+        // rtl_tcp has it open.
+        let fds = proc_dir.join("4242/fd");
+        std::fs::create_dir_all(&fds).expect("mkdir");
+        std::fs::write(proc_dir.join("4242/comm"), "rtl_tcp\n").expect("write");
+        std::os::unix::fs::symlink("/dev/bus/usb/001/007", fds.join("3")).expect("link");
+        let c = &sdr_holders(&hw, &usb_dir, &env, &set, None)[0];
+        assert_eq!(c.level, Level::Warn, "{c}");
+        assert!(
+            c.detail
+                .contains("in use by another program on this computer: rtl_tcp (process 4242)"),
+            "{c}"
+        );
+        assert_eq!(c.name, "sdr-holders");
+        // The same program on an SDR no receiver uses is information.
+        let c = &sdr_holders(&hw, &usb_dir, &env, &StoredSet::default(), None)[0];
+        assert_eq!(c.level, Level::Pass, "{c}");
+        assert!(
+            c.detail
+                .contains("in use by rtl_tcp (process 4242); no receiver of this station"),
+            "{c}"
+        );
+        // The DVB-T driver is bound to it.
+        let interface = usb_dir.join("1-1.3/1-1.3:1.0");
+        std::fs::create_dir_all(&interface).expect("mkdir");
+        std::os::unix::fs::symlink(
+            "../../../bus/usb/drivers/dvb_usb_rtl28xxu",
+            interface.join("driver"),
+        )
+        .expect("link");
+        let c = &sdr_holders(&hw, &usb_dir, &env, &set, None)[0];
+        assert!(
+            c.detail.contains("kernel driver dvb_usb_rtl28xxu is bound"),
+            "{c}"
+        );
+        assert!(c.detail.contains("rmmod"), "{c}");
+        // An SDR that is not an RTL-SDR gets no line.
+        usb(&usb_dir, "1-1.4", ("1d50", "6089"), "HackRF", "H1");
+        assert_eq!(
+            sdr_holders(&Hardware::scan(&usb_dir), &usb_dir, &env, &set, None).len(),
+            1
+        );
     }
 
     #[test]
