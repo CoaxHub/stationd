@@ -106,6 +106,48 @@ mkdir -p /tmp/nousb
 good="$(installer "${FPR}")"
 common=(--skip-time-sync --no-start)
 
+# ---------------------------------------------------------------- no control plane
+# The package has its domain built in (a throwaway one in CI, the production
+# one in a release), and the installer's enrollment calls https://enroll.<domain>.
+# Whatever the domain, this test must never reach a real service: the names
+# stationd and the installer use are pointed at the container's own loopback,
+# where nothing listens on port 443, so every connection is refused at once.
+# The domain is read from the package itself (Maintainer: CoaxHub <packages@DOMAIN>).
+maintainer="$(dpkg-deb -f /test/pkg/*_amd64.deb Maintainer)"
+DOMAIN="${maintainer##*packages@}"
+DOMAIN="${DOMAIN%>}"
+if [[ ! "${DOMAIN}" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
+    echo "cannot read the package's domain from its Maintainer field: ${maintainer}"
+    exit 1
+fi
+{
+    for sub in enroll station-api get apt api app admin www; do
+        printf '127.0.0.1 %s.%s\n::1 %s.%s\n' "${sub}" "${DOMAIN}" "${sub}" "${DOMAIN}"
+    done
+    printf '127.0.0.1 %s\n::1 %s\n' "${DOMAIN}" "${DOMAIN}"
+} >>/etc/hosts
+# unreachable HOST: resolves to loopback only, and a connection to port 443 is
+# refused (or fails some other way within 5 s); prints what it saw.
+unreachable() {
+    python3 - "$1" <<'PY'
+import socket, sys
+host = sys.argv[1]
+addrs = {a[4][0] for a in socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)}
+if not addrs or not addrs <= {"127.0.0.1", "::1"}:
+    print(f"{host} resolves to {sorted(addrs)}")
+    sys.exit(1)
+try:
+    socket.create_connection((host, 443), timeout=5).close()
+except OSError as e:
+    print(f"{host} -> {sorted(addrs)}: {e.__class__.__name__}")
+    sys.exit(0)
+print(f"{host} accepted a connection")
+sys.exit(1)
+PY
+}
+check "the enrollment endpoint (enroll.${DOMAIN}) is unreachable from this test" unreachable "enroll.${DOMAIN}"
+check "the station API (station-api.${DOMAIN}) is unreachable from this test" unreachable "station-api.${DOMAIN}"
+
 # ---------------------------------------------------------------- refusals
 rc="$(run /tmp/t.log "${TEMPLATE}" -y "${common[@]}")"
 check_eq "template: refuses to run" 1 "${rc}"
@@ -230,7 +272,7 @@ check_eq "happy path: exits 1 (no control plane to enroll with)" 1 "${rc}"
 check_contains "happy path: lists the SDR as information" "Found an RTL-SDR (0bda:2838, RTL2838UHIDIR)" "${log}"
 check_contains "happy path: says the web app sets up receivers" "web app" "${log}"
 check_contains "happy path: reports the failed enrollment" "enrollment failed" "${log}"
-check_contains "happy path: stationd says why" "cannot reach the enrollment service at https://enroll." "${log}"
+check_contains "happy path: stationd says why" "cannot reach the enrollment service at https://enroll.${DOMAIN}" "${log}"
 check_lacks "happy path: the token is not in the output" "${TOKEN_BODY}" "${log}"
 check_eq "keyring mode" "644 root root" "$(mode_owner "${KEYRING}")"
 check_contains "the keyring holds the pinned key" "${FPR}" \

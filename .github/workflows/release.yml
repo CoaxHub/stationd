@@ -48,9 +48,13 @@ jobs:
           driver: docker
       - name: Build the packages with the production root
         run: COAXHUB_ROOT_CA=packaging/roots/coaxhub-production.pem packaging/build-all.sh
+      # Each test has its own limit, so a hang fails in minutes, not at the job's.
       - run: packaging/test/test-packages.sh
+        timeout-minutes: 30
       - run: packaging/test/test-systemd.sh
+        timeout-minutes: 30
       - run: packaging/test/test-installer.sh
+        timeout-minutes: 30
       - name: Collect the assets
         run: |
           set -euo pipefail
