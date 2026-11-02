@@ -30,7 +30,7 @@
 # Docker daemon. The 0.2.3 package is downloaded once from the CoaxHub APT
 # repository into target/packages-previous/ and checked against its SHA-256.
 #
-# Usage: packaging/test/test-systemd.sh [--quick] [--suite bookworm|trixie]
+# Usage: packaging/test/test-systemd.sh [--quick] [--suite bookworm|trixie|jammy|noble|resolute]
 #        (--quick: bookworm only, no upgrade)
 
 export TEST_NAME=test-systemd
@@ -42,23 +42,16 @@ readonly PREVIOUS_URL="https://apt.coaxhub.com/pool/bookworm/main/coaxhub-statio
 readonly PREVIOUS_SHA256="d954f93716d5b25e60983bc28f96d9e0f02859be6815063307cab4f1ad11f6bb"
 readonly PREVIOUS_DIR="${STATION}/target/packages-previous"
 
-suites=(bookworm trixie)
-upgrade=1
-while (($#)); do
-    case "$1" in
-    --quick) suites=(bookworm); upgrade=0 ;;
-    --suite) suites=("${2:?bookworm|trixie}"); shift ;;
-    *) die "usage: test-systemd.sh [--quick] [--suite bookworm|trixie]" ;;
-    esac
-    shift
-done
+suite_args "$@"
+upgrade=$((1 - quick))
 run="coaxhub-systd-$$"
 
 # The image of a suite: systemd, dbus and the tools the tests use.
 build_image() {
     local suite="$1" image="coaxhub-systemd-test:$1"
+    suite_env "${suite}"
     docker build --quiet --tag "${image}" - >/dev/null <<DOCKERFILE
-FROM debian:${suite}
+FROM ${SUITE_BASE}
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \\
  && apt-get install -y --no-install-recommends systemd systemd-sysv dbus socat ca-certificates \\
@@ -103,6 +96,7 @@ fetch_previous() {
 
 fresh_test() {
     local suite="$1" name="${run}-fresh-${1}"
+    suite_env "${suite}"
     start_systemd "${name}" "${suite}"
     docker exec "${name}" mkdir -p /test/pkg
     docker cp "$(package_for "${suite}" amd64)" "${name}:/test/pkg/" >/dev/null
@@ -111,6 +105,7 @@ fresh_test() {
 
 upgrade_test() {
     local suite="$1" name="${run}-upgrade-${1}" previous
+    suite_env "${suite}"
     previous="$(fetch_previous)" || return 1
     start_systemd "${name}" "${suite}"
     docker exec "${name}" mkdir -p /test/pkg /test/previous
@@ -119,12 +114,33 @@ upgrade_test() {
     run_in "${name}" "${TEST_DIR}/in-container/systemd.sh" upgrade "${suite}"
 }
 
+# The jammy owner's case: the 0.2.3 package for bookworm installed on Ubuntu
+# 22.04 by an altered installer, no receiver working (polkit 0.105 ignores the
+# rule), then the published installer run against a repository that has the
+# jammy package.
+owner_test() {
+    local suite="$1" name="${run}-owner-${1}" previous
+    suite_env "${suite}"
+    previous="$(fetch_previous)" || return 1
+    start_systemd "${name}" "${suite}"
+    docker exec "${name}" mkdir -p /test/pkg /test/previous
+    docker cp "$(package_for "${suite}" amd64)" "${name}:/test/pkg/" >/dev/null
+    docker cp "$(package_for "${suite}" arm64)" "${name}:/test/pkg/" >/dev/null
+    docker cp "${previous}" "${name}:/test/previous/" >/dev/null
+    docker cp "${STATION}/installer/station.sh" "${name}:/test/station.sh" >/dev/null
+    run_in "${name}" "${TEST_DIR}/in-container/systemd.sh" owner "${suite}"
+}
+
 for suite in "${suites[@]}"; do
     build_image "${suite}" || die "cannot build the ${suite} test image"
     record "${suite}: fresh install under systemd" fresh_test "${suite}"
-    # The published package is for Debian 12: its upgrade is tested there.
+    # The published package is for Debian 12: its upgrade is tested there, and
+    # its (altered) install on jammy, where the installer then heals it.
     if ((upgrade)) && [[ "${suite}" == bookworm ]]; then
         record "${suite}: upgrade from ${PREVIOUS_VERSION}" upgrade_test "${suite}"
+    fi
+    if ((upgrade)) && [[ "${suite}" == jammy ]]; then
+        record "${suite}: the owner's ${PREVIOUS_VERSION} healed by the installer" owner_test "${suite}"
     fi
 done
 finish

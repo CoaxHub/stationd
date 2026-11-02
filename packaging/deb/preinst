@@ -1,0 +1,62 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# coaxhub-stationd preinst: this package is built for one system
+# (@TARGET_NAME@) and refuses every other one, before anything is unpacked.
+# The installer refuses an unsupported system with the same rule; this check
+# is for what the installer does not see: a repository added by hand, an
+# edited installer, `dpkg -i`. A refused `upgrade` leaves the installed
+# version in place. `remove`, `purge` and the `abort-*` calls never check.
+#
+# The build fills in @OS_IDS@ (the os-release IDs this package installs on),
+# @CODENAME@ (the VERSION_CODENAME it needs), @TARGET_NAME@ and @SUPPORTED@.
+# Pre-Depends: base-files makes /etc/os-release name the new release already
+# when this runs during an in-place release upgrade.
+set -e
+
+OS_IDS="@OS_IDS@"
+CODENAME="@CODENAME@"
+TARGET_NAME="@TARGET_NAME@"
+SUPPORTED="@SUPPORTED@"
+
+refuse() {
+	{
+		echo "coaxhub-stationd: this package is for $TARGET_NAME, and this system is $1."
+		echo "coaxhub-stationd: nothing was installed. CoaxHub stations run on $SUPPORTED."
+		echo "coaxhub-stationd: use the package for your system (the CoaxHub installer picks it), or upgrade the system to a supported release."
+	} >&2
+	exit 1
+}
+
+check_system() {
+	if [ ! -r /etc/os-release ]; then
+		refuse "unknown (no /etc/os-release)"
+	fi
+	# One line: id|codename|name, from the system's own file, in a subshell.
+	found=$(
+		# shellcheck disable=SC1091
+		. /etc/os-release
+		printf '%s|%s|%s' "${ID:-}" "${VERSION_CODENAME:-}" "${PRETTY_NAME:-${ID:-unknown}}"
+	)
+	id=${found%%|*}
+	rest=${found#*|}
+	codename=${rest%%|*}
+	pretty=${rest#*|}
+	if [ "$codename" = "$CODENAME" ]; then
+		for ok in $OS_IDS; do
+			[ "$id" = "$ok" ] && return 0
+		done
+	fi
+	refuse "$pretty"
+}
+
+case "$1" in
+install | upgrade) check_system ;;
+abort-upgrade | abort-remove | abort-deconfigure | remove | purge | failed-upgrade | disappear) ;;
+*)
+	echo "preinst called with unknown argument '$1'" >&2
+	exit 1
+	;;
+esac
+
+exit 0

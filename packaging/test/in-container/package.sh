@@ -15,15 +15,26 @@
 
 # shellcheck source-path=SCRIPTDIR source=common.sh
 . /test/common.sh
+# SYSLIB (/usr/lib or /lib), SUFFIX, TARGET_NAME ... of the suite under test, from the host.
+# shellcheck source=/dev/null
+. /test/suite.env
 
 readonly MODE="${1:?without-systemd|with-systemd}"
 readonly KA9Q_COMMIT=384b269aaf5e9ee1015185ae7c0cdd60f4d2ecbd
 readonly RTLSDR_COMMIT=619ac3186ea0ffc092615e1f59f7397e5e6f668c
 deb="$(ls /test/pkg/coaxhub-stationd_*_amd64.deb)"
 
+# On Ubuntu only `main` and `restricted` are used: the package's runtime
+# libraries (dpkg-shlibdeps) must all be in main, never universe.
+if [[ "${OS_IDS}" == ubuntu ]]; then
+    for f in /etc/apt/sources.list.d/*.sources; do
+        [[ -e "${f}" ]] && sed -i 's/^Components:.*/Components: main restricted/' "${f}"
+    done
+    [[ -s /etc/apt/sources.list ]] && sed -i -e '/ \(universe\|multiverse\)$/d' -e 's/ universe//; s/ multiverse//' /etc/apt/sources.list
+fi
 apt_quiet update || exit 1
 if [[ "${MODE}" == with-systemd ]]; then
-    # systemd-timesyncd ships systemd-time-wait-sync.service on trixie.
+    # systemd-timesyncd ships systemd-time-wait-sync.service on trixie and Ubuntu.
     apt_quiet install --no-install-recommends systemd systemd-timesyncd udev || exit 1
 fi
 
@@ -67,12 +78,12 @@ for f in "755 /usr/bin/stationd" "755 /usr/lib/coaxhub/coaxhub-helper" \
     "644 /usr/share/coaxhub/radiod-templates/rtlsdr.conf" \
     "644 /usr/share/coaxhub/radiod-templates/rtlsdr-hf.conf" \
     "644 /usr/share/coaxhub/radiod-templates/rtlsdr-v4.conf" \
-    "644 /usr/lib/systemd/system/stationd.service" \
-    "644 /usr/lib/systemd/system/coaxhub-radiod@.service" \
-    "644 /usr/lib/systemd/system/coaxhub-helper.socket" \
-    "644 /usr/lib/systemd/system/coaxhub-helper@.service" \
-    "644 /usr/lib/udev/rules.d/72-coaxhub-rtlsdr.rules" \
-    "644 /usr/lib/modprobe.d/coaxhub-stationd.conf" \
+    "644 ${SYSLIB}/systemd/system/stationd.service" \
+    "644 ${SYSLIB}/systemd/system/coaxhub-radiod@.service" \
+    "644 ${SYSLIB}/systemd/system/coaxhub-helper.socket" \
+    "644 ${SYSLIB}/systemd/system/coaxhub-helper@.service" \
+    "644 ${SYSLIB}/udev/rules.d/72-coaxhub-rtlsdr.rules" \
+    "644 ${SYSLIB}/modprobe.d/coaxhub-stationd.conf" \
     "644 /usr/share/doc/coaxhub-stationd/copyright"; do
     check_eq "${f#* } (mode ${f%% *}, root)" "${f%% *} root root" "$(mode_owner "${f#* }")"
 done
@@ -80,11 +91,11 @@ check "no development-only template (siggen)" test ! -e /usr/share/coaxhub/radio
 check_not "radiod is not on PATH" command -v radiod
 check_not "coaxhub-helper is not on PATH" command -v coaxhub-helper
 check "no polkit rule is shipped" test ! -e /usr/share/polkit-1/rules.d/coaxhub-stationd.rules
-check "no coaxhub-radiod.service (only the template)" test ! -e /usr/lib/systemd/system/coaxhub-radiod.service
+check "no coaxhub-radiod.service (only the template)" test ! -e "${SYSLIB}"/systemd/system/coaxhub-radiod.service
 check_eq "the package has no conffile" "" "$(dpkg-query -W -f='${Conffiles}' coaxhub-stationd)"
 check "the package ships nothing under /etc/coaxhub" test ! -e /etc/coaxhub
 check_contains "the blacklist names dvb_usb_rtl28xxu" "blacklist dvb_usb_rtl28xxu" \
-    "$(cat /usr/lib/modprobe.d/coaxhub-stationd.conf)"
+    "$(cat "${SYSLIB}"/modprobe.d/coaxhub-stationd.conf)"
 copyright="$(cat /usr/share/doc/coaxhub-stationd/copyright)"
 check_contains "copyright names the ka9q-radio commit" "${KA9Q_COMMIT}" "${copyright}"
 check_contains "copyright names the source tarball" "ka9q-radio-${KA9Q_COMMIT:0:8}.tar.gz" "${copyright}"
@@ -117,7 +128,7 @@ check_eq "stationd run exits 3 when not enrolled (as coaxhub)" 3 \
 # does with a request is tested under a real systemd (test-systemd.sh); here its
 # units are read as text, and the binary is started the way nothing should
 # start it.
-socket_unit="$(grep -v '^[[:space:]]*#' /usr/lib/systemd/system/coaxhub-helper.socket)"
+socket_unit="$(grep -v '^[[:space:]]*#' "${SYSLIB}"/systemd/system/coaxhub-helper.socket)"
 check_contains "helper socket: /run/coaxhub-helper.sock" "ListenStream=/run/coaxhub-helper.sock" "${socket_unit}"
 check_contains "helper socket: owner root" "SocketUser=root" "${socket_unit}"
 check_contains "helper socket: group coaxhub" "SocketGroup=coaxhub" "${socket_unit}"
@@ -127,7 +138,7 @@ check_contains "helper socket: at most 4 connections" "MaxConnections=4" "${sock
 check_contains "helper socket: trigger limit interval" "TriggerLimitIntervalSec=2s" "${socket_unit}"
 check_contains "helper socket: trigger limit burst" "TriggerLimitBurst=200" "${socket_unit}"
 check_lacks "helper socket: nobody enables it (no [Install])" "[Install]" "${socket_unit}"
-helper_unit="$(grep -v '^[[:space:]]*#' /usr/lib/systemd/system/coaxhub-helper@.service)"
+helper_unit="$(grep -v '^[[:space:]]*#' "${SYSLIB}"/systemd/system/coaxhub-helper@.service)"
 check_contains "helper unit: runs the helper" "ExecStart=/usr/lib/coaxhub/coaxhub-helper" "${helper_unit}"
 check_contains "helper unit: the connection is its standard input" "StandardInput=socket" "${helper_unit}"
 check_contains "helper unit: no capability" $'CapabilityBoundingSet=\n' "${helper_unit}"$'\n'
@@ -271,10 +282,20 @@ if [[ "${MODE}" == with-systemd ]]; then
     # The template unit is verified through an instance of it.
     for unit in stationd.service coaxhub-radiod@1.service coaxhub-helper.socket coaxhub-helper@0-1.service; do
         check "systemd-analyze verify ${unit}" systemd-analyze verify "${unit}"
+        # verify exits 0 on an unknown directive of an older systemd (jammy's 249): it must print nothing.
+        # (the system's own units may warn about their symlinks: only ours count)
+        check_eq "systemd-analyze verify ${unit}: no warning about it (every directive exists on this systemd)" "" \
+            "$(systemd-analyze verify "${unit}" 2>&1 | grep -E 'coaxhub|stationd|[Uu]nknown|not supported|Failed' || true)"
     done
-    # systemd's own exposure score (0 best, 10 worst); all "OK" today.
+    # systemd's own exposure score (0 best, 10 worst); all "OK" today. `--offline` (a
+    # unit file without a running systemd) came after jammy's systemd 249: there the score
+    # is checked by test-systemd.sh, against the running manager.
     for limit in "stationd.service 2.5" "coaxhub-radiod@1.service 4.5" "coaxhub-helper@0-1.service 3.0"; do
         read -r unit max <<<"${limit}"
+        if ! systemd-analyze security --help 2>&1 | grep -q -- --offline; then
+            ok "${unit} exposure: this systemd has no --offline (checked under test-systemd.sh)"
+            continue
+        fi
         score="$(systemd-analyze security --offline=true "${unit}" 2>&1 |
             sed -n 's/.*Overall exposure level for .*: \([0-9.]*\) .*/\1/p')"
         check "${unit} exposure ${score:-?} <= ${max} (systemd-analyze security)" \
@@ -282,7 +303,7 @@ if [[ "${MODE}" == with-systemd ]]; then
     done
     check "postinst enabled systemd-time-wait-sync" \
         systemctl is-enabled --quiet systemd-time-wait-sync.service
-    unit="$(cat /usr/lib/systemd/system/stationd.service)"
+    unit="$(cat "${SYSLIB}"/systemd/system/stationd.service)"
     check_contains "stationd.service: RestartPreventExitStatus=3" "RestartPreventExitStatus=3" "${unit}"
     check_contains "stationd.service: after time-sync.target" "time-sync.target" "${unit}"
     check_lacks "stationd.service: does not depend on radiod" "coaxhub-radiod" "$(grep -v '^#' <<<"${unit}")"
@@ -290,7 +311,7 @@ if [[ "${MODE}" == with-systemd ]]; then
         "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK" "${unit}"
     check_contains "stationd.service: wants the helper's socket" "Wants=coaxhub-helper.socket" "${unit}"
     check_contains "stationd.service: after the helper's socket" "After=coaxhub-helper.socket" "${unit}"
-    unit="$(cat /usr/lib/systemd/system/coaxhub-radiod@.service)"
+    unit="$(cat "${SYSLIB}"/systemd/system/coaxhub-radiod@.service)"
     check_contains "coaxhub-radiod@.service: a runtime directory per receiver" \
         "RuntimeDirectory=coaxhub-radiod/%i" "${unit}"
     check_contains "coaxhub-radiod@.service: a receiver with no renderable config is not started or retried" \
@@ -303,7 +324,7 @@ if [[ "${MODE}" == with-systemd ]]; then
         "ExecStartPre=+ip link set dev lo multicast on" "${unit}"
     check_lacks "coaxhub-radiod@.service: no [Install] (stationd starts the instances)" "[Install]" "${unit}"
     if udevadm verify --help >/dev/null 2>&1; then
-        check "udevadm verify the rule" udevadm verify /usr/lib/udev/rules.d/72-coaxhub-rtlsdr.rules
+        check "udevadm verify the rule" udevadm verify "${SYSLIB}"/udev/rules.d/72-coaxhub-rtlsdr.rules
     fi
     # As the installer does, so purge has something to clean up. Only
     # stationd is enabled.
@@ -329,9 +350,9 @@ check_eq "reinstall keeps the receivers directory's mode" "2750 coaxhub coaxhub-
 check "apt-get remove" apt_quiet remove coaxhub-stationd
 check "remove: stationd is gone" test ! -e /usr/bin/stationd
 check "remove: /usr/lib/coaxhub is gone" test ! -e /usr/lib/coaxhub
-check "remove: the units are gone" test ! -e /usr/lib/systemd/system/stationd.service
+check "remove: the units are gone" test ! -e "${SYSLIB}"/systemd/system/stationd.service
 check "remove: the helper is gone" test ! -e /usr/lib/coaxhub/coaxhub-helper
-check "remove: the helper's units are gone" test ! -e /usr/lib/systemd/system/coaxhub-helper.socket
+check "remove: the helper's units are gone" test ! -e "${SYSLIB}"/systemd/system/coaxhub-helper.socket
 check_eq "remove: the credentials stay" marker "$(cat /var/lib/coaxhub/stationd/key.pem 2>&1)"
 check_eq "remove: the receiver set stays" "${receivers_before}" "$(cat /var/lib/coaxhub/receivers/receivers.json 2>&1)"
 check "remove: the users stay" getent passwd coaxhub
@@ -341,8 +362,8 @@ check "apt-get purge" apt_quiet purge coaxhub-stationd
 check_eq "purge: dpkg forgets the package" "" "$(dpkg-query -W -f='${Status}' coaxhub-stationd 2>/dev/null)"
 for path in /etc/coaxhub /var/lib/coaxhub /var/lib/coaxhub/receivers /var/lib/coaxhub-radiod \
     /usr/lib/coaxhub /usr/share/coaxhub /usr/share/doc/coaxhub-stationd /run/coaxhub-radiod \
-    /usr/lib/udev/rules.d/72-coaxhub-rtlsdr.rules /usr/lib/modprobe.d/coaxhub-stationd.conf \
-    /usr/lib/systemd/system/coaxhub-helper.socket /usr/lib/systemd/system/coaxhub-helper@.service \
+    ${SYSLIB}/udev/rules.d/72-coaxhub-rtlsdr.rules ${SYSLIB}/modprobe.d/coaxhub-stationd.conf \
+    ${SYSLIB}/systemd/system/coaxhub-helper.socket ${SYSLIB}/systemd/system/coaxhub-helper@.service \
     /run/coaxhub-helper.sock; do
     check "purge: ${path} is gone" test ! -e "${path}"
 done

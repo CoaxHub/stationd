@@ -13,6 +13,9 @@
 
 # shellcheck source-path=SCRIPTDIR source=common.sh
 . /test/common.sh
+# SYSLIB (/usr/lib or /lib), SUFFIX, TARGET_NAME ... of the suite under test, from the host.
+# shellcheck source=/dev/null
+. /test/suite.env
 
 readonly SUITE="${1:?suite}"
 readonly PORT=28080
@@ -126,20 +129,32 @@ for profile in rtlsdr rtlsdr-hf rtlsdr-v4 airspy; do
 done
 nothing_written "--profile"
 
-# Other systems: /etc/os-release is swapped for a while.
+# Other systems: /etc/os-release is swapped for a while. Each refusal names the
+# system (PRETTY_NAME) and lists what is supported, and writes nothing.
 cp -P /etc/os-release /root/os-release.orig
-for os in "debian bullseye" "ubuntu noble" "fedora 40"; do
-    read -r os_id os_version <<<"${os}"
+supported_line="CoaxHub stations run on ${SUPPORTED_TEXT}"
+fake_os() { # NAME ID CODENAME PRETTY [ID_LIKE [UBUNTU_CODENAME]]
     rm -f /etc/os-release
-    case "${os_id}" in
-    debian) printf 'ID=debian\nVERSION_CODENAME=%s\nPRETTY_NAME="Debian (%s)"\n' "${os_version}" "${os_version}" ;;
-    ubuntu) printf 'ID=ubuntu\nID_LIKE=debian\nVERSION_CODENAME=%s\n' "${os_version}" ;;
-    fedora) printf 'ID=fedora\nVERSION_ID=%s\nPRETTY_NAME="Fedora %s"\n' "${os_version}" "${os_version}" ;;
-    esac >/etc/os-release
+    {
+        printf 'ID=%s\nPRETTY_NAME="%s"\n' "$2" "$4"
+        [[ -n "$3" ]] && printf 'VERSION_CODENAME=%s\n' "$3"
+        [[ -n "${5:-}" ]] && printf 'ID_LIKE="%s"\n' "$5"
+        [[ -n "${6:-}" ]] && printf 'UBUNTU_CODENAME=%s\n' "$6"
+    } >/etc/os-release
     rc="$(run /tmp/t.log "${good}" -y "${common[@]}")"
-    check_eq "${os}: refused" 1 "${rc}"
-    check_contains "${os}: says it is unsupported" "support" "$(cat /tmp/t.log)"
-done
+    check_eq "$1: refused" 1 "${rc}"
+    check_contains "$1: names the system" "$4 is not supported" "$(cat /tmp/t.log)"
+    check_contains "$1: lists what is supported" "${supported_line}" "$(cat /tmp/t.log)"
+}
+fake_os "Debian 11" debian bullseye "Debian GNU/Linux 11 (bullseye)" ""
+fake_os "Ubuntu 23.10 (not an LTS)" ubuntu mantic "Ubuntu 23.10" debian
+fake_os "Ubuntu 20.04 (past standard support)" ubuntu focal "Ubuntu 20.04.6 LTS" debian
+fake_os "Linux Mint (a derivative)" linuxmint wilma "Linux Mint 22" "ubuntu debian" noble
+fake_os "Pop!_OS (a derivative)" pop noble "Pop!_OS 24.04 LTS" "ubuntu debian" noble
+fake_os "Fedora" fedora "" "Fedora Linux 40 (Workstation Edition)" ""
+fake_os "a Debian that claims an Ubuntu codename" debian jammy "Odd Debian (jammy)" ""
+check_lacks "never says 'Debian jammy'" "Debian jammy" "$(cat /tmp/t.log)"
+fake_os "an Ubuntu that claims a Debian codename" ubuntu bookworm "Odd Ubuntu (bookworm)" debian
 rm -f /etc/os-release
 cp -P /root/os-release.orig /etc/os-release
 nothing_written "unsupported systems"
@@ -169,6 +184,41 @@ check_eq "an extra key in the key file: refused" 1 "${rc}"
 nothing_written "extra key"
 cp /root/good-key.asc "${REPO}/coaxhub-archive-keyring.asc"
 
+# ---------------------------------------------------------------- Raspberry Pi OS and needrestart
+# Raspberry Pi OS (ID=raspbian) on the Debian suites is accepted by the
+# installer and by the package; on Ubuntu it is refused by the installer.
+if [[ " ${OS_IDS} " == *" raspbian "* ]]; then
+    rm -f /etc/os-release
+    printf 'ID=raspbian\nID_LIKE=debian\nVERSION_CODENAME=%s\nPRETTY_NAME="Raspbian GNU/Linux (%s)"\n' "${SUITE}" "${SUITE}" >/etc/os-release
+    rc="$(run /tmp/t.log "${good}" -y --token-file /root/token "${common[@]}")"
+    check_eq "Raspberry Pi OS: the installer goes through to enrollment (exits 1, no control plane)" 1 "${rc}"
+    check_contains "Raspberry Pi OS: reaches enrollment" "enrollment failed" "$(cat /tmp/t.log)"
+    check_eq "Raspberry Pi OS: the package is installed" "install ok installed" \
+        "$(dpkg-query -W -f='${Status}' coaxhub-stationd)"
+    apt_quiet purge coaxhub-stationd
+    rm -f "${KEYRING}" "${SOURCES}"
+    rm -f /etc/os-release
+    cp -P /root/os-release.orig /etc/os-release
+else
+    rm -f /etc/os-release
+    printf 'ID=raspbian\nID_LIKE=debian\nVERSION_CODENAME=%s\nPRETTY_NAME="Raspbian GNU/Linux"\n' "${SUITE}" >/etc/os-release
+    rc="$(run /tmp/t.log "${good}" -y "${common[@]}")"
+    check_eq "Raspberry Pi OS on an Ubuntu suite: refused" 1 "${rc}"
+    check_contains "Raspberry Pi OS on an Ubuntu suite: names the system" "Raspbian GNU/Linux is not supported" "$(cat /tmp/t.log)"
+    rm -f /etc/os-release
+    cp -P /root/os-release.orig /etc/os-release
+    nothing_written "raspbian on Ubuntu"
+    # needrestart (Ubuntu's, on by default) runs after every apt-get and would stop
+    # `curl | sudo sh` with a dialog unless NEEDRESTART_SUSPEND is set: its apt hook is
+    # a shim that records what it was given.
+    mkdir -p /usr/lib/needrestart
+    # shellcheck disable=SC2016 # the shim's own $
+    printf '#!/bin/sh\necho "suspend=${NEEDRESTART_SUSPEND:-unset}" >>/tmp/needrestart.seen\n' >/usr/lib/needrestart/apt-pinvoke
+    chmod 0755 /usr/lib/needrestart/apt-pinvoke
+    printf 'DPkg::Post-Invoke { "[ -x /usr/lib/needrestart/apt-pinvoke ] && /usr/lib/needrestart/apt-pinvoke || true"; };\n' \
+        >/etc/apt/apt.conf.d/99needrestart-shim
+fi
+
 # ---------------------------------------------------------------- happy path
 # Piped into sh, as `curl -fsSL …/station | sudo sh -s -- …` runs it.
 rc=0
@@ -191,6 +241,10 @@ check_contains "sources: the suite" "Suites: ${SUITE}" "${sources}"
 check_contains "sources: the URL" "URIs: ${URL}" "${sources}"
 check_eq "the package is installed" "install ok installed" \
     "$(dpkg-query -W -f='${Status}' coaxhub-stationd)"
+if [[ " ${OS_IDS} " != *" raspbian "* ]]; then
+    check_contains "needrestart's hook ran after the installer's apt-get" "suspend=" "$(cat /tmp/needrestart.seen)"
+    check_lacks "needrestart was always suspended (no dialog on a terminal)" "suspend=unset" "$(cat /tmp/needrestart.seen)"
+fi
 check "the installer writes no configuration" test ! -e /etc/coaxhub
 check_eq "the installer writes no receivers.json" "" "$(ls -A "${RECEIVERS}")"
 check_lacks "the installer never mentions a profile" "profile" "${log}"

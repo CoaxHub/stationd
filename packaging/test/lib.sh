@@ -10,6 +10,8 @@ set -euo pipefail
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATION="$(cd "${TEST_DIR}/../.." && pwd)"
+# shellcheck source=packaging/suites.sh
+. "${STATION}/packaging/suites.sh"
 PACKAGES="${STATION}/target/packages"
 readonly TEST_DIR STATION PACKAGES
 # Every container this run starts, removed on exit.
@@ -28,6 +30,44 @@ cleanup_containers() {
     fi
 }
 trap cleanup_containers EXIT
+
+# suite_args "$@": sets `suites` from --quick (bookworm only), --suite S or
+# nothing (every suite), and `quick`. Sets nothing else.
+# shellcheck disable=SC2034 # read by the scripts that call it
+suite_args() {
+    suites=("${ALL_SUITES[@]}")
+    quick=0
+    while (($#)); do
+        case "$1" in
+        --quick) suites=(bookworm); quick=1 ;;
+        --suite)
+            suite_info "${2:-}" || die "--suite must be one of: ${ALL_SUITES[*]}"
+            suites=("$2")
+            shift
+            ;;
+        *) die "usage: $0 [--quick] [--suite ${ALL_SUITES[*]// /|}]" ;;
+        esac
+        shift
+    done
+}
+
+# suite_env SUITE: sets SUITE_* (suites.sh) and writes the shell file that
+# in-container scripts source: the suite's paths and names.
+suite_env() {
+    suite_info "$1" || die "unknown suite $1"
+    local f
+    f="$(mktemp)"
+    {
+        printf 'CODENAME=%q\n' "$1"
+        printf 'SYSLIB=%q\n' "/${SUITE_SYSLIB}"
+        printf 'SUFFIX=%q\n' "${SUITE_SUFFIX}"
+        printf 'TARGET_NAME=%q\n' "${SUITE_NAME}"
+        printf 'OS_IDS=%q\n' "${SUITE_OS_IDS}"
+        printf 'BASE_IMAGE=%q\n' "${SUITE_BASE}"
+        printf 'SUPPORTED_TEXT=%q\n' "${SUPPORTED_TEXT}"
+    } >"${f}"
+    SUITE_ENV_FILE="${f}"
+}
 
 # start_container NAME IMAGE [docker run options...]: a detached container
 # that idles until removed.
@@ -56,6 +96,7 @@ run_in() {
     shift 2
     docker exec "${name}" mkdir -p /test
     docker cp "${TEST_DIR}/in-container/common.sh" "${name}:/test/common.sh" >/dev/null
+    docker cp "${SUITE_ENV_FILE:?call suite_env first}" "${name}:/test/suite.env" >/dev/null
     docker cp "${script}" "${name}:/test/$(basename "${script}")" >/dev/null
     docker exec "${name}" bash "/test/$(basename "${script}")" "$@"
 }

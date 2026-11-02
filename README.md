@@ -9,13 +9,13 @@ stationd is the station daemon of [CoaxHub](https://coaxhub.com). It connects an
 - the **station protocol**, `proto/` and `crates/station-proto/` (MIT): the wire format that the hub and any station implementation build against, with the validation both sides share;
 - **stationd**, `crates/stationd/`, its backend trait, `crates/station-backend/`, the radiod backend, `crates/backend-ka9q/`, and `coaxhub-helper`, `crates/coaxhub-helper/`, the root helper through which stationd starts the receivers' units (GPL-3.0-only);
 - **station-conformance**, `crates/station-conformance/` (MIT): a scripted fake hub for testing a station implementation;
-- the Debian package `coaxhub-stationd` (`packaging/`) and the installer (`installer/`), GPL-3.0-only;
+- the package `coaxhub-stationd` for Debian, Raspberry Pi OS and Ubuntu LTS (`packaging/`) and the installer (`installer/`), GPL-3.0-only;
 - `scripts/`: radiod built at its pinned commit, the end-to-end runs, fuzzing and the license-boundary check;
 - `testdata/`: radiod configs (a signal generator, so that everything can be tested without SDR hardware, and the three RTL-SDR profiles: VHF/UHF, HF by direct sampling, and the RTL-SDR Blog V4).
 
 ## Installing a station
 
-A station is a Debian or Raspberry Pi OS computer (bookworm or trixie, amd64 or arm64) with one or more RTL-SDRs on USB. The installer adds the signed CoaxHub APT repository, installs the `coaxhub-stationd` package, asks for the enrollment token from the web app (with the input hidden) and starts `stationd.service`:
+A station is a computer running Ubuntu LTS (22.04 jammy, 24.04 noble or 26.04 resolute), or Debian or Raspberry Pi OS (12 bookworm or 13 trixie), on amd64 or arm64, with one or more RTL-SDRs on USB. A release is a target while its distribution publishes security updates for it under standard support (not ESM or Ubuntu Pro, not paid Debian extended support); derivatives such as Linux Mint are not supported, and neither the installer nor the package installs on any other system. The installer adds the signed CoaxHub APT repository, installs the `coaxhub-stationd` package, asks for the enrollment token from the web app (with the input hidden) and starts `stationd.service`:
 
 ```sh
 curl -fsSL https://get.coaxhub.com/station | sudo sh

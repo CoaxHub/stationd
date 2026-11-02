@@ -10,11 +10,13 @@
 
 # shellcheck source-path=SCRIPTDIR source=common.sh
 . /test/common.sh
+# SYSLIB (/usr/lib or /lib), SUFFIX, TARGET_NAME ... of the suite under test, from the host.
+# shellcheck source=/dev/null
+. /test/suite.env
 
-readonly SUITE="${1:?suite}" ARCH="${2:?arch}"
+readonly ARCH="${2:?arch}"
 readonly LIB=usr/lib/coaxhub/radiod
 deb="$(ls /test/pkg/coaxhub-stationd_*_"${ARCH}".deb)"
-case "${SUITE}" in bookworm) debv=12 ;; trixie) debv=13 ;; esac
 case "${ARCH}" in amd64) machine="x86-64" ;; arm64) machine="ARM aarch64" ;; esac
 
 apt_quiet update && apt_quiet install --no-install-recommends file binutils || exit 1
@@ -23,7 +25,7 @@ info="$(dpkg-deb --info "${deb}")"
 field() { dpkg-deb --field "${deb}" "$1"; }
 check_eq "Package" coaxhub-stationd "$(field Package)"
 check_eq "Architecture" "${ARCH}" "$(field Architecture)"
-check_contains "Version ends in ~deb${debv}" "~deb${debv}" "$(field Version)"
+check_contains "Version ends in ~${SUFFIX}" "~${SUFFIX}" "$(field Version)"
 check_contains "file name matches the version" "_$(field Version)_${ARCH}.deb" "${deb}"
 depends="$(field Depends)"
 for dep in libc6 libopus0 libfftw3-single3 libiniparser libusb-1.0-0 adduser iproute2 dbus; do
@@ -41,15 +43,15 @@ for path in ./usr/bin/stationd ./usr/lib/coaxhub/coaxhub-helper ./${LIB}/radiod 
     ./${LIB}/presets.conf ./usr/share/coaxhub/radiod-templates/rtlsdr.conf \
     ./usr/share/coaxhub/radiod-templates/rtlsdr-hf.conf \
     ./usr/share/coaxhub/radiod-templates/rtlsdr-v4.conf \
-    ./usr/lib/systemd/system/stationd.service ./usr/lib/systemd/system/coaxhub-radiod@.service \
-    ./usr/lib/systemd/system/coaxhub-helper.socket ./usr/lib/systemd/system/coaxhub-helper@.service \
-    ./usr/lib/udev/rules.d/72-coaxhub-rtlsdr.rules ./usr/lib/modprobe.d/coaxhub-stationd.conf \
+    .${SYSLIB}/systemd/system/stationd.service .${SYSLIB}/systemd/system/coaxhub-radiod@.service \
+    .${SYSLIB}/systemd/system/coaxhub-helper.socket .${SYSLIB}/systemd/system/coaxhub-helper@.service \
+    .${SYSLIB}/udev/rules.d/72-coaxhub-rtlsdr.rules .${SYSLIB}/modprobe.d/coaxhub-stationd.conf \
     ./usr/share/doc/coaxhub-stationd/copyright; do
     check_contains "contains ${path}" " ${path}"$'\n' "${contents}"$'\n'
 done
 check_lacks "no siggen template" "siggen" "${contents}"
 check_lacks "no polkit rule" "polkit" "${contents}"
-check_lacks "no coaxhub-radiod.service (only the template)" " ./usr/lib/systemd/system/coaxhub-radiod.service" "${contents}"
+check_lacks "no coaxhub-radiod.service (only the template)" " .${SYSLIB}/systemd/system/coaxhub-radiod.service" "${contents}"
 check_lacks "nothing under /etc" " ./etc/" "${contents}"
 check_eq "every file is owned by root" "" "$(awk '$2 != "root/root"' <<<"${contents}")"
 

@@ -15,9 +15,9 @@ A release is a tag. This repository builds, tests and attaches the packages to a
    ```
 
 3. The release workflow runs on the tag. It:
-   - builds the four packages (bookworm and trixie × amd64 and arm64) with the production domain and the production root certificate, which is public and committed under `packaging/roots/`;
-   - runs the package and installer tests (`packaging/test/test-packages.sh`, `packaging/test/test-installer.sh`);
-   - creates the GitHub release and attaches the four `.deb` files, `SHA256SUMS`, the installer template (`installer/station.sh`, with its two placeholders unfilled) and the source tarballs of radiod, `ka9q-radio-<commit8>.tar.gz` with our patches to it, `ka9q-radio-<commit8>-<name>.patch`, and of librtlsdr, `rtl-sdr-<commit8>.tar.gz`.
+   - builds the ten packages (bookworm, trixie, jammy, noble and resolute × amd64 and arm64) with the production domain and the production root certificate, which is public and committed under `packaging/roots/`;
+   - runs the package, systemd and installer tests (`packaging/test/test-packages.sh`, `packaging/test/test-systemd.sh`, `packaging/test/test-installer.sh`) on every suite;
+   - creates the GitHub release and attaches the ten `.deb` files, `SHA256SUMS`, the installer template (`installer/station.sh`, with its two placeholders unfilled) and the source tarballs of radiod, `ka9q-radio-<commit8>.tar.gz` with our patches to it, `ka9q-radio-<commit8>-<name>.patch`, and of librtlsdr, `rtl-sdr-<commit8>.tar.gz`.
 4. CoaxHub's own tooling then publishes from those assets: it downloads them, checks them against `SHA256SUMS`, signs the APT repository at `apt.<domain>`, fills the repository URL and the key fingerprint into the installer template, and serves the result at `get.<domain>/station`. That tooling is not in this repository.
 
 The domain is a repository variable of the workflow and never a default in the tree. The workflow refuses to build a release with `coaxhub.test`.
@@ -26,7 +26,7 @@ The domain is a repository variable of the workflow and never a default in the t
 
 | Asset | What |
 |---|---|
-| `coaxhub-stationd_<v>-<r>~deb12_amd64.deb`, `…~deb12_arm64.deb`, `…~deb13_amd64.deb`, `…~deb13_arm64.deb` | the packages, unsigned |
+| `coaxhub-stationd_<v>-<r>~<suffix>_<arch>.deb` for the suffixes `deb12`, `deb13`, `ubuntu22.04`, `ubuntu24.04` and `ubuntu26.04` and the architectures `amd64` and `arm64` | the ten packages, unsigned; the repository serves them as the suites `bookworm`, `trixie`, `jammy`, `noble` and `resolute` |
 | `SHA256SUMS` | the SHA-256 of every other asset |
 | `station.sh` | the installer template: it refuses to run until its two placeholders are replaced |
 | `ka9q-radio-<commit8>.tar.gz` | the upstream source of the bundled radiod, at the pinned commit |
@@ -54,6 +54,10 @@ To check the radiod and librtlsdr sources:
 ```sh
 sha256sum ka9q-radio-<commit8>.tar.gz ka9q-radio-<commit8>-*.patch rtl-sdr-<commit8>.tar.gz   # equal the SHA-256s in /usr/share/doc/coaxhub-stationd/copyright
 ```
+
+## Adding or dropping a system
+
+The supported systems are rows of [packaging/suites.sh](../packaging/suites.sh) (the suite, its Docker image, version suffix, `/etc/os-release` IDs, the first `base-files` version of the release, and where its units go), plus the `case` of the installer (`installer/station.sh`, `check_system`), the CI matrix (`.github/workflows/ci.yml`) and the wrong-package pairs of `packaging/test/test-packages.sh`; [packaging.md §1](packaging.md#1-targets-and-versions) is the policy. A new Debian stable or Ubuntu LTS is added in the first release after it comes out; the first release after a release's standard support ends (Debian's security team or LTS; Ubuntu's five years, not ESM) drops it: its row, its installer case, its CI entry. The packages already in the repository stay but get no new versions. The repository then serves one suite per row (`scripts/apt-repo.sh` in CoaxHub's tooling lists them).
 
 ## Changing the root certificate
 

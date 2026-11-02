@@ -6,27 +6,20 @@
 # container (in-container/installer.sh). Needs the amd64 and arm64 packages
 # in target/packages (packaging/build-all.sh); no bind mounts, no host ports.
 #
-# Usage: packaging/test/test-installer.sh [--quick] [--suite bookworm|trixie]
+# Usage: packaging/test/test-installer.sh [--quick] [--suite bookworm|trixie|jammy|noble|resolute]
 #        (--quick: bookworm only)
 
 export TEST_NAME=test-installer
 # shellcheck source-path=SCRIPTDIR source=lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-suites=(bookworm trixie)
-while (($#)); do
-    case "$1" in
-    --quick) suites=(bookworm) ;;
-    --suite) suites=("${2:?bookworm|trixie}"); shift ;;
-    *) die "usage: $0 [--quick] [--suite bookworm|trixie]" ;;
-    esac
-    shift
-done
+suite_args "$@"
 run="coaxhub-insttest-$$"
 
 installer_test() {
     local suite="$1" name="${run}-${1}" arch
-    start_container "${name}" "debian:${suite}"
+    suite_env "${suite}"
+    start_container "${name}" "${SUITE_BASE}"
     docker exec "${name}" mkdir -p /test/pkg
     for arch in amd64 arm64; do
         docker cp "$(package_for "${suite}" "${arch}")" "${name}:/test/pkg/" >/dev/null

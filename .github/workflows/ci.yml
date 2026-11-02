@@ -105,17 +105,19 @@ jobs:
           if-no-files-found: ignore
 
   packages:
-    # The coaxhub-stationd packages of one Debian suite (amd64 and arm64, arm64
+    # The coaxhub-stationd packages of one suite (Debian bookworm or trixie, Ubuntu jammy,
+    # noble or resolute; amd64 and arm64, arm64
     # cross-compiled) with a throwaway root, then the install, remove and purge tests, the
-    # unit checks, the installer against a signed test repository, and the package under a
-    # real systemd (the helper, the upgrade from 0.2.3), in Debian containers.
+    # unit checks, the installer against a signed test repository, the package refusing a
+    # system it was not built for, and the package under a real systemd (the helper, the
+    # upgrade from 0.2.3, the jammy owner's case), in containers of that system.
     # Releases are built by release.yml with the production domain and root.
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        suite: [bookworm, trixie]
+        suite: [bookworm, trixie, jammy, noble, resolute]
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:

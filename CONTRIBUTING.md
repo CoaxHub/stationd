@@ -26,7 +26,7 @@ This repository mixes two licenses, split by directory:
 | `crates/stationd/` | **GPL-3.0-only** | The station daemon |
 | `crates/station-backend/` | **GPL-3.0-only** | The `Backend` trait and `FakeBackend` |
 | `crates/backend-ka9q/` | **GPL-3.0-only** | The ka9q-radio (`radiod`) backend |
-| `packaging/`, `installer/`, `scripts/` | **GPL-3.0-only** | Debian packaging, systemd units, the install script, test and build scripts |
+| `packaging/`, `installer/`, `scripts/` | **GPL-3.0-only** | packaging (Debian and Ubuntu), systemd units, the install script, test and build scripts |
 | `docs/` | Protocol docs MIT, the rest GPL-3.0-only | Match the license of what they document |
 
 The boundary rule, also enforced by `scripts/check-license-boundary.sh` in CI: **MIT crates never depend on GPL crates**, transitively or otherwise. `station-proto` and `station-conformance` must stay buildable and usable by someone who wants to write an alternative, non-GPL station implementation against the protocol. If you need to share code between the daemon and the protocol crate, it belongs in `station-proto`, not the other way around.

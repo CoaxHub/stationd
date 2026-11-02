@@ -10,7 +10,9 @@
 #           earlier stages
 #   PKGSRC  packaging
 #   OUT     where the .deb goes
-# Environment: ARCH, SUITE, VERSION, COAXHUB_DOMAIN, KA9Q_COMMIT,
+# Environment: ARCH, SUITE (the system's VERSION_CODENAME), OS_IDS, TARGET_NAME,
+#   BASE_FILES_FLOOR, SYSLIB and SUPPORTED_TEXT (all from packaging/suites.sh),
+#   VERSION, COAXHUB_DOMAIN, KA9Q_COMMIT,
 #   KA9Q_TARBALL_SHA256, RTLSDR_VERSION, RTLSDR_COMMIT, RTLSDR_TARBALL_SHA256,
 #   SOURCE_DATE_EPOCH.
 
@@ -19,6 +21,7 @@ set -euo pipefail
 in="$1"
 src="$2"
 out="$3"
+: "${OS_IDS:?}" "${TARGET_NAME:?}" "${BASE_FILES_FLOOR:?}" "${SYSLIB:?}" "${SUPPORTED_TEXT:?}"
 : "${ARCH:?}" "${SUITE:?}" "${VERSION:?}" "${COAXHUB_DOMAIN:?}" "${KA9Q_COMMIT:?}"
 : "${KA9Q_TARBALL_SHA256:?}" "${RTLSDR_VERSION:?}" "${RTLSDR_COMMIT:?}"
 : "${RTLSDR_TARBALL_SHA256:?}" "${SOURCE_DATE_EPOCH:?}"
@@ -41,12 +44,15 @@ install -m 0644 "${in}/radiod/rtlsdr.so" "${in}/radiod/librtlsdr.so.0" "${in}/ra
 install -d "${root}/usr/share/coaxhub/radiod-templates"
 install -m 0644 "${src}/radiod-templates/rtlsdr.conf" "${src}/radiod-templates/rtlsdr-hf.conf" \
     "${src}/radiod-templates/rtlsdr-v4.conf" "${root}/usr/share/coaxhub/radiod-templates/"
-install -d "${root}/usr/lib/systemd/system"
+# Units, the udev rule and the modprobe file go under ${SYSLIB}: /usr/lib, but
+# /lib on jammy, whose kmod reads /lib/modprobe.d and not /usr/lib/modprobe.d
+# (a jammy that is not merged-/usr has the two apart).
+install -d "${root}/${SYSLIB}/systemd/system"
 install -m 0644 "${src}/systemd/stationd.service" "${src}/systemd/coaxhub-radiod@.service" \
     "${src}/systemd/coaxhub-helper.socket" "${src}/systemd/coaxhub-helper@.service" \
-    "${root}/usr/lib/systemd/system/"
-install -D -m 0644 "${src}/udev/72-coaxhub-rtlsdr.rules" "${root}/usr/lib/udev/rules.d/72-coaxhub-rtlsdr.rules"
-install -D -m 0644 "${src}/modprobe/coaxhub-stationd.conf" "${root}/usr/lib/modprobe.d/coaxhub-stationd.conf"
+    "${root}/${SYSLIB}/systemd/system/"
+install -D -m 0644 "${src}/udev/72-coaxhub-rtlsdr.rules" "${root}/${SYSLIB}/udev/rules.d/72-coaxhub-rtlsdr.rules"
+install -D -m 0644 "${src}/modprobe/coaxhub-stationd.conf" "${root}/${SYSLIB}/modprobe.d/coaxhub-stationd.conf"
 
 install -d "${doc}"
 short="${KA9Q_COMMIT:0:8}"
@@ -74,6 +80,14 @@ chmod 0644 "${doc}/copyright"
 # ---------------------------------------------------------------- control
 install -d -m 0755 "${root}/DEBIAN"
 install -m 0755 "${src}/deb/postinst" "${src}/deb/prerm" "${src}/deb/postrm" "${root}/DEBIAN/"
+# The preinst is the package's own check of the system it is built for.
+sed -e "s|@OS_IDS@|${OS_IDS}|g" -e "s|@CODENAME@|${SUITE}|g" -e "s|@TARGET_NAME@|${TARGET_NAME}|g" \
+    -e "s|@SUPPORTED@|${SUPPORTED_TEXT}|g" "${src}/deb/preinst" >"${root}/DEBIAN/preinst"
+chmod 0755 "${root}/DEBIAN/preinst"
+if grep -E '@[A-Z_]+@' "${root}/DEBIAN/preinst" | grep -v '^#'; then
+    echo "preinst has an unfilled field" >&2
+    exit 1
+fi
 
 # Shared-library dependencies of the five ELF objects, for the target
 # architecture (dpkg-shlibdeps wants a debian/control to exist). The private
@@ -111,6 +125,7 @@ Version: ${VERSION}
 Architecture: ${ARCH}
 Maintainer: CoaxHub <packages@${COAXHUB_DOMAIN}>
 Installed-Size: ${installed_size}
+Pre-Depends: base-files (>= ${BASE_FILES_FLOOR})
 Depends: ${shlib_depends}, adduser, iproute2, dbus | dbus-system-bus
 Recommends: systemd-timesyncd | time-daemon
 Section: hamradio
@@ -130,10 +145,10 @@ Description: CoaxHub station daemon with its bundled SDR receiver
  stationd and root can use; no polkit) and configured from the receivers set
  up in the CoaxHub web app, and is not put on PATH.
  .
- Built for Debian ${SUITE} and the CoaxHub service at ${COAXHUB_DOMAIN}.
+ Built for ${TARGET_NAME} and the CoaxHub service at ${COAXHUB_DOMAIN}.
 CONTROL
 
-(cd "${root}" && find usr -type f -print0 | sort -z | xargs -0 md5sum) >"${root}/DEBIAN/md5sums"
+(cd "${root}" && for d in usr lib; do [[ -d "${d}" ]] || continue; find "${d}" -type f -print0; done | sort -z | xargs -0 md5sum) >"${root}/DEBIAN/md5sums"
 chmod 0644 "${root}/DEBIAN/control" "${root}/DEBIAN/md5sums"
 
 # ---------------------------------------------------------------- build

@@ -18,6 +18,9 @@
 
 # shellcheck source-path=SCRIPTDIR source=common.sh
 . /test/common.sh
+# SYSLIB (/usr/lib or /lib), SUFFIX, TARGET_NAME ... of the suite under test, from the host.
+# shellcheck source=/dev/null
+. /test/suite.env
 
 readonly MODE="${1:?fresh|upgrade}" SUITE="${2:?suite}"
 printf "# %s test on %s\n" "${MODE}" "${SUITE}"
@@ -202,7 +205,7 @@ fresh() {
     done
     for limit in "stationd.service 2.5" "coaxhub-radiod@1.service 4.5" "coaxhub-helper@0-1.service 3.0"; do
         read -r unit max <<<"${limit}"
-        score="$(systemd-analyze security --offline=true "${unit}" 2>&1 |
+        score="$(systemd-analyze security "${unit}" 2>&1 |
             sed -n 's/.*Overall exposure level for .*: \([0-9.]*\) .*/\1/p')"
         check "${unit} exposure ${score:-?} <= ${max}" \
             awk -v s="${score:-99}" -v m="${max}" 'BEGIN { exit !(s + 0 <= m + 0) }'
@@ -539,7 +542,7 @@ JSON
     check "remove: the helper is gone" test ! -e /usr/lib/coaxhub/coaxhub-helper
     check_eq "remove: the socket unit is not found" not-found "$(prop coaxhub-helper.socket LoadState)"
     check "apt-get purge" apt_quiet purge coaxhub-stationd
-    check "purge: no helper unit file is left" test -z "$(find /usr/lib/systemd /etc/systemd -name 'coaxhub-helper*' 2>/dev/null)"
+    check "purge: no helper unit file is left" test -z "$(find "${SYSLIB}"/systemd /etc/systemd -name 'coaxhub-helper*' 2>/dev/null)"
     check "purge: no socket file is left" test ! -e "${SOCK}"
     check "purge: no link to our units is left" test -z \
         "$(find /etc/systemd -name 'stationd.service' -o -name 'coaxhub-*' 2>/dev/null)"
@@ -619,12 +622,117 @@ EOF
     drop_test_files
     check "apt-get purge" apt_quiet purge coaxhub-stationd
     check "purge: no helper file, unit or socket is left" test -z \
-        "$(find /usr/lib/systemd /etc/systemd /run -name 'coaxhub-helper*' 2>/dev/null)"
+        "$(find "${SYSLIB}"/systemd /etc/systemd /run -name 'coaxhub-helper*' 2>/dev/null)"
+}
+
+# ---------------------------------------------------------------- owner
+# The jammy owner: 0.2.3 for bookworm on Ubuntu 22.04, as an altered installer
+# left it; then the published installer against a repository with the jammy
+# package. Also a bookworm system with the same installer is covered by fresh.
+owner() {
+    old="$(ls /test/previous/coaxhub-stationd_*_amd64.deb)"
+    readonly URL="http://127.0.0.1:28081" REPO=/srv/repo
+    check_eq "this is the jammy case" jammy "${CODENAME}"
+    # The altered installer had to force it: 0.2.3 for bookworm needs libfftw3-single3 >= 3.3.10
+    # and jammy has 3.3.8 (the same soname, so radiod runs). Its other dependencies, polkit
+    # among them, are installed first.
+    apt_quiet install --no-install-recommends dbus polkitd libbsd0 libfftw3-single3 libiniparser1 \
+        libopus0 libusb-1.0-0 adduser iproute2 || exit 1
+    # The tools of the test (and curl, which the owner's machine had): apt is broken
+    # once the package is forced in, until the jammy package replaces it.
+    apt_quiet install --no-install-recommends gpg gpg-agent apt-utils python3 curl ca-certificates || exit 1
+    check "install the published 0.2.3 package for bookworm, forcing its dependencies as the altered installer did" \
+        dpkg --force-depends -i "${old}"
+    check_eq "0.2.3 is installed" "0.2.3-1~deb12" "$(dpkg-query -W -f='${Version}' coaxhub-stationd)"
+    check_eq "polkit is the jammy one (0.105: .pkla, not .rules)" "0.105" \
+        "$(dpkg-query -W -f='${Version}' polkitd | cut -d- -f1)"
+    stub_radiod
+    # What the owner saw: no receiver can start.
+    fail="$(runuser -u coaxhub -- systemctl --no-ask-password --no-block start coaxhub-radiod@12.service 2>&1)"
+    check_contains "the reported bug: the rule is ignored, \"Interactive authentication required\"" \
+        "Interactive authentication required" "${fail}"
+    check_eq "and the receiver did not start" inactive "$(prop coaxhub-radiod@12.service ActiveState)"
+    systemctl stop coaxhub-radiod@12.service 2>/dev/null
+
+    # A repository with the jammy package, signed with a key of the test, and the
+    # installer filled in as apt-repo.sh does; a station that is enrolled (throwaway
+    # credentials) with two receivers whose SDRs (a fake sysfs) are plugged in.
+    export GNUPGHOME=/root/repo-gnupg
+    mkdir -p "${GNUPGHOME}" && chmod 0700 "${GNUPGHOME}"
+    gpg --batch --quiet --passphrase '' --quick-gen-key 'CoaxHub test archive <archive@coaxhub.test>' ed25519 sign never
+    fpr="$(gpg --batch --with-colons --list-keys | awk -F: '$1 == "fpr" { print $10; exit }')"
+    mkdir -p "${REPO}/pool/main"
+    cp /test/pkg/*.deb "${REPO}/pool/main/"
+    for arch in amd64 arm64; do
+        mkdir -p "${REPO}/dists/${CODENAME}/main/binary-${arch}"
+        (cd "${REPO}" && apt-ftparchive --arch "${arch}" packages pool/main) >"${REPO}/dists/${CODENAME}/main/binary-${arch}/Packages"
+        gzip -9kn "${REPO}/dists/${CODENAME}/main/binary-${arch}/Packages"
+    done
+    apt-ftparchive -o "APT::FTPArchive::Release::Suite=${CODENAME}" -o "APT::FTPArchive::Release::Codename=${CODENAME}" \
+        -o "APT::FTPArchive::Release::Components=main" -o "APT::FTPArchive::Release::Architectures=amd64 arm64" \
+        release "${REPO}/dists/${CODENAME}" >"${REPO}/dists/${CODENAME}/Release"
+    gpg --batch --yes --quiet -u "${fpr}" --clearsign -o "${REPO}/dists/${CODENAME}/InRelease" "${REPO}/dists/${CODENAME}/Release"
+    gpg --batch --yes --quiet -u "${fpr}" -abs -o "${REPO}/dists/${CODENAME}/Release.gpg" "${REPO}/dists/${CODENAME}/Release"
+    gpg --batch --armor --export "${fpr}" >"${REPO}/coaxhub-archive-keyring.asc"
+    (cd "${REPO}" && exec python3 -m http.server 28081 --bind 127.0.0.1 >/tmp/http.log 2>&1) &
+    for _ in $(seq 50); do
+        python3 -c "import urllib.request; urllib.request.urlopen('${URL}/dists/${CODENAME}/Release')" 2>/dev/null && break
+        sleep 0.1
+    done
+    sed -e "s|@COAXHUB_APT_URL@|${URL}|g" -e "s|@COAXHUB_KEY_FINGERPRINT@|${fpr}|g" /test/station.sh >/tmp/station.sh
+
+    fake_enrollment
+    mount -t tmpfs tmpfs /sys/bus/usb/devices
+    for entry in "1-1.3 A0000031" "1-1.4 A0000032"; do
+        read -r port serial <<<"${entry}"
+        mkdir -p "/sys/bus/usb/devices/${port}"
+        printf '0bda\n' >"/sys/bus/usb/devices/${port}/idVendor"
+        printf '2838\n' >"/sys/bus/usb/devices/${port}/idProduct"
+        printf '%s\n' "${serial}" >"/sys/bus/usb/devices/${port}/serial"
+        printf 'RTL2838UHIDIR\n' >"/sys/bus/usb/devices/${port}/product"
+    done
+    put_receivers_json <<'JSON'
+{"receivers": [
+  {"receiver_id": 31, "slot": 1, "sdr_serial": "A0000031", "model": "rtlsdr_other",
+   "profile": "rtlsdr", "center_frequency_hz": 98000000},
+  {"receiver_id": 32, "slot": 2, "sdr_serial": "A0000032", "model": "rtlsdr_other",
+   "profile": "rtlsdr", "center_frequency_hz": 98000000}
+]}
+JSON
+    fast_time_sync
+    # The old stationd as the owner ran it: it asks polkit and every receiver fails.
+    mkdir -p "$(dirname "${DROPIN_STATIOND}")"
+    printf '[Service]\nRestart=no\n' >"${DROPIN_STATIOND}"
+    real_renderer
+    systemctl daemon-reload
+    systemctl start stationd.service
+    check "the old stationd cannot start the receivers (no receiver unit runs)" bash -c \
+        "sleep 6; test -z \"\$(systemctl list-units 'coaxhub-radiod@*' --state=active,activating --plain --no-legend)\""
+    check_contains "its journal says why" "Interactive authentication required" \
+        "$(journalctl -u stationd.service -o cat --no-pager 2>&1)"
+
+    # The published installer, once the repository has the jammy package.
+    rc=0
+    sh /tmp/station.sh -y --skip-time-sync </dev/null >/tmp/installer.log 2>&1 || rc=$?
+    check_eq "the installer succeeds on jammy" 0 "${rc}"
+    check_contains "it writes the jammy suite" "Suites: jammy" "$(cat /etc/apt/sources.list.d/coaxhub.sources)"
+    check_contains "the package is now the jammy one" "~ubuntu22.04" "$(dpkg-query -W -f='${Version}' coaxhub-stationd)"
+    check_eq "the polkit rule file is gone" "" "$(ls /usr/share/polkit-1/rules.d/coaxhub-stationd.rules 2>/dev/null)"
+    check_eq "the helper's socket is active" active "$(prop coaxhub-helper.socket ActiveState)"
+    check "the receivers start" wait_for 30 is_active coaxhub-radiod@31.service
+    check "both receivers start" wait_for 30 is_active coaxhub-radiod@32.service
+    check_contains "the helper started them for stationd's user" "start 31: ok" \
+        "$(journalctl -u 'coaxhub-helper@*' -o cat --no-pager 2>&1)"
+    check_contains "the DVB blacklist is where jammy's kmod reads it" "blacklist dvb_usb_rtl28xxu" "$(modprobe --showconfig 2>&1)"
+    systemctl stop stationd.service coaxhub-radiod@31.service coaxhub-radiod@32.service
+    umount /sys/bus/usb/devices
+    drop_test_files
 }
 
 case "${MODE}" in
 fresh) fresh ;;
 upgrade) upgrade ;;
+owner) owner ;;
 *) echo "unknown mode ${MODE}" >&2; exit 2 ;;
 esac
 done_testing

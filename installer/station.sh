@@ -6,8 +6,9 @@
 #   curl -fsSL https://get.<domain>/station | sudo sh
 #
 # What it does, in order:
-#   1. checks that it runs as root on Debian or Raspberry Pi OS (bookworm or
-#      trixie), on amd64 or arm64;
+#   1. checks that it runs as root on Ubuntu LTS (22.04 jammy, 24.04 noble or
+#      26.04 resolute) or Debian or Raspberry Pi OS (12 bookworm or 13
+#      trixie), on amd64 or arm64, and refuses every other system, naming it;
 #   2. lists the SDRs it sees on USB, as information: it asks nothing about
 #      them. The owner sets up each receiver (its SDR, model and band) in the
 #      web app, from the list the station reports;
@@ -138,15 +139,25 @@ check_system() {
 	[ -r /etc/os-release ] || die "cannot identify this system (no /etc/os-release)"
 	# shellcheck disable=SC1091 # the system's own file
 	. /etc/os-release
-	case " ${ID:-} ${ID_LIKE:-} " in
-	*" debian "*) ;;
-	*) die "${PRETTY_NAME:-${ID:-this system}} is not supported: CoaxHub stations run on Debian or Raspberry Pi OS" ;;
-	esac
+	# By ID, exactly: Linux Mint, Pop!_OS and the like name Ubuntu or Debian
+	# only in ID_LIKE or UBUNTU_CODENAME, and are not tested here. The same
+	# rule is the package's own preinst.
 	codename="${VERSION_CODENAME:-}"
-	case "$codename" in
-	bookworm | trixie) ;;
-	*) die "Debian ${codename:-${VERSION_ID:-unknown}} is not supported; use Debian or Raspberry Pi OS bookworm (12) or trixie (13)" ;;
+	supported=no
+	case "${ID:-}" in
+	ubuntu)
+		case "$codename" in
+		jammy | noble | resolute) supported=yes ;;
+		esac
+		;;
+	debian | raspbian)
+		case "$codename" in
+		bookworm | trixie) supported=yes ;;
+		esac
+		;;
 	esac
+	[ "$supported" = yes ] ||
+		die "${PRETTY_NAME:-${ID:-this system}} is not supported: CoaxHub stations run on Ubuntu 22.04, 24.04 or 26.04 LTS, or Debian or Raspberry Pi OS 12 or 13 (64-bit)"
 	command -v dpkg >/dev/null 2>&1 || die "dpkg not found"
 	arch=$(dpkg --print-architecture)
 	case "$arch" in
@@ -201,7 +212,7 @@ install_prerequisites() {
 	say "Installing:$missing"
 	apt-get update -q >/dev/null
 	# shellcheck disable=SC2086 # a list of packages
-	DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends $missing >/dev/null
+	NEEDRESTART_SUSPEND=1 DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends $missing >/dev/null
 }
 
 add_repository() {
@@ -234,7 +245,9 @@ add_repository() {
 install_package() {
 	say "Installing $PACKAGE."
 	apt-get update -q >/dev/null || die "apt-get update failed"
-	DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$PACKAGE" ||
+	# NEEDRESTART_SUSPEND: Ubuntu's needrestart would stop `curl | sudo sh`
+	# with a dialog; the package restarts its own units itself.
+	NEEDRESTART_SUSPEND=1 DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$PACKAGE" ||
 		die "installing $PACKAGE failed"
 	command -v stationd >/dev/null 2>&1 || die "$PACKAGE is installed but stationd is missing"
 }

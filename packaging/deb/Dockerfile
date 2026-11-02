@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: GPL-3.0-only
 #
-# Builds the coaxhub-stationd Debian package for one (suite, architecture).
+# Builds the coaxhub-stationd package for one (suite, architecture): Debian
+# bookworm or trixie, Ubuntu jammy, noble or resolute (packaging/suites.sh).
 # Driven by packaging/build-deb.sh; the build
 # context is the repository root. arm64 is cross-compiled on an amd64
 # host: no emulation is needed.
 #
 # Stages:
-#   toolchain  debian:<suite> with the native and cross C toolchains, the
+#   toolchain  the suite's image (BASE) with the native and cross C toolchains, the
 #              amd64 and arm64 -dev libraries radiod links, cmake, protoc
 #              and Rust
 #   librtlsdr  osmocom librtlsdr at the pinned commit, from the published
@@ -25,14 +26,29 @@
 #              scripts, Depends from dpkg-shlibdeps, dpkg-deb
 #   export     just the .deb, for `docker build --output type=local`
 
+ARG BASE=debian:bookworm
 ARG SUITE=bookworm
 
-FROM debian:${SUITE} AS toolchain
+FROM ${BASE} AS toolchain
 ARG RUST_VERSION=stable
 ENV DEBIAN_FRONTEND=noninteractive \
     RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Ubuntu's archive.ubuntu.com has no arm64: the image's own sources are
+# limited to amd64 and arm64 comes from ports.ubuntu.com, so that
+# `dpkg --add-architecture arm64` below finds its -dev libraries. jammy has the
+# one-line sources.list, noble and resolute deb822 files.
+RUN . /etc/os-release \
+ && if [ "${ID}" = ubuntu ]; then \
+      for f in /etc/apt/sources.list.d/*.sources; do \
+        [ -e "$f" ] || continue; \
+        sed -i '/^Components:/a Architectures: amd64' "$f"; \
+      done; \
+      if [ -s /etc/apt/sources.list ]; then sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list; fi; \
+      printf 'Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports/\nSuites: %s %s-updates %s-security\nComponents: main universe restricted multiverse\nArchitectures: arm64\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n' \
+        "${VERSION_CODENAME}" "${VERSION_CODENAME}" "${VERSION_CODENAME}" > /etc/apt/sources.list.d/ubuntu-ports.sources; \
+    fi
 # radiod links -lopus -lfftw3f(_threads) -liniparser -lusb-1.0 -lbsd -ldl;
 # librtlsdr (built below, not the suite's) links -lusb-1.0. station-proto's
 # build script runs protoc.
@@ -46,6 +62,16 @@ RUN dpkg --add-architecture arm64 \
       libbsd-dev:arm64 libfftw3-dev:arm64 libiniparser-dev:arm64 libopus-dev:arm64 \
       libusb-1.0-0-dev:arm64 \
  && rm -rf /var/lib/apt/lists/*
+# station-proto has proto3 `optional` fields. protoc before 3.15 (jammy's is
+# 3.12.4) takes them only with --experimental_allow_proto3_optional, which
+# the build script does not pass: on such a protoc the flag is added by a
+# wrapper (3.15 and later accept it and ignore it).
+RUN case "$(protoc --version)" in \
+      "libprotoc 3."[0-9]"."* | "libprotoc 3.1"[0-4]"."* | "libprotoc 2."*) \
+        mv /usr/bin/protoc /usr/bin/protoc.real; \
+        printf '#!/bin/sh\nexec /usr/bin/protoc.real --experimental_allow_proto3_optional "$@"\n' >/usr/bin/protoc; \
+        chmod 0755 /usr/bin/protoc ;; \
+    esac
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
       | sh -s -- -y --no-modify-path --profile minimal --default-toolchain "${RUST_VERSION}" \
           --target x86_64-unknown-linux-gnu --target aarch64-unknown-linux-gnu \
@@ -182,6 +208,11 @@ RUN --mount=type=cache,id=coaxhub-cargo-registry,target=/usr/local/cargo/registr
 FROM toolchain AS package
 ARG ARCH=amd64
 ARG SUITE
+ARG OS_IDS
+ARG TARGET_NAME
+ARG BASE_FILES_FLOOR
+ARG SYSLIB
+ARG SUPPORTED_TEXT
 ARG VERSION
 ARG COAXHUB_DOMAIN
 ARG KA9Q_COMMIT
@@ -194,6 +225,8 @@ COPY packaging /pkgsrc
 COPY --from=radiod /out /in/radiod
 COPY --from=stationd /out /in/stationd
 RUN ARCH="${ARCH}" SUITE="${SUITE}" VERSION="${VERSION}" COAXHUB_DOMAIN="${COAXHUB_DOMAIN}" \
+    OS_IDS="${OS_IDS}" TARGET_NAME="${TARGET_NAME}" BASE_FILES_FLOOR="${BASE_FILES_FLOOR}" \
+    SYSLIB="${SYSLIB}" SUPPORTED_TEXT="${SUPPORTED_TEXT}" \
     KA9Q_COMMIT="${KA9Q_COMMIT}" KA9Q_TARBALL_SHA256="${KA9Q_TARBALL_SHA256}" \
     RTLSDR_VERSION="${RTLSDR_VERSION}" RTLSDR_COMMIT="${RTLSDR_COMMIT}" \
     RTLSDR_TARBALL_SHA256="${RTLSDR_TARBALL_SHA256}" SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH}" \

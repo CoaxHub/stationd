@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-only
 #
-# Builds the coaxhub-stationd .deb for one Debian suite and architecture
-# in a debian:<suite> container on the Docker
+# Builds the coaxhub-stationd .deb for one suite (Debian bookworm or trixie,
+# Ubuntu jammy, noble or resolute: packaging/suites.sh) and architecture
+# in a container of that system on the Docker
 # daemon, with BuildKit. arm64 is cross-compiled: no emulation is needed.
 #
-# Usage: packaging/build-deb.sh --suite bookworm|trixie --arch amd64|arm64
+# Usage: packaging/build-deb.sh --suite bookworm|trixie|jammy|noble|resolute --arch amd64|arm64
 #
 # Environment:
 #   COAXHUB_DOMAIN     required: the CoaxHub domain built into stationd
 #   COAXHUB_ROOT_CA    required: PEM file with the CoaxHub root certificate
 #                      built into stationd
-#   PACKAGE_REVISION   Debian revision (default 1): version <crate>-<rev>~deb<N>
+#   PACKAGE_REVISION   Debian revision (default 1): version <crate>-<rev>~<suffix>,
+#                      the suffix being deb12, deb13, ubuntu22.04, ubuntu24.04 or
+#                      ubuntu26.04 (packaging/suites.sh)
 #   RUST_VERSION       rustup toolchain for the build image (default: the channel
 #                      in rust-toolchain.toml)
 #   RADIOD_ARCHOPTS    override radiod's ARCHOPTS (default: x86-64-v2 for amd64,
@@ -40,6 +43,8 @@ readonly RTLSDR_COMMIT="619ac3186ea0ffc092615e1f59f7397e5e6f668c"
 
 station="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly station
+# shellcheck source=packaging/suites.sh
+. "${station}/packaging/suites.sh"
 readonly packages="${station}/target/packages"
 readonly cache="${station}/target/packaging"
 
@@ -64,11 +69,7 @@ while (($#)); do
     esac
 done
 
-case "${suite}" in
-bookworm) debian_version=12 ;;
-trixie) debian_version=13 ;;
-*) die "--suite must be bookworm or trixie" ;;
-esac
+suite_info "${suite}" || die "--suite must be one of: ${ALL_SUITES[*]}"
 case "${arch}" in
 amd64 | arm64) ;;
 *) die "--arch must be amd64 or arm64" ;;
@@ -86,7 +87,7 @@ revision="${PACKAGE_REVISION:-1}"
 
 crate_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' "${station}/crates/stationd/Cargo.toml" | head -n1)"
 [[ -n "${crate_version}" ]] || die "cannot read stationd's version from its Cargo.toml"
-readonly version="${crate_version}-${revision}~deb${debian_version}"
+readonly version="${crate_version}-${revision}~${SUITE_SUFFIX}"
 
 # fetch_source NAME REPO COMMIT DIR: the pinned COMMIT of NAME, fetched once
 # into target/packaging/NAME.git, and its source tarball
@@ -150,7 +151,7 @@ main() {
     local epoch
     epoch="$(git -C "${station}" log -1 --format=%ct 2>/dev/null || date +%s)"
 
-    log "building coaxhub-stationd ${version} for ${suite}/${arch} (domain ${COAXHUB_DOMAIN})"
+    log "building coaxhub-stationd ${version} for ${suite} (${SUITE_BASE})/${arch} (domain ${COAXHUB_DOMAIN})"
     local args=(
         build
         --progress "${DOCKER_PROGRESS:-auto}"
@@ -160,7 +161,13 @@ main() {
         --build-context "ka9q=${cache}/ka9q-src"
         --build-context "rtlsdr=${cache}/rtl-sdr-src"
         --build-context "rootca=${tmp}/rootca"
+        --build-arg "BASE=${SUITE_BASE}"
         --build-arg "SUITE=${suite}"
+        --build-arg "OS_IDS=${SUITE_OS_IDS}"
+        --build-arg "TARGET_NAME=${SUITE_NAME}"
+        --build-arg "BASE_FILES_FLOOR=${SUITE_FLOOR}"
+        --build-arg "SYSLIB=${SUITE_SYSLIB}"
+        --build-arg "SUPPORTED_TEXT=${SUPPORTED_TEXT}"
         --build-arg "ARCH=${arch}"
         --build-arg "VERSION=${version}"
         --build-arg "COAXHUB_DOMAIN=${COAXHUB_DOMAIN}"

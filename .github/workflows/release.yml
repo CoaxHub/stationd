@@ -1,4 +1,5 @@
-# A release: on a tag vX.Y.Z, the four coaxhub-stationd packages built with the production
+# A release: on a tag vX.Y.Z, the ten coaxhub-stationd packages (five suites, two
+# architectures: packaging/suites.sh) built with the production
 # domain (the repository variable COAXHUB_DOMAIN) and the production root certificate
 # (packaging/roots/), tested, and attached to a GitHub release with the corresponding source
 # of radiod (its tarball and our patches) and librtlsdr, the installer template and
@@ -20,7 +21,7 @@ env:
 jobs:
   packages:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 240
     permissions:
       contents: write # the release and its assets
       id-token: write # build provenance
@@ -72,4 +73,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes \
-            "stationd $GITHUB_REF_NAME: the coaxhub-stationd packages for Debian 12 and 13 on amd64 and arm64, built for $COAXHUB_DOMAIN with the root certificate in packaging/roots/, the corresponding source of radiod (with our patches) and librtlsdr, the installer template and SHA256SUMS. See docs/releasing.md."
+            "stationd $GITHUB_REF_NAME: the coaxhub-stationd packages for Debian 12 and 13 and Ubuntu 22.04, 24.04 and 26.04 LTS on amd64 and arm64, built for $COAXHUB_DOMAIN with the root certificate in packaging/roots/, the corresponding source of radiod (with our patches) and librtlsdr, the installer template and SHA256SUMS. See docs/releasing.md."
