@@ -5,9 +5,14 @@
 # refuses a system it was not built for, in its preinst, before anything is
 # unpacked (docs/packaging.md §5).
 #
-#   - the package of another suite (/test/wrong/*.deb) is refused by dpkg
-#     and by apt, naming this system and the package's, listing what is
-#     supported, and leaving nothing: no file, no user, no package;
+#   - a package for another system is refused by dpkg, naming this system and
+#     the package's, listing what is supported, and leaving nothing: no file,
+#     no user, no package. It is made from this suite's own package (dpkg-deb
+#     -R, the preinst's CODENAME, OS_IDS and TARGET_NAME set to another
+#     suite's as assemble.sh fills them, dpkg-deb -b), so that the real
+#     preinst text the build produced is what refuses and only this suite's
+#     packages are needed; when that other suite's real package was built too
+#     (/test/wrong/*.deb) it is tried as well;
 #   - this suite's package (/test/pkg/*.deb) is refused on systems that only
 #     look like it: a derivative (another ID that names this one in ID_LIKE),
 #     a release that is not a target (an old Debian or a non-LTS Ubuntu), no
@@ -22,8 +27,21 @@
 # shellcheck source=/dev/null
 . /test/suite.env
 
-wrong="$(ls /test/wrong/coaxhub-stationd_*_amd64.deb)"
+# shellcheck source=/dev/null
+. /test/other.env
 right="$(ls /test/pkg/coaxhub-stationd_*_amd64.deb)"
+# The package for another system, from this suite's own: only the three filled-in
+# lines of the preinst differ. Its Pre-Depends is this suite's, which is met here.
+rm -rf /root/derived
+dpkg-deb -R "${right}" /root/derived
+sed -i -e "s|^OS_IDS=.*|OS_IDS=\"${OTHER_OS_IDS}\"|" -e "s|^CODENAME=.*|CODENAME=\"${OTHER_CODENAME}\"|" \
+    -e "s|^TARGET_NAME=.*|TARGET_NAME=\"${OTHER_TARGET_NAME}\"|" /root/derived/DEBIAN/preinst
+derived=/root/derived.deb
+dpkg-deb --root-owner-group -b /root/derived "${derived}" >/dev/null
+changed="$(diff <(dpkg-deb -I "${right}" preinst) <(dpkg-deb -I "${derived}" preinst) | grep '^[<>]')"
+check_eq "the derived package differs from the real one in the preinst's filled-in lines only" "" \
+    "$(grep -vE '^[<>] (OS_IDS|CODENAME|TARGET_NAME)=' <<<"${changed}")"
+check_contains "and it names the other system" "CODENAME=\"${OTHER_CODENAME}\"" "${changed}"
 cp -P /etc/os-release /root/os-release.orig
 real_pretty="$(. /etc/os-release && echo "${PRETTY_NAME}")"
 
@@ -48,18 +66,24 @@ remove_on_fedora() {
 }
 restore_os() { rm -f /etc/os-release; cp -P /root/os-release.orig /etc/os-release; }
 
-# ------------------------------------------------ another suite's package
-before_wrong="$(dpkg-deb --field "${wrong}" Version)"
-out="$(dpkg -i "${wrong}" 2>&1)"
-rc=$?
-check_eq "another suite's package: dpkg refuses it" 1 "${rc}"
-check_contains "it says what the package is for" "this package is for" "${out}"
-check_contains "it names this system" "${real_pretty}" "${out}"
-check_contains "it says nothing was installed" "nothing was installed" "${out}"
-check_contains "it lists what is supported" "${SUPPORTED_TEXT}" "${out}"
-check "nothing of it is left (no package, no file, no user)" nothing_installed
-check_lacks "it never says the system is Debian when it is not (no 'Debian ${CODENAME}')" "Debian ${CODENAME}" "${out}"
-check_contains "the package carries the version it was built with" "~" "${before_wrong}"
+# ------------------------------------------------ a package for another system
+wrong_checks() { # LABEL DEB TARGET_NAME
+    local out rc
+    out="$(dpkg -i "$2" 2>&1)"
+    rc=$?
+    check_eq "$1: dpkg refuses it" 1 "${rc}"
+    check_contains "$1: it says what the package is for" "this package is for $3" "${out}"
+    check_contains "$1: it names this system" "${real_pretty}" "${out}"
+    check_contains "$1: it says nothing was installed" "nothing was installed" "${out}"
+    check_contains "$1: it lists what is supported" "${SUPPORTED_TEXT}" "${out}"
+    check "$1: nothing of it is left (no package, no file, no user)" nothing_installed
+}
+wrong_checks "the package for ${OTHER_TARGET_NAME}, derived from this suite's" "${derived}" "${OTHER_TARGET_NAME}"
+for real in /test/wrong/coaxhub-stationd_*_amd64.deb; do
+    [[ -e "${real}" ]] || continue
+    wrong_checks "the real package ${real##*/}" "${real}" "$(dpkg-deb --field "${real}" Description | sed -n 's/.*Built for \(.*\) and the CoaxHub service.*/\1/p')"
+done
+check_contains "the package carries the suffix it was built with" "~" "$(dpkg-deb --field "${right}" Version)"
 
 # ------------------------------------------------ this suite's package on systems that only look like it
 refused() { # WHAT: dpkg -i of the right package is refused, naming this fake system

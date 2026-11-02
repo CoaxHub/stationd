@@ -57,9 +57,14 @@ install_test() {
     run_in "${name}" "${TEST_DIR}/in-container/package.sh" "${mode}"
 }
 
-# The package of another suite, whose Pre-Depends on base-files is met on this
-# system (so that it is the preinst that refuses, not dpkg's pre-dependency
-# check): an older release's, or another family's with a lower floor.
+# The suite whose system the "wrong" package is for. The test needs only this
+# job's own suite's packages (CI builds one suite per job): refusal.sh makes the
+# wrong package from the suite's own .deb, with the preinst's filled-in system
+# changed to this suite's, as assemble.sh would have filled it, and keeps this
+# suite's Pre-Depends, which is met, so that it is the preinst that refuses.
+# When the real package of that suite is in target/packages as well (a full local
+# build), it is tried too: an older release's, or another family's with a lower
+# floor, so that its own Pre-Depends is met on this system.
 wrong_package_suite() {
     case "$1" in
     bookworm) echo jammy ;;
@@ -77,7 +82,21 @@ refusal_test() {
     start_container "${name}" "${SUITE_BASE}"
     docker exec "${name}" mkdir -p /test/pkg /test/wrong
     docker cp "$(package_for "${suite}" amd64)" "${name}:/test/pkg/" >/dev/null
-    docker cp "$(package_for "${other}" amd64)" "${name}:/test/wrong/" >/dev/null
+    # The other suite's real package, when it was built.
+    local real
+    for real in "${PACKAGES}/${other}"/coaxhub-stationd_*_amd64.deb; do
+        [[ -e "${real}" ]] && docker cp "${real}" "${name}:/test/wrong/" >/dev/null
+    done
+    # The system the derived package is for.
+    local f
+    f="$(mktemp)"
+    suite_info "${other}"
+    {
+        printf 'OTHER_CODENAME=%q\n' "${other}"
+        printf 'OTHER_OS_IDS=%q\n' "${SUITE_OS_IDS}"
+        printf 'OTHER_TARGET_NAME=%q\n' "${SUITE_NAME}"
+    } >"${f}"
+    docker cp "${f}" "${name}:/test/other.env" >/dev/null
     run_in "${name}" "${TEST_DIR}/in-container/refusal.sh"
 }
 

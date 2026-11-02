@@ -12,7 +12,7 @@ TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATION="$(cd "${TEST_DIR}/../.." && pwd)"
 # shellcheck source=packaging/suites.sh
 . "${STATION}/packaging/suites.sh"
-PACKAGES="${STATION}/target/packages"
+PACKAGES="${COAXHUB_PACKAGES:-${STATION}/target/packages}"
 readonly TEST_DIR STATION PACKAGES
 # Every container this run starts, removed on exit.
 CONTAINERS=()
