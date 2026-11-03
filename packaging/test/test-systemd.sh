@@ -27,8 +27,9 @@
 #   starting anything).
 #
 # Needs the amd64 packages in target/packages (packaging/build-all.sh) and a
-# Docker daemon. The 0.2.3 package is downloaded once from the CoaxHub APT
-# repository into target/packages-previous/ and checked against its SHA-256.
+# Docker daemon. The 0.2.3 package is downloaded once from its GitHub release
+# (the APT repository serves only the latest release) into
+# target/packages-previous/ and checked against its SHA-256.
 #
 # Usage: packaging/test/test-systemd.sh [--quick] [--suite bookworm|trixie|jammy|noble|resolute]
 #        (--quick: bookworm only, no upgrade)
@@ -38,7 +39,7 @@ export TEST_NAME=test-systemd
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 readonly PREVIOUS_VERSION="0.2.3-1~deb12"
-readonly PREVIOUS_URL="https://apt.coaxhub.com/pool/bookworm/main/coaxhub-stationd_0.2.3-1~deb12_amd64.deb"
+readonly PREVIOUS_URL="https://github.com/CoaxHub/stationd/releases/download/v0.2.3/coaxhub-stationd_0.2.3-1.deb12_amd64.deb"
 readonly PREVIOUS_SHA256="d954f93716d5b25e60983bc28f96d9e0f02859be6815063307cab4f1ad11f6bb"
 readonly PREVIOUS_DIR="${STATION}/target/packages-previous"
 
