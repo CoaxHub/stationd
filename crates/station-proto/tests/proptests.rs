@@ -254,15 +254,18 @@ fn arb_hardware() -> BoxedStrategy<v1::Hardware> {
 }
 
 fn arb_receivers_configured() -> BoxedStrategy<v1::ReceiversConfigured> {
-    proptest::collection::vec((small_id(), enum_value(), text()), 0..18)
+    proptest::collection::vec((small_id(), enum_value(), text(), enum_value()), 0..18)
         .prop_map(|rs| v1::ReceiversConfigured {
             receivers: rs
                 .into_iter()
-                .map(|(receiver_id, state, detail)| v1::ReceiverStatus {
-                    receiver_id,
-                    state,
-                    detail,
-                })
+                .map(
+                    |(receiver_id, state, detail, failure_reason)| v1::ReceiverStatus {
+                        receiver_id,
+                        state,
+                        detail,
+                        failure_reason,
+                    },
+                )
                 .collect(),
         })
         .boxed()
@@ -452,10 +455,10 @@ fn body() -> BoxedStrategy<Option<Body>> {
         ),
         2 => (
             (enum_value(), proptest::option::of(small_id()), proptest::option::of(small_id()), text()),
-            (proptest::option::of(small_id()), proptest::option::of(enum_value())),
+            (proptest::option::of(small_id()), proptest::option::of(enum_value()), enum_value()),
             (proptest::option::of(small_id()), proptest::option::of(enum_value()), proptest::option::of(any::<i64>())),
         ).prop_map(
-            |((kind, channel_id, subscription_id, detail), (receiver_id, receiver_state), (measurement_id, measurement_duty, effective_unix_ms))| {
+            |((kind, channel_id, subscription_id, detail), (receiver_id, receiver_state, failure_reason), (measurement_id, measurement_duty, effective_unix_ms))| {
                 Body::Event(v1::Event {
                     kind,
                     channel_id,
@@ -466,6 +469,7 @@ fn body() -> BoxedStrategy<Option<Body>> {
                     measurement_id,
                     measurement_duty,
                     effective_unix_ms,
+                    failure_reason,
                     ..Default::default()
                 })
             }
@@ -478,25 +482,30 @@ fn body() -> BoxedStrategy<Option<Body>> {
 
 fn arb_receiver_health() -> BoxedStrategy<v1::ReceiverHealth> {
     (
-        (small_id(), enum_value(), text()),
+        (small_id(), enum_value(), text(), enum_value()),
         proptest::option::of((enum_value(), text())),
         proptest::option::of((enum_value(), float(), proptest::option::of(float()))),
         proptest::option::of(float()),
     )
         .prop_map(
-            |((receiver_id, state, detail), backend, frontend, backend_cpu)| v1::ReceiverHealth {
-                receiver_id,
-                state,
-                detail,
-                backend: backend.map(|(state, version)| v1::BackendHealth { state, version }),
-                frontend: frontend.map(|(state, gain_db, input_power_dbfs)| v1::FrontendHealth {
+            |((receiver_id, state, detail, failure_reason), backend, frontend, backend_cpu)| {
+                v1::ReceiverHealth {
+                    failure_reason,
+                    receiver_id,
                     state,
-                    gain_db,
-                    input_power_dbfs,
-                    ..Default::default()
-                }),
-                active_channels: 0,
-                backend_cpu,
+                    detail,
+                    backend: backend.map(|(state, version)| v1::BackendHealth { state, version }),
+                    frontend: frontend.map(|(state, gain_db, input_power_dbfs)| {
+                        v1::FrontendHealth {
+                            state,
+                            gain_db,
+                            input_power_dbfs,
+                            ..Default::default()
+                        }
+                    }),
+                    active_channels: 0,
+                    backend_cpu,
+                }
             },
         )
         .boxed()

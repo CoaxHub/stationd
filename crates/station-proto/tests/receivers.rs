@@ -980,3 +980,64 @@ fn ingress_follows_the_running_receivers() {
         assert_eq!(q.on_bytes(50_000, now), QuotaDecision::Allow);
     }
 }
+
+// ------------------------------------------------------------------ failure reason
+
+#[test]
+fn a_failure_reason_is_read_only_for_a_failed_receiver_and_never_a_violation() {
+    use station_proto::validate::failure_reason;
+    use v1::ReceiverFailureReason as R;
+    let failed = v1::ReceiverState::Failed as i32;
+    // The known reasons of a FAILED receiver stand.
+    assert_eq!(failure_reason(failed, R::SdrInUse as i32), R::SdrInUse);
+    assert_eq!(
+        failure_reason(failed, R::RadiodRestartLoop as i32),
+        R::RadiodRestartLoop
+    );
+    // None given, or one this side does not know (a newer minor): UNSPECIFIED.
+    assert_eq!(failure_reason(failed, 0), R::Unspecified);
+    assert_eq!(failure_reason(failed, 99), R::Unspecified);
+    assert_eq!(failure_reason(failed, -1), R::Unspecified);
+    // A reason with any other state is not believed.
+    for state in [
+        v1::ReceiverState::Starting,
+        v1::ReceiverState::Running,
+        v1::ReceiverState::NoDevice,
+        v1::ReceiverState::Unspecified,
+    ] {
+        assert_eq!(
+            failure_reason(state as i32, R::SdrInUse as i32),
+            R::Unspecified
+        );
+    }
+    assert_eq!(failure_reason(77, R::SdrInUse as i32), R::Unspecified);
+
+    // The reason is a display-only claim: whatever value it has, the
+    // messages that carry it stay valid.
+    for reason in [0, R::SdrInUse as i32, R::RadiodRestartLoop as i32, 99, -1] {
+        let mut configured = receivers_configured(&[RX]);
+        if let Payload::ReceiversConfigured(c) = &mut configured {
+            c.receivers[0].state = failed;
+            c.receivers[0].failure_reason = reason;
+        }
+        assert_eq!(
+            check_message(&response(1, OK, Some(configured)), 2),
+            Ok(()),
+            "ReceiversConfigured, reason {reason}"
+        );
+
+        let mut m = status();
+        if let Some(v1::station_message::Body::Status(s)) = m.body.as_mut() {
+            s.receivers[0].state = failed;
+            s.receivers[0].failure_reason = reason;
+        }
+        assert_eq!(check_message(&m, 2), Ok(()), "status, reason {reason}");
+
+        let mut m = event(v1::event::Kind::ReceiverState, None, None);
+        if let Some(v1::station_message::Body::Event(e)) = m.body.as_mut() {
+            e.receiver_state = Some(failed);
+            e.failure_reason = reason;
+        }
+        assert_eq!(check_message(&m, 2), Ok(()), "event, reason {reason}");
+    }
+}

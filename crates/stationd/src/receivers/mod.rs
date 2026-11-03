@@ -66,6 +66,7 @@ pub use self::units::{
     CallError, ExternalUnits, FakeUnits, Helper, RestartLoop, Systemd, UnitState, Units,
 };
 
+use v1::ReceiverFailureReason as Reason;
 use v1::ReceiverState as State;
 
 /// How many times in a row a receiver's radiod may stop and be restarted
@@ -358,12 +359,24 @@ pub fn state_name(state: State) -> &'static str {
     }
 }
 
+/// The wire value of a receiver's failure reason: only a `FAILED` receiver
+/// has one.
+fn failure_reason(state: State, reason: Reason) -> i32 {
+    if state == State::Failed {
+        reason as i32
+    } else {
+        Reason::Unspecified as i32
+    }
+}
+
 const EVENT_BUFFER: usize = 256;
 
 struct Rx {
     config: StoredReceiver,
     state: State,
     detail: String,
+    /// Why it is `FAILED`, when stationd knows (`ReceiverFailureReason`).
+    reason: Reason,
     backend: Option<Arc<dyn Backend>>,
     /// The unit's run the backend belongs to (`RUNNING`), or the run that
     /// failed (`FAILED`).
@@ -387,6 +400,7 @@ impl Rx {
             config,
             state: State::Starting,
             detail: String::new(),
+            reason: Reason::Unspecified,
             backend: None,
             invocation: None,
             forward: None,
@@ -638,18 +652,55 @@ impl Receivers {
     /// Records `id`'s new state, with a `RECEIVER_STATE` event when it
     /// changed. Entering or leaving `RUNNING` stops a plan (§4.1).
     fn set_state(&self, id: u32, state: State, detail: &str) {
-        let old = {
+        self.set_state_because(id, state, detail, Reason::Unspecified);
+    }
+
+    /// [`set_state`](Self::set_state) with the typed reason of a `FAILED`
+    /// receiver (`ReceiverFailureReason`, §4.2); any other state carries none.
+    fn set_state_because(&self, id: u32, state: State, detail: &str, reason: Reason) {
+        let reason = if state == State::Failed {
+            reason
+        } else {
+            Reason::Unspecified
+        };
+        // What the hub is told with a state: the detail only for the states that have one.
+        let told = |state: State, detail: &str| {
+            if matches!(state, State::Failed | State::NoDevice) {
+                truncate_utf8(detail, limits::MAX_DETAIL_BYTES)
+            } else {
+                String::new()
+            }
+        };
+        let (old, old_told, old_reason) = {
             let mut s = self.shared();
             let Some(rx) = s.get(id) else { return };
-            let old = rx.state;
+            let old = (rx.state, told(rx.state, &rx.detail), rx.reason);
             rx.state = state;
             rx.detail = truncate_utf8(detail, limits::MAX_DETAIL_BYTES);
+            rx.reason = reason;
             if state != State::Failed {
                 rx.looping = false;
             }
             old
         };
+        let detail = told(state, detail);
         if old == state {
+            // The same state: the hub hears again only when what it was told changed (a
+            // FAILED receiver whose reason or detail is now another one), so the newer
+            // event is never older than its health sample's.
+            if old_told != detail || old_reason != reason {
+                self.emit(
+                    v1::Event {
+                        kind: v1::event::Kind::ReceiverState as i32,
+                        receiver_id: Some(id),
+                        receiver_state: Some(state as i32),
+                        detail,
+                        failure_reason: reason as i32,
+                        ..Default::default()
+                    },
+                    None,
+                );
+            }
             return;
         }
         match state {
@@ -665,17 +716,13 @@ impl Receivers {
         }
         let stop = (old == State::Running || state == State::Running)
             .then_some(StopReason::FrontendChanged);
-        let detail = if matches!(state, State::Failed | State::NoDevice) {
-            truncate_utf8(detail, limits::MAX_DETAIL_BYTES)
-        } else {
-            String::new()
-        };
         self.emit(
             v1::Event {
                 kind: v1::event::Kind::ReceiverState as i32,
                 receiver_id: Some(id),
                 receiver_state: Some(state as i32),
                 detail,
+                failure_reason: reason as i32,
                 ..Default::default()
             },
             stop,
@@ -831,15 +878,18 @@ impl Receivers {
         // another program, but a permission or a serial can do it too); any
         // other end is a radiod that keeps stopping for a reason it does
         // not give, and the SDR is a likely one.
-        let detail = if no_input {
-            RADIOD_CANNOT_OPEN_SDR.to_owned()
+        let (detail, reason) = if no_input {
+            (RADIOD_CANNOT_OPEN_SDR.to_owned(), Reason::SdrInUse)
         } else {
-            format!(
-                "its radiod stopped {failures} times in a row; the SDR may be in use by another program on this computer"
+            (
+                format!(
+                    "its radiod stopped {failures} times in a row; the SDR may be in use by another program on this computer"
+                ),
+                Reason::RadiodRestartLoop,
             )
         };
         self.take_down(id);
-        self.set_state(id, State::Failed, &detail);
+        self.set_state_because(id, State::Failed, &detail, reason);
         if let Some(rx) = self.shared().get(id) {
             rx.looping = true;
         }
@@ -960,6 +1010,7 @@ impl Receivers {
                     } else {
                         String::new()
                     },
+                    failure_reason: failure_reason(r.state, r.reason),
                 })
                 .collect(),
         })
@@ -1169,6 +1220,7 @@ impl Receivers {
                     frontend,
                     active_channels: channels(id),
                     backend_cpu,
+                    failure_reason: failure_reason(rx.state, rx.reason),
                 }
             })
             .collect()

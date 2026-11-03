@@ -54,6 +54,8 @@ message ReceiverHealth {
   // CPU time its backend used over the last interval, as a share of one
   // core (1.0 = one core busy). Absent when unknown.
   optional float backend_cpu = 7;
+  // Why, for FAILED when the station knows (see ReceiverFailureReason).
+  ReceiverFailureReason failure_reason = 8;
 }
 
 message BackendHealth {
@@ -122,4 +124,7 @@ message Event {
   optional int64 effective_unix_ms = 9;
   // MEASUREMENT_STOPPED: why the station stopped the plan.
   optional MeasurementStopReason measurement_stop_reason = 10;
+  // RECEIVER_STATE with receiver_state FAILED: why, when the station knows
+  // (see ReceiverFailureReason).
+  ReceiverFailureReason failure_reason = 11;
 }

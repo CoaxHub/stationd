@@ -20,6 +20,23 @@ use super::{MessageKind, ViolationKind};
 use crate::limits;
 use crate::v1;
 
+// ------------------------------------------------------------------ failure reason
+
+/// §5.1: the failure reason of a receiver as the hub reads it, from the
+/// `failure_reason` a station sent (`ReceiverStatus`, `ReceiverHealth` or
+/// `Event{RECEIVER_STATE}`) and the `state` that came with it.
+///
+/// It is a claim for display only, so a reason the hub cannot use is read as
+/// [`UNSPECIFIED`](v1::ReceiverFailureReason::Unspecified) and is never a
+/// violation: a value this side does not know (a newer minor), and any
+/// reason of a receiver that is not `FAILED`.
+pub fn failure_reason(state: i32, reason: i32) -> v1::ReceiverFailureReason {
+    if state != v1::ReceiverState::Failed as i32 {
+        return v1::ReceiverFailureReason::Unspecified;
+    }
+    v1::ReceiverFailureReason::try_from(reason).unwrap_or(v1::ReceiverFailureReason::Unspecified)
+}
+
 // ------------------------------------------------------------------ ranges
 
 /// §4.2: the tunable range a profile gives a receiver centred on

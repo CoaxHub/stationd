@@ -41,7 +41,7 @@ pub use negotiate::{
 };
 pub use quota::{IngressQuota, QuotaDecision};
 pub use receivers::{
-    OverlappingReceiver, ReceiverSelection, ReceiverSetError, check_receiver_set,
+    OverlappingReceiver, ReceiverSelection, ReceiverSetError, check_receiver_set, failure_reason,
     predicted_tunable_range, ranges_overlap, select_receivers,
 };
 pub use request::{RequestRejection, check_request};

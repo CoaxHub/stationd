@@ -154,6 +154,7 @@ pub fn receivers_configured(ids: &[u32]) -> Payload {
                 receiver_id,
                 state: v1::ReceiverState::Starting as i32,
                 detail: String::new(),
+                failure_reason: 0,
             })
             .collect(),
     })
@@ -405,6 +406,7 @@ pub fn receiver_health(receiver_id: u32) -> v1::ReceiverHealth {
         }),
         active_channels: 0,
         backend_cpu: Some(0.25),
+        failure_reason: 0,
     }
 }
 

@@ -66,6 +66,7 @@ fn configured(ids: &[u32]) -> Payload {
                 receiver_id,
                 state: v1::ReceiverState::Starting as i32,
                 detail: String::new(),
+                failure_reason: 0,
             })
             .collect(),
     })

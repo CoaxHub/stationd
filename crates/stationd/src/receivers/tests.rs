@@ -527,6 +527,8 @@ async fn units_that_fail_and_restart() {
         .find(|e| e.event.receiver_state == Some(S::Failed as i32))
         .expect("failed");
     assert!(failed.event.detail.contains("exit status 1"), "{failed:?}");
+    // A unit that failed gives no typed reason: the detail is all there is.
+    assert_eq!(failed.event.failure_reason, 0);
     assert_eq!(failed.stop, Some(StopReason::FrontendChanged));
     let health = st.receivers.health(|_| 0);
     assert!(health[0].detail.contains("exit status 1"));
@@ -571,6 +573,21 @@ async fn an_sdr_another_program_holds_fails_the_receiver_with_a_plain_reason() {
     assert_eq!(failed.event.detail, RADIOD_CANNOT_OPEN_SDR);
     assert!(failed.event.detail.len() <= limits::MAX_DETAIL_BYTES);
     assert_eq!(st.receivers.health(|_| 0)[0].detail, RADIOD_CANNOT_OPEN_SDR);
+    // The typed reason travels with the state, in the event and the health.
+    let sdr_in_use = v1::ReceiverFailureReason::SdrInUse as i32;
+    assert_eq!(failed.event.failure_reason, sdr_in_use);
+    assert_eq!(st.receivers.health(|_| 0)[0].failure_reason, sdr_in_use);
+    // A receiver that is not failed has none.
+    assert_eq!(st.receivers.health(|_| 0)[1].failure_reason, 0);
+    // The answer to the hub's next ConfigureReceivers says it too.
+    let answer = st
+        .receivers
+        .configure(&standard_set())
+        .await
+        .expect("the same set");
+    assert_eq!(answer.receivers[0].state, S::Failed as i32);
+    assert_eq!(answer.receivers[0].failure_reason, sdr_in_use);
+    assert_eq!(answer.receivers[1].failure_reason, 0);
     // The other receiver is untouched.
     assert_eq!(st.receivers.summaries()[1].state, "running");
     // While the loop goes on the receiver stays failed: no flapping.
@@ -589,6 +606,13 @@ async fn an_sdr_another_program_holds_fails_the_receiver_with_a_plain_reason() {
     })
     .await;
     assert_eq!(st.receivers.summaries()[0].detail, "");
+    // Running again: the reason is gone from the event and the health.
+    let running = seen
+        .iter()
+        .find(|e| e.event.receiver_state == Some(S::Running as i32))
+        .expect("running");
+    assert_eq!(running.event.failure_reason, 0);
+    assert_eq!(st.receivers.health(|_| 0)[0].failure_reason, 0);
 }
 
 #[tokio::test]
@@ -613,6 +637,66 @@ async fn a_radiod_that_keeps_stopping_without_saying_why_fails_the_receiver() {
     );
     assert!(failed.event.detail.contains("in use by another program"));
     assert!(failed.event.detail.len() <= limits::MAX_DETAIL_BYTES);
+    // Exit status 1 is not the SDR's own refusal: the restart loop.
+    let looping = v1::ReceiverFailureReason::RadiodRestartLoop as i32;
+    assert_eq!(failed.event.failure_reason, looping);
+    assert_eq!(st.receivers.health(|_| 0)[1].failure_reason, looping);
+}
+
+#[tokio::test]
+async fn a_failed_receiver_whose_reason_or_detail_changes_tells_the_hub_again() {
+    let st = Station::standard().await;
+    let mut events = st.receivers.subscribe();
+    let looping = v1::ReceiverFailureReason::RadiodRestartLoop;
+    let in_use = v1::ReceiverFailureReason::SdrInUse;
+    let failed = |events: &mut tokio::sync::broadcast::Receiver<RxEvent>| -> Vec<(String, i32)> {
+        drain(events)
+            .iter()
+            .filter(|e| {
+                e.event.receiver_id == Some(1) && e.event.receiver_state == Some(S::Failed as i32)
+            })
+            .map(|e| (e.event.detail.clone(), e.event.failure_reason))
+            .collect()
+    };
+    drain(&mut events);
+    st.receivers
+        .set_state_because(1, S::Failed, "stopped 3 times", looping);
+    assert_eq!(
+        failed(&mut events),
+        [("stopped 3 times".to_owned(), looping as i32)]
+    );
+    // The same state, detail and reason again: nothing to tell.
+    st.receivers
+        .set_state_because(1, S::Failed, "stopped 3 times", looping);
+    assert!(failed(&mut events).is_empty());
+    // The reason changed (radiod now exits 66): told, so the hub's last event is not older
+    // than its health sample's.
+    st.receivers
+        .set_state_because(1, S::Failed, "stopped 3 times", in_use);
+    assert_eq!(
+        failed(&mut events),
+        [("stopped 3 times".to_owned(), in_use as i32)]
+    );
+    // The detail changed alone: told too.
+    st.receivers
+        .set_state_because(1, S::Failed, "cannot open the SDR", in_use);
+    assert_eq!(
+        failed(&mut events),
+        [("cannot open the SDR".to_owned(), in_use as i32)]
+    );
+    // Same state again with no reason given: the reason going away is a change.
+    st.receivers.set_state_because(
+        1,
+        S::Failed,
+        "cannot open the SDR",
+        v1::ReceiverFailureReason::Unspecified,
+    );
+    assert_eq!(failed(&mut events), [("cannot open the SDR".to_owned(), 0)]);
+    // A running receiver's detail is not told, so a change of it is nothing.
+    st.receivers.set_state(1, S::Running, "");
+    drain(&mut events);
+    st.receivers.set_state(1, S::Running, "ignored");
+    assert!(drain(&mut events).is_empty());
 }
 
 #[tokio::test]

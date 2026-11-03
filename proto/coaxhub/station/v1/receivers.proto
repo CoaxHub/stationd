@@ -130,9 +130,26 @@ enum ReceiverState {
   RECEIVER_STATE_NO_DEVICE = 4; // its SDR is not plugged in
 }
 
+// Why a receiver is FAILED, when the station knows: a typed reason the hub
+// shows in the owner's language. A claim for display only; UNSPECIFIED (the
+// default) is "no reason given", and `detail` is then all there is. Added in
+// protocol 2.2: a value this side does not know is read as UNSPECIFIED.
+enum ReceiverFailureReason {
+  RECEIVER_FAILURE_REASON_UNSPECIFIED = 0;
+  // radiod cannot open the SDR (exit status 66 restart after restart).
+  // The usual cause is another program on the station's computer holding
+  // it, but 66 is also what a device permission or a serial no SDR has
+  // ends in: the name is the likeliest cause, not a diagnosis.
+  RECEIVER_FAILURE_REASON_SDR_IN_USE = 1;
+  // radiod keeps stopping for a reason it does not give.
+  RECEIVER_FAILURE_REASON_RADIOD_RESTART_LOOP = 2;
+}
+
 message ReceiverStatus {
   uint32 receiver_id = 1;
   ReceiverState state = 2;
   // Untrusted detail, at most 256 bytes UTF-8. Displayed escaped.
   string detail = 3;
+  // Set only with FAILED, and only when the station knows why.
+  ReceiverFailureReason failure_reason = 4;
 }

@@ -183,6 +183,7 @@ fn station_message_seeds(dir: &Path) -> Res<()> {
                     receiver_id,
                     state: v1::ReceiverState::Starting as i32,
                     detail: String::new(),
+                    failure_reason: 0,
                 })
                 .collect(),
         }),
@@ -192,6 +193,14 @@ fn station_message_seeds(dir: &Path) -> Res<()> {
         receiver_id: Some(2),
         receiver_state: Some(v1::ReceiverState::NoDevice as i32),
         detail: "SDR 00000002 is not plugged in".into(),
+        ..Default::default()
+    });
+    let receiver_failed = Body::Event(v1::Event {
+        kind: v1::event::Kind::ReceiverState as i32,
+        receiver_id: Some(2),
+        receiver_state: Some(v1::ReceiverState::Failed as i32),
+        detail: "radiod cannot open the SDR".into(),
+        failure_reason: v1::ReceiverFailureReason::SdrInUse as i32,
         ..Default::default()
     });
     let pong = ok(
@@ -238,6 +247,7 @@ fn station_message_seeds(dir: &Path) -> Res<()> {
         }),
         active_channels: 1,
         backend_cpu: Some(0.2),
+        failure_reason: 0,
     };
     let status = Body::Status(v1::StationStatus {
         uptime_s: 60,
@@ -370,6 +380,7 @@ fn station_message_seeds(dir: &Path) -> Res<()> {
         ("response_hardware", hardware),
         ("response_receivers_configured", receivers_configured),
         ("event_receiver_state", receiver_state),
+        ("event_receiver_failed", receiver_failed),
         ("noise", noise(1_790_942_400_000)),
         ("event_measurement_duty", duty),
         ("event_measurement_stopped", stopped),
