@@ -138,6 +138,7 @@ pub struct FakeBackends {
     made: Arc<Mutex<HashMap<u32, FakeBackend>>>,
     silent: Arc<Mutex<HashSet<u32>>>,
     wall_clock: Option<station_backend::fake::WallClock>,
+    payload: station_backend::FakePayload,
 }
 
 impl fmt::Debug for FakeBackends {
@@ -154,6 +155,14 @@ impl FakeBackends {
     #[must_use]
     pub fn with_wall_clock(mut self, clock: station_backend::fake::WallClock) -> Self {
         self.wall_clock = Some(clock);
+        self
+    }
+
+    /// Backends that send `payload`: the size of the audio packets and
+    /// waterfall rows (`[backend.fake] payload`).
+    #[must_use]
+    pub fn with_payload(mut self, payload: station_backend::FakePayload) -> Self {
+        self.payload = payload;
         self
     }
 
@@ -209,7 +218,9 @@ impl BackendFactory for FakeBackends {
     }
 
     fn backend(&self, rx: &StoredReceiver) -> Result<Arc<dyn Backend>, BackendError> {
-        let mut backend = FakeBackend::new(Self::config(rx));
+        let mut config = Self::config(rx);
+        config.payload = self.payload;
+        let mut backend = FakeBackend::new(config);
         if let Some(clock) = &self.wall_clock {
             backend = backend.with_wall_clock(Arc::clone(clock));
         }

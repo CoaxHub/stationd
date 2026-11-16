@@ -39,6 +39,7 @@
 //! `backend-ka9q` implements this trait for radiod.
 
 pub mod fake;
+mod fake_opus;
 pub mod reduce;
 
 use std::pin::Pin;
@@ -46,7 +47,9 @@ use std::pin::Pin;
 use futures_util::Stream;
 use station_proto::v1;
 
-pub use fake::{FAKE_MEASUREMENT_GRID_HZ, FakeBackend, FakeConfig, MeasurementOp};
+pub use fake::{
+    FAKE_MEASUREMENT_GRID_HZ, FAKE_ROW_SEED, FakeBackend, FakeConfig, FakePayload, MeasurementOp,
+};
 
 /// A hub-assigned audio channel ID (`OpenChannel.channel_id`).
 pub type ChannelId = u32;

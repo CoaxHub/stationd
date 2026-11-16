@@ -28,7 +28,12 @@
 //! usb_devices = "usb"                      # where SDRs are read from (default
 //!                                          # /sys/bus/usb/devices); simulated SDRs
 //!                                          # are directories laid out like it
-//! [backend.ka9q]                           # a radiod of your own, for every receiver;
+//! [backend.fake]                           # only with kind = "fake"
+//! payload = "real"                         # "tiny" (the default): a 3-byte Opus
+//!                                          # packet and flat rows; "real": Opus
+//!                                          # packets of a real channel's size and
+//!                                          # noisy rows, for load tests
+//! [backend.ka9q]                          # a radiod of your own, for every receiver;
 //! status_group = "239.77.0.6:5006"         # stationd starts no unit. Its status group,
 //! data_group = "239.77.0.4:5004"           # optional; default: asked from radiod
 //! [measurements]
@@ -52,6 +57,7 @@ use std::path::{Path, PathBuf};
 
 use backend_ka9q::backend::group::{self, DEFAULT_DATA_PORT, DEFAULT_STATUS_PORT};
 use serde::Deserialize;
+pub use station_backend::FakePayload;
 use tonic::transport::Uri;
 
 use crate::flavour::{self, BuiltIn, Flavour};
@@ -130,6 +136,13 @@ pub struct Ka9qSettings {
     pub data_group: Option<std::net::SocketAddr>,
 }
 
+/// `[backend.fake]` (development): what the fake backends send.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FakeSettings {
+    /// `payload`: the size of the audio packets and waterfall rows.
+    pub payload: FakePayload,
+}
+
 /// How the receivers run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -141,14 +154,14 @@ pub enum BackendConfig {
     /// unit is started.
     External(Ka9qSettings),
     /// `kind = "fake"` (development): a `FakeBackend` per receiver.
-    Fake,
+    Fake(FakeSettings),
 }
 
 impl BackendConfig {
     /// The backend kind.
     pub fn kind(&self) -> BackendKind {
         match self {
-            Self::Fake => BackendKind::Fake,
+            Self::Fake(_) => BackendKind::Fake,
             Self::Bundled | Self::External(_) => BackendKind::Ka9q,
         }
     }
@@ -157,7 +170,12 @@ impl BackendConfig {
 impl fmt::Display for BackendConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Fake => f.write_str("fake"),
+            Self::Fake(FakeSettings {
+                payload: FakePayload::Tiny,
+            }) => f.write_str("fake"),
+            Self::Fake(FakeSettings {
+                payload: FakePayload::Real,
+            }) => f.write_str("fake, real-size payloads"),
             Self::Bundled => f.write_str("ka9q, the bundled radiod of each receiver"),
             Self::External(k) => {
                 write!(f, "ka9q, your radiod at status {}", k.status_group)?;
@@ -177,18 +195,49 @@ struct RawKa9q {
     data_group: Option<String>,
 }
 
+/// `[backend.fake] payload`.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RawPayload {
+    /// A 3-byte Opus packet and flat rows.
+    #[default]
+    Tiny,
+    /// Opus packets of a real channel's size and noisy rows.
+    Real,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFake {
+    #[serde(default)]
+    payload: RawPayload,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawBackend {
     kind: BackendKind,
     usb_devices: Option<PathBuf>,
+    fake: Option<RawFake>,
     ka9q: Option<RawKa9q>,
 }
 
 impl RawBackend {
     fn validate(&self) -> Result<BackendConfig, ConfigError> {
+        if self.fake.is_some() && self.kind != BackendKind::Fake {
+            return Err(ConfigError::Invalid {
+                field: "backend.fake",
+                message: "only valid with kind = \"fake\"".to_owned(),
+            });
+        }
         match (self.kind, &self.ka9q) {
-            (BackendKind::Fake, None) => Ok(BackendConfig::Fake),
+            (BackendKind::Fake, None) => {
+                let payload = match self.fake.as_ref().map(|f| f.payload).unwrap_or_default() {
+                    RawPayload::Tiny => FakePayload::Tiny,
+                    RawPayload::Real => FakePayload::Real,
+                };
+                Ok(BackendConfig::Fake(FakeSettings { payload }))
+            }
             (BackendKind::Fake, Some(_)) => Err(ConfigError::Invalid {
                 field: "backend.ka9q",
                 message: "only valid with kind = \"ka9q\"".to_owned(),
@@ -683,10 +732,63 @@ mod tests {
         assert_eq!(s.cert, dir.path().join("station.pem"));
         assert_eq!(c.key_path(), dir.path().join("station.key"));
         assert_eq!(s.gateway_ca, dir.path().join("ca.pem"));
-        assert_eq!(c.backend, BackendConfig::Fake);
+        assert_eq!(c.backend, BackendConfig::Fake(FakeSettings::default()));
         assert_eq!(c.backend.to_string(), "fake");
         assert_eq!(BackendKind::Ka9q.to_string(), "ka9q");
         assert_eq!(c.status_path(), c.state_dir.join("status.json"));
+    }
+
+    #[test]
+    fn the_fake_backends_payload() {
+        let dir = Dir::new();
+        let fake = |extra: &str| format!("{STATIC}{extra}");
+        let tiny = BackendConfig::Fake(FakeSettings {
+            payload: FakePayload::Tiny,
+        });
+        // Not given: tiny, as before the key existed.
+        assert_eq!(parse(&dir, STATIC).expect("none").backend, tiny);
+        assert_eq!(
+            parse(&dir, &fake("[backend.fake]\n"))
+                .expect("empty")
+                .backend,
+            tiny
+        );
+        assert_eq!(
+            parse(&dir, &fake("[backend.fake]\npayload = \"tiny\"\n"))
+                .expect("tiny")
+                .backend,
+            tiny
+        );
+        let real = parse(&dir, &fake("[backend.fake]\npayload = \"real\"\n"))
+            .expect("real")
+            .backend;
+        assert_eq!(
+            real,
+            BackendConfig::Fake(FakeSettings {
+                payload: FakePayload::Real
+            })
+        );
+        assert_eq!(real.kind(), BackendKind::Fake);
+        assert_eq!(real.to_string(), "fake, real-size payloads");
+        // A typo or another value is an error, never a silent default.
+        for bad in [
+            "[backend.fake]\npayload = \"huge\"\n",
+            "[backend.fake]\npayload = true\n",
+            "[backend.fake]\nbitrate = 1\n",
+        ] {
+            assert!(matches!(
+                parse(&dir, &fake(bad)),
+                Err(ConfigError::Parse { .. })
+            ));
+        }
+        // Only for the fake backend.
+        assert_eq!(
+            invalid_field(parse(
+                &dir,
+                "[backend]\nkind = \"ka9q\"\n[backend.fake]\npayload = \"real\"\n"
+            )),
+            "backend.fake"
+        );
     }
 
     #[test]

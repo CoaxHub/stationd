@@ -435,7 +435,7 @@ async fn helper(backend: &BackendConfig, env: &Environment) -> Check {
 /// Probes each receiver's radiod.
 async fn radiods(config: &Config, set: &StoredSet, timeout: Duration) -> Vec<Check> {
     match config.backend {
-        BackendConfig::Fake => vec![check("radiod", Level::Skip, "fake backend (development)")],
+        BackendConfig::Fake(_) => vec![check("radiod", Level::Skip, "fake backend (development)")],
         _ if set.receivers.is_empty() => {
             vec![check("radiod", Level::Skip, "no receiver, no radiod")]
         }
@@ -783,7 +783,8 @@ mod tests {
         };
         let config = BackendConfig::Bundled;
         // Not a bundled station: nothing to check.
-        assert_eq!(helper(&BackendConfig::Fake, &env).await.level, Level::Skip);
+        let fake = BackendConfig::Fake(crate::config::FakeSettings::default());
+        assert_eq!(helper(&fake, &env).await.level, Level::Skip);
         // No socket: the fix is named.
         let c = helper(&config, &env).await;
         assert_eq!(c.level, Level::Fail, "{c}");

@@ -13,6 +13,12 @@
 //! - **Waterfall:** one row per confirmed `row_interval_ms`: a flat floor
 //!   with a small deterministic ripple and a peak in the middle bin,
 //!   compressed as requested (zstd level 1 or none).
+//! - **Real-size payloads** ([`FakePayload::Real`], off by default): the
+//!   audio packets are Opus packets of a real channel's size (24 kbit/s: 60
+//!   bytes per 20 ms), taken from a committed fixture of encoded noise and
+//!   cycled, and the rows are a noisy floor with a few carriers from a fixed
+//!   seed (`bins` bytes each), so compression and decoders see what a real
+//!   station sends. For load tests; the default is the tiny payloads above.
 //! - **Front end:** gain, hardware AGC and retuning are modelled; retuning
 //!   moves the tunable range (center ± sample rate / 2, inside the hardware
 //!   range), closes channels that fall outside it with
@@ -39,6 +45,7 @@ use tokio::time::{Instant, Interval, MissedTickBehavior};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
 
+use crate::fake_opus;
 use crate::{
     AudioStream, Backend, BackendCapabilities, BackendError, ChannelId, ChannelOutput, EventStream,
     Health, MeasurementChannel, MeasurementId, RowStream, Spectrum, SubscriptionId,
@@ -63,6 +70,22 @@ const FAKE_FLOOR_DB_HZ: f64 = -125.0;
 const FAKE_FLOOR_SWING_DB: f64 = 3.0;
 /// How far a fake carrier stands above the floor, dB.
 const FAKE_CARRIER_DB: f32 = 30.0;
+
+/// How big the fake's audio packets and waterfall rows are.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FakePayload {
+    /// A 3-byte Opus packet of silence per frame and flat rows with a
+    /// ripple and one peak: what development and the tests use.
+    #[default]
+    Tiny,
+    /// Opus packets of a real channel's size (a fixture of encoded noise,
+    /// cycled) and rows of a noisy floor with carriers, from a fixed seed.
+    Real,
+}
+
+/// The seed of the noisy rows of [`FakePayload::Real`], mixed with each
+/// subscription's ID, so a subscription gets the same rows on every run.
+pub const FAKE_ROW_SEED: u64 = 0x636f_6178_6875_6231;
 
 /// What a test sees of the measurement channels ([`FakeBackend::measurement_log`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +160,8 @@ pub struct FakeConfig {
     pub frontend: v1::FrontendState,
     /// The initial health (see [`FakeBackend::set_health`]).
     pub health: Health,
+    /// The size of the audio packets and waterfall rows.
+    pub payload: FakePayload,
 }
 
 impl Default for FakeConfig {
@@ -233,6 +258,7 @@ impl FakeConfig {
                     input_power_dbfs: Some(-35.0),
                 }),
             },
+            payload: FakePayload::Tiny,
         }
     }
 }
@@ -275,6 +301,7 @@ struct State {
 #[derive(Clone)]
 pub struct FakeBackend {
     info: v1::BackendInfo,
+    payload: FakePayload,
     state: Arc<Mutex<State>>,
     events: broadcast::Sender<v1::Event>,
     epoch: Instant,
@@ -302,6 +329,7 @@ impl FakeBackend {
         let (events, _) = broadcast::channel(EVENT_BUFFER);
         Self {
             info: config.info,
+            payload: config.payload,
             state: Arc::new(Mutex::new(State {
                 capabilities: config.capabilities,
                 frontend: config.frontend,
@@ -539,7 +567,7 @@ impl Backend for FakeBackend {
                 stop: stop.clone(),
             },
         );
-        let stream = audio_stream(req.channel_id, audio.frame_duration_ms, stop);
+        let stream = audio_stream(req.channel_id, audio.frame_duration_ms, self.payload, stop);
         Ok((opened, stream))
     }
 
@@ -708,7 +736,7 @@ impl Backend for FakeBackend {
         state
             .subscriptions
             .insert(req.subscription_id, stop.clone());
-        let stream = row_stream(&subscribed, self.epoch, stop);
+        let stream = row_stream(&subscribed, self.epoch, self.payload, stop);
         Ok((subscribed, stream))
     }
 
@@ -944,7 +972,7 @@ struct AudioGen {
     channel_id: ChannelId,
     interval: Interval,
     stop: CancellationToken,
-    payload: Vec<u8>,
+    payload: AudioPayload,
     seq: u32,
     timestamp: u32,
     step: u32,
@@ -953,9 +981,54 @@ struct AudioGen {
     pending_signal: bool,
 }
 
+/// The bitrate the Opus fixture was encoded at (a constant one), bits/s.
+const REAL_BITRATE_BPS: u32 = 24_000;
+
+/// Where a channel's packets come from.
+enum AudioPayload {
+    /// The same packet every frame.
+    Fixed(Vec<u8>),
+    /// The packets of the fixture, back to back, in turn.
+    Cycled { packets: &'static [u8], size: usize },
+}
+
+impl AudioPayload {
+    fn new(frame_ms: u32, payload: FakePayload) -> Self {
+        let packets = match (payload, frame_ms) {
+            (FakePayload::Real, 10) => fake_opus::PACKETS_10_MS,
+            (FakePayload::Real, 20) => fake_opus::PACKETS_20_MS,
+            (FakePayload::Real, 40) => fake_opus::PACKETS_40_MS,
+            (FakePayload::Real, 60) => fake_opus::PACKETS_60_MS,
+            _ => return Self::Fixed(silence_packet(frame_ms)),
+        };
+        Self::Cycled {
+            packets,
+            size: real_packet_bytes(frame_ms),
+        }
+    }
+
+    /// The packet of frame `n`.
+    fn packet(&self, n: u32) -> Vec<u8> {
+        match self {
+            Self::Fixed(packet) => packet.clone(),
+            Self::Cycled { packets, size } => {
+                let count = (packets.len() / size).max(1);
+                let i = usize::try_from(n).unwrap_or(0) % count;
+                packets[i * size..(i + 1) * size].to_vec()
+            }
+        }
+    }
+}
+
+/// The size of one packet of the fixture for `frame_ms`.
+fn real_packet_bytes(frame_ms: u32) -> usize {
+    usize::try_from(REAL_BITRATE_BPS / 8_000 * frame_ms).unwrap_or(usize::MAX)
+}
+
 fn audio_stream(
     channel_id: ChannelId,
     frame_duration_ms: u32,
+    payload: FakePayload,
     stop: CancellationToken,
 ) -> AudioStream {
     let frame_ms = frame_duration_ms.max(1);
@@ -963,7 +1036,7 @@ fn audio_stream(
         channel_id,
         interval: ticker(Duration::from_millis(u64::from(frame_ms))),
         stop,
-        payload: silence_packet(frame_ms),
+        payload: AudioPayload::new(frame_ms, payload),
         seq: 0,
         timestamp: 0,
         step: 48u32.saturating_mul(frame_ms),
@@ -990,7 +1063,7 @@ fn audio_stream(
                     channel_id: st.channel_id,
                     seq: st.seq,
                     timestamp: st.timestamp,
-                    payload: st.payload.clone(),
+                    payload: st.payload.packet(st.seq),
                 };
                 st.seq = st.seq.wrapping_add(1);
                 st.timestamp = st.timestamp.wrapping_add(st.step);
@@ -1020,23 +1093,77 @@ fn synthetic_row(bins: usize, seq: u32) -> Vec<u8> {
         .collect()
 }
 
+/// How many carriers a real row has.
+const REAL_ROW_CARRIERS: u64 = 5;
+
+/// A row of `bins` values like a receiver's: the floor with bell-shaped noise
+/// (four uniform bytes added, σ about 4.5 steps: 2.2 dB with the default
+/// quantization) and a few narrow carriers, whose places and heights come from
+/// `seed` and which flicker a little from row to row. The same `seed`, `bins`
+/// and `seq` give the same row.
+fn real_row(bins: usize, seq: u32, seed: u64) -> Vec<u8> {
+    let mut row: Vec<u8> = (0..bins)
+        .map(|i| {
+            let r = mix(seed ^ mix((u64::from(seq) << 32) | u64::try_from(i).unwrap_or(0)));
+            let sum: i32 = r.to_le_bytes()[..4].iter().map(|&b| i32::from(b)).sum();
+            // The sum has mean 510 and σ 147: scale it to σ 4.5 steps.
+            let noise = (sum - 510) * 31 / 1024;
+            u8::try_from((i32::from(ROW_FLOOR) + noise).clamp(0, 255)).unwrap_or(ROW_FLOOR)
+        })
+        .collect();
+    let Ok(width) = u64::try_from(bins) else {
+        return row;
+    };
+    if width == 0 {
+        return row;
+    }
+    for k in 0..REAL_ROW_CARRIERS {
+        let h = mix(seed ^ 0xCA44_1E40 ^ k);
+        let center = usize::try_from(h % width).unwrap_or(0);
+        // 40 to 89 steps above the floor (20 to 45 dB), less a flicker of 0
+        // to 7.
+        let height = 40 + (h >> 32) % 50 - mix(seed ^ (k << 56) ^ u64::from(seq)) % 8;
+        // The carrier's bin, then its neighbours at a half and a sixth.
+        for (offset, divisor) in [(0usize, 1u64), (1, 2), (2, 6)] {
+            let add = u8::try_from(height / divisor).unwrap_or(u8::MAX);
+            let below = center.checked_sub(offset);
+            let above = (offset > 0).then_some(center + offset);
+            for bin in [below, above].into_iter().flatten() {
+                if let Some(v) = row.get_mut(bin) {
+                    *v = v.saturating_add(add);
+                }
+            }
+        }
+    }
+    row
+}
+
 struct RowGen {
     subscription_id: SubscriptionId,
     interval: Interval,
     stop: CancellationToken,
     bins: usize,
     zstd: bool,
+    /// The seed of the real rows; `None` for the tiny ones.
+    real_seed: Option<u64>,
     seq: u32,
     epoch: Instant,
 }
 
-fn row_stream(sub: &v1::WaterfallSubscribed, epoch: Instant, stop: CancellationToken) -> RowStream {
+fn row_stream(
+    sub: &v1::WaterfallSubscribed,
+    epoch: Instant,
+    payload: FakePayload,
+    stop: CancellationToken,
+) -> RowStream {
     let state = RowGen {
         subscription_id: sub.subscription_id,
         interval: ticker(Duration::from_millis(u64::from(sub.row_interval_ms.max(1)))),
         stop,
         bins: usize::try_from(sub.bins).unwrap_or(0),
         zstd: sub.compression == v1::WaterfallCompression::Zstd as i32,
+        real_seed: (payload == FakePayload::Real)
+            .then(|| mix(FAKE_ROW_SEED ^ u64::from(sub.subscription_id))),
         seq: 0,
         epoch,
     };
@@ -1045,7 +1172,10 @@ fn row_stream(sub: &v1::WaterfallSubscribed, epoch: Instant, stop: CancellationT
             biased;
             () = st.stop.cancelled() => None,
             _ = st.interval.tick() => {
-                let row = synthetic_row(st.bins, st.seq);
+                let row = match st.real_seed {
+                    Some(seed) => real_row(st.bins, st.seq, seed),
+                    None => synthetic_row(st.bins, st.seq),
+                };
                 // Compressing a few KiB in memory cannot fail in practice; if
                 // it ever does, end the stream rather than send a bad row.
                 let payload = if st.zstd {
@@ -1702,5 +1832,252 @@ mod tests {
         }
         let first = events.next().await.expect("event after lag");
         assert_eq!(first.detail, "10");
+    }
+
+    // ------------------------------------------------ real-size payloads
+
+    fn real_backend() -> FakeBackend {
+        FakeBackend::new(FakeConfig {
+            payload: FakePayload::Real,
+            ..FakeConfig::default()
+        })
+    }
+
+    /// The duration an Opus packet's table of contents says, in tenths of a
+    /// millisecond (RFC 6716 §3.1, §3.2): the frame duration of its config
+    /// times its number of frames; `None` for a packet that is too short.
+    fn opus_duration_tenths_ms(packet: &[u8]) -> Option<u32> {
+        let toc = *packet.first()?;
+        let config = toc >> 3;
+        let frame = match config {
+            0..=11 => [100, 200, 400, 600][usize::from(config % 4)],
+            12..=15 => [100, 200][usize::from(config % 2)],
+            _ => [25, 50, 100, 200][usize::from(config % 4)],
+        };
+        let frames = match toc & 3 {
+            0 => 1,
+            1 | 2 => 2,
+            _ => u32::from(*packet.get(1)? & 0x3F),
+        };
+        Some(frame * frames)
+    }
+
+    #[test]
+    fn the_default_payload_is_tiny() {
+        assert_eq!(FakePayload::default(), FakePayload::Tiny);
+        assert_eq!(FakeConfig::default().payload, FakePayload::Tiny);
+        assert_eq!(
+            FakeConfig::receiver(
+                7_100_000,
+                2_048_000,
+                v1::FrequencyRange {
+                    start_hz: 500_000,
+                    end_hz: 1_766_000_000,
+                },
+                "x"
+            )
+            .payload,
+            FakePayload::Tiny
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tiny_payloads_are_unchanged() {
+        let b = FakeBackend::default();
+        let (_, mut audio) = b.open_channel(open_req(1, 7_100_000)).await.expect("open");
+        for _ in 0..5 {
+            if let ChannelOutput::Audio(f) = audio.next().await.expect("item") {
+                assert_eq!(f.payload, vec![0xF8, 0xFF, 0xFE]);
+            }
+        }
+        let (_, mut rows) = b
+            .subscribe_waterfall(sub_req(1, v1::WaterfallCompression::None))
+            .await
+            .expect("subscribe");
+        for seq in 0..3 {
+            let row = rows.next().await.expect("row");
+            assert_eq!(row.payload, synthetic_row(256, seq));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn real_packets_are_a_real_channels_size_and_valid() {
+        for frame_ms in [10u32, 20, 40, 60] {
+            let b = real_backend();
+            let mut req = open_req(1, 7_100_000);
+            req.audio = Some(opus(frame_ms));
+            let (_, mut audio) = b.open_channel(req).await.expect("open");
+            let size = usize::try_from(3 * frame_ms).expect("small");
+            let count = match frame_ms {
+                10 => 100,
+                20 => 50,
+                40 => 25,
+                _ => 17,
+            };
+            let mut packets = Vec::new();
+            while packets.len() < 2 * count + 3 {
+                if let ChannelOutput::Audio(f) = audio.next().await.expect("item") {
+                    packets.push(f.payload);
+                }
+            }
+            for p in &packets {
+                // §6.1: 24 kbit/s is 3 bytes a millisecond; inside §5's bounds.
+                assert_eq!(p.len(), size, "{frame_ms} ms");
+                assert!((limits::MIN_OPUS_PACKET..=limits::MAX_OPUS_PACKET).contains(&p.len()));
+                // A decoder reads the packet as the duration of its frame.
+                assert_eq!(opus_duration_tenths_ms(p), Some(frame_ms * 10), "{p:02x?}");
+            }
+            // The fixture is cycled, and is not one packet repeated.
+            assert_eq!(packets[0], packets[count]);
+            assert_eq!(packets[3], packets[count + 3]);
+            assert!(packets.iter().any(|p| *p != packets[0]));
+            assert_ne!(packets[0], silence_packet(frame_ms));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn real_packets_keep_the_pace_and_the_numbering() {
+        let b = real_backend();
+        let (_, mut audio) = b.open_channel(open_req(3, 7_100_000)).await.expect("open");
+        let start = Instant::now();
+        let mut frames = Vec::new();
+        while frames.len() < 50 {
+            if let ChannelOutput::Audio(f) = audio.next().await.expect("item") {
+                frames.push(f);
+            }
+        }
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+        for (i, f) in frames.iter().enumerate() {
+            let i = u32::try_from(i).expect("small");
+            assert_eq!((f.channel_id, f.seq, f.timestamp), (3, i, i * 960));
+            assert_eq!(f.payload.len(), 60);
+        }
+    }
+
+    #[test]
+    fn real_rows_have_bins_values_a_floor_with_noise_and_carriers() {
+        for bins in [64usize, 256, 1024, 4096] {
+            let row = real_row(bins, 7, FAKE_ROW_SEED);
+            assert_eq!(row.len(), bins);
+            let mut sorted = row.clone();
+            sorted.sort_unstable();
+            // A carrier stands tens of steps above the floor.
+            assert!(
+                i32::from(sorted[bins - 1]) > i32::from(ROW_FLOOR) + 30,
+                "{bins} bins"
+            );
+            // The floor is the median, to within the noise (a few carriers
+            // and their sides take a small part of a row of many bins).
+            if bins >= 1024 {
+                let median = i32::from(sorted[bins / 2]);
+                assert!(
+                    (i32::from(ROW_FLOOR) - 2..=i32::from(ROW_FLOOR) + 2).contains(&median),
+                    "{bins} bins: median {median}"
+                );
+            }
+        }
+        let row = real_row(4096, 7, FAKE_ROW_SEED);
+        let mean = row.iter().map(|&v| f64::from(v)).sum::<f64>() / 4096.0;
+        let var = row
+            .iter()
+            .map(|&v| (f64::from(v) - mean).powi(2))
+            .sum::<f64>()
+            / 4096.0;
+        assert!((3.0..7.0).contains(&var.sqrt()), "σ = {}", var.sqrt());
+    }
+
+    #[test]
+    fn the_same_seed_gives_the_same_rows() {
+        for seq in [0, 1, 99] {
+            assert_eq!(
+                real_row(512, seq, FAKE_ROW_SEED),
+                real_row(512, seq, FAKE_ROW_SEED)
+            );
+        }
+        // Rows differ from one to the next, and between seeds.
+        assert_ne!(
+            real_row(512, 0, FAKE_ROW_SEED),
+            real_row(512, 1, FAKE_ROW_SEED)
+        );
+        assert_ne!(
+            real_row(512, 0, FAKE_ROW_SEED),
+            real_row(512, 0, FAKE_ROW_SEED + 1)
+        );
+        // The carriers stay where they are from row to row.
+        let carriers = |seq: u32| -> Vec<usize> {
+            let row = real_row(512, seq, FAKE_ROW_SEED);
+            (0..row.len())
+                .filter(|&i| row[i] > ROW_FLOOR + 35)
+                .collect()
+        };
+        let (a, b) = (carriers(0), carriers(1));
+        assert!(!a.is_empty());
+        assert!(a.iter().any(|c| b.contains(c)));
+    }
+
+    #[test]
+    fn real_rows_do_not_compress_like_tiny_ones() {
+        for bins in [256usize, 1024, 4096] {
+            let real = real_row(bins, 3, FAKE_ROW_SEED);
+            let tiny = synthetic_row(bins, 3);
+            let real_zstd = zstd::bulk::compress(&real, 1).expect("compress").len();
+            let tiny_zstd = zstd::bulk::compress(&tiny, 1).expect("compress").len();
+            // Noise is entropy: at least a third of the row stays, and a
+            // flat row with a ripple is a small fraction of that.
+            assert!(real_zstd * 3 > bins, "{bins} bins: {real_zstd}");
+            assert!(
+                real_zstd > 3 * tiny_zstd,
+                "{bins}: {real_zstd} vs {tiny_zstd}"
+            );
+            // And a station can send it: §5's compressed limit.
+            assert!(real_zstd <= limits::MAX_WATERFALL_COMPRESSED);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn real_rows_come_out_of_the_backend_exact_and_repeatable() {
+        let rows_of = |compression: v1::WaterfallCompression| async move {
+            let b = real_backend();
+            let (_, mut rows) = b
+                .subscribe_waterfall(sub_req(5, compression))
+                .await
+                .expect("subscribe");
+            let mut out = Vec::new();
+            for _ in 0..4 {
+                out.push(rows.next().await.expect("row").payload);
+            }
+            out
+        };
+        let none = rows_of(v1::WaterfallCompression::None).await;
+        let zstd = rows_of(v1::WaterfallCompression::Zstd).await;
+        // Another backend, the same subscription: the same rows.
+        assert_eq!(none, rows_of(v1::WaterfallCompression::None).await);
+        assert_eq!(zstd, rows_of(v1::WaterfallCompression::Zstd).await);
+        let mut decoder = WaterfallDecoder::new();
+        let mut out = Vec::new();
+        for (seq, (raw, compressed)) in none.iter().zip(&zstd).enumerate() {
+            assert_eq!(raw.len(), 256);
+            assert_ne!(*raw, synthetic_row(256, u32::try_from(seq).expect("small")));
+            decoder
+                .decode(
+                    compressed,
+                    v1::WaterfallCompression::Zstd as i32,
+                    256,
+                    &mut out,
+                )
+                .expect("decodes");
+            assert_eq!(&out, raw);
+        }
+        // Two subscriptions look at different noise.
+        let b = real_backend();
+        let mut firsts = Vec::new();
+        for id in [1, 2] {
+            let (_, mut rows) = b
+                .subscribe_waterfall(sub_req(id, v1::WaterfallCompression::None))
+                .await
+                .expect("subscribe");
+            firsts.push(rows.next().await.expect("row").payload);
+        }
+        assert_ne!(firsts[0], firsts[1]);
     }
 }

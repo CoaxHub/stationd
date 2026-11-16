@@ -289,8 +289,8 @@ pub fn driver_for(config: &BackendConfig) -> Driver {
             }),
             units: Arc::new(ExternalUnits),
         },
-        BackendConfig::Fake => Driver {
-            backends: Arc::new(FakeBackends::default()),
+        BackendConfig::Fake(fake) => Driver {
+            backends: Arc::new(FakeBackends::default().with_payload(fake.payload)),
             units: Arc::new(FakeUnits::default()),
         },
     }
@@ -740,7 +740,7 @@ mod tests {
 
     #[tokio::test]
     async fn drivers_are_built_from_the_config() {
-        let fake = driver_for(&BackendConfig::Fake);
+        let fake = driver_for(&BackendConfig::Fake(crate::config::FakeSettings::default()));
         assert!(fake.backends.info().version.starts_with("fake-"));
         let bundled = driver_for(&BackendConfig::Bundled);
         assert!(bundled.backends.info().version.starts_with("ka9q-radio"));

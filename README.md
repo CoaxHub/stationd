@@ -96,6 +96,9 @@ gateway_ca = "/path/ca.pem"                     # the ONLY roots trusted for the
 kind = "fake"                                   # synthetic media, no radio; or "ka9q" (the default)
 usb_devices = "usb"                             # where SDRs are read from (default /sys/bus/usb/devices);
                                                 # simulated SDRs are directories laid out like it
+[backend.fake]                                  # only with kind = "fake"
+payload = "real"                                # "tiny" (the default): a 3-byte Opus packet per frame and flat rows;
+                                                # "real": Opus packets of a real channel's size and noisy rows
 [backend.ka9q]                                  # one radiod of your own for every receiver; stationd starts no unit
 status_group = "239.77.0.6:5006"                # radiod's `status =` group
 data_group = "239.77.0.4:5004"                  # optional: radiod's `data =` group; default: asked from radiod
@@ -105,6 +108,7 @@ ignore_host_load = true                         # measuring never pauses for the
 
 - Without `[credentials]`, stationd runs on the credentials in the state directory, which `stationd enroll` gets from `[endpoints]`.
 - Without `[backend]`, or with `kind = "ka9q"` and no `[backend.ka9q]`, each receiver runs the bundled radiod on its slot's groups, started through systemd, as on a packaged station. With `kind = "fake"`, each receiver is a fake backend and no unit is started.
+- `[backend.fake] payload` sets what the fake backends send, for load tests and for decoders: `"tiny"` (the default) is a 3-byte Opus packet of silence per frame and flat waterfall rows; `"real"` is Opus packets of a real channel's size (24 kbit/s: 60 bytes per 20 ms; from a committed fixture of encoded noise, cycled, made by `scripts/make-fake-opus-fixture.py`) and rows of `bins` bytes with a noisy floor and a few carriers from a fixed seed (the same subscription gets the same rows on every run), so compression sees real entropy. Unknown values and keys are errors.
 - With `state_dir`, the applied receivers live in `<state_dir>/receivers/receivers.json`.
 - `stationd check-config` (development builds only) validates the file, the credentials and the applied receivers.
 - `[credentials]` takes PEM files of the shape `crates/station-conformance/src/pki.rs` generates in memory: a P-256 key readable only by stationd's user, a client certificate whose only URI SAN is `urn:coaxhub:station:<uuid>` (followed by its intermediate, if any), and the root that signed the gateway's certificate, the only trust anchor used for it.
