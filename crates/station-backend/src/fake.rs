@@ -19,6 +19,12 @@
 //!   cycled, and the rows are a noisy floor with a few carriers from a fixed
 //!   seed (`bins` bytes each), so compression and decoders see what a real
 //!   station sends. For load tests; the default is the tiny payloads above.
+//! - **Beacons:** a waterfall subscription of 3 kHz in 64 bins around one of
+//!   the five NCDXF/IARU beacon frequencies (14.100, 18.110, 21.150, 24.930
+//!   and 28.200 MHz) gets rows that follow the project's published schedule
+//!   by the wall clock: the beacon of the slot keys its callsign and four
+//!   dashes over a noise floor, with an SNR of its own (YV5B, listed off the
+//!   air, sends nothing). See `fake_beacons`.
 //! - **Front end:** gain, hardware AGC and retuning are modelled; retuning
 //!   moves the tunable range (center ± sample rate / 2, inside the hardware
 //!   range), closes channels that fall outside it with
@@ -45,6 +51,7 @@ use tokio::time::{Instant, Interval, MissedTickBehavior};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
 
+use crate::fake_beacons;
 use crate::fake_opus;
 use crate::{
     AudioStream, Backend, BackendCapabilities, BackendError, ChannelId, ChannelOutput, EventStream,
@@ -736,7 +743,25 @@ impl Backend for FakeBackend {
         state
             .subscriptions
             .insert(req.subscription_id, stop.clone());
-        let stream = row_stream(&subscribed, self.epoch, self.payload, stop);
+        // 3 kHz in 64 bins around a beacon's carrier: the rows follow its schedule.
+        let beacon = subscribed
+            .range
+            .as_ref()
+            .and_then(|r| fake_beacons::carrier_of(r, subscribed.bins))
+            .map(|band| {
+                (
+                    band,
+                    subscribed.quantization.unwrap_or(DEFAULT_QUANTIZATION),
+                )
+            });
+        let stream = row_stream(
+            &subscribed,
+            self.epoch,
+            self.payload,
+            beacon,
+            Arc::clone(&self.wall_clock),
+            stop,
+        );
         Ok((subscribed, stream))
     }
 
@@ -886,7 +911,7 @@ impl Backend for FakeBackend {
 }
 
 /// `SplitMix64`: a deterministic scatter for the fake spectra.
-fn mix(mut z: u64) -> u64 {
+pub(crate) fn mix(mut z: u64) -> u64 {
     z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -1146,6 +1171,9 @@ struct RowGen {
     zstd: bool,
     /// The seed of the real rows; `None` for the tiny ones.
     real_seed: Option<u64>,
+    /// A beacon subscription: the carrier's band and the quantization of its rows.
+    beacon: Option<(usize, v1::Quantization)>,
+    wall_clock: WallClock,
     seq: u32,
     epoch: Instant,
 }
@@ -1154,6 +1182,8 @@ fn row_stream(
     sub: &v1::WaterfallSubscribed,
     epoch: Instant,
     payload: FakePayload,
+    beacon: Option<(usize, v1::Quantization)>,
+    wall_clock: WallClock,
     stop: CancellationToken,
 ) -> RowStream {
     let state = RowGen {
@@ -1164,6 +1194,8 @@ fn row_stream(
         zstd: sub.compression == v1::WaterfallCompression::Zstd as i32,
         real_seed: (payload == FakePayload::Real)
             .then(|| mix(FAKE_ROW_SEED ^ u64::from(sub.subscription_id))),
+        beacon,
+        wall_clock,
         seq: 0,
         epoch,
     };
@@ -1172,9 +1204,16 @@ fn row_stream(
             biased;
             () = st.stop.cancelled() => None,
             _ = st.interval.tick() => {
-                let row = match st.real_seed {
-                    Some(seed) => real_row(st.bins, st.seq, seed),
-                    None => synthetic_row(st.bins, st.seq),
+                let row = match (st.beacon, st.real_seed) {
+                    (Some((band, quantization)), seed) => fake_beacons::row(
+                        band,
+                        (st.wall_clock)(),
+                        st.seq,
+                        seed.unwrap_or(FAKE_ROW_SEED) ^ u64::from(st.subscription_id),
+                        quantization,
+                    ),
+                    (None, Some(seed)) => real_row(st.bins, st.seq, seed),
+                    (None, None) => synthetic_row(st.bins, st.seq),
                 };
                 // Compressing a few KiB in memory cannot fail in practice; if
                 // it ever does, end the stream rather than send a bad row.
@@ -1612,6 +1651,69 @@ mod tests {
             code(b.unsubscribe_waterfall(1).await),
             v1::ResultCode::NotFound
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_subscription_around_a_beacon_carrier_hears_the_scheduled_beacon() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        // 14.100 MHz in the first slot of a cycle: 4U1UN, whose first dash (100 W) is keyed
+        // from 3.56 s to 4.56 s into the slot and whose transmission ends by 8.8 s.
+        let slot_ms = 1_790_942_400_i64 * 1000;
+        let clock = Arc::new(AtomicI64::new(slot_ms + 4_000));
+        let b = FakeBackend::new(FakeConfig::receiver(
+            14_175_000,
+            2_048_000,
+            v1::FrequencyRange {
+                start_hz: 500_000,
+                end_hz: 1_766_000_000,
+            },
+            "fake HF",
+        ))
+        .with_wall_clock({
+            let clock = Arc::clone(&clock);
+            Arc::new(move || clock.load(Ordering::Relaxed))
+        });
+        let beacon_req = |id, bins| v1::SubscribeWaterfall {
+            subscription_id: id,
+            receiver_id: 0,
+            range: Some(v1::FrequencyRange {
+                start_hz: 14_098_500,
+                end_hz: 14_101_500,
+            }),
+            bins,
+            row_interval_ms: 100,
+            quantization: Some(v1::Quantization {
+                offset_db: -160.0,
+                step_db: 0.5,
+            }),
+            compression: v1::WaterfallCompression::None as i32,
+        };
+        let (sub, mut rows) = b
+            .subscribe_waterfall(beacon_req(1, 64))
+            .await
+            .expect("subscribe");
+        assert_eq!(sub.bins, 64);
+        // How far the tone's bin stands over the row's median, steps of 0.5 dB.
+        let over = |payload: &[u8]| {
+            let mut sorted = payload.to_vec();
+            sorted.sort_unstable();
+            i32::from(payload[32]) - i32::from(sorted[32])
+        };
+        let keyed = rows.next().await.expect("row");
+        assert_eq!(keyed.payload.len(), 64);
+        assert!(over(&keyed.payload) > 40, "{}", over(&keyed.payload));
+        // After the beacon has finished its transmission the bin is noise.
+        clock.store(slot_ms + 9_500, Ordering::Relaxed);
+        let silent = rows.next().await.expect("row");
+        assert!(over(&silent.payload) < 16, "{}", over(&silent.payload));
+        // Another shape around the same carrier is the generic row, with its peak in the middle.
+        let (_, mut generic) = b
+            .subscribe_waterfall(beacon_req(2, 128))
+            .await
+            .expect("subscribe");
+        let row = generic.next().await.expect("row");
+        assert_eq!(row.payload.len(), 128);
+        assert_eq!(row.payload[64], ROW_PEAK);
     }
 
     #[tokio::test]

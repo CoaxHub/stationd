@@ -30,7 +30,8 @@ message WaterfallRow {
   uint32 subscription_id = 1;
   // Increments by 1 per row, wraps at 2^32.
   uint32 seq = 2;
-  // Station monotonic clock, microseconds. For row-rate checks only.
+  // Station monotonic clock, microseconds. For row-rate checks and to place
+  // rows in time.
   uint64 timestamp_us = 3;
   // Compressed per WaterfallSubscribed.compression. Once decompressed it is
   // exactly WaterfallSubscribed.bins bytes, lowest frequency first, each a

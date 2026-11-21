@@ -44,7 +44,7 @@ stationd                                         hub gateway
    │                                               │  marks station online
    │◄──── Request{k, StartMeasurements} ───────────│  a station that measures (§4.1)
    │───── Response{k, OK, MeasurementsStarted} ───►│
-   │◄──── Request{n, SubscribeWaterfall …} ────────│  only when listeners need it
+   │◄──── Request{n, SubscribeWaterfall …} ────────│  when listeners need it, and in the hub's beacon watch
    │───── Response{n, OK, WaterfallSubscribed} ───►│
    │───── WaterfallRow* / AudioFrame* ────────────►│
    │───── NoiseFloorReport* (1 per measured minute)►│

@@ -39,6 +39,7 @@
 //! `backend-ka9q` implements this trait for radiod.
 
 pub mod fake;
+mod fake_beacons;
 mod fake_opus;
 pub mod reduce;
 
