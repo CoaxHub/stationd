@@ -302,9 +302,12 @@ impl Session {
                 }
                 msg = inbound.message() => match msg {
                     Ok(Some(v1::HubMessage { body: Some(HubBody::Request(req)) })) => {
+                        // The tables' step now, in the order the hub sent the
+                        // requests; the backend calls and the answer in a task.
+                        let admitted = dispatch::admit(&self.requests, req);
                         let requests = self.requests.clone();
                         let outbound = Arc::clone(&self.outbound);
-                        tasks.spawn(handle_request(requests, outbound, req));
+                        tasks.spawn(handle_request(requests, outbound, admitted));
                     }
                     Ok(Some(v1::HubMessage { body: Some(HubBody::Goodbye(g)) })) => break End::Goodbye(g),
                     Ok(Some(v1::HubMessage { body: Some(HubBody::Welcome(_)) })) => {
@@ -354,14 +357,20 @@ impl Session {
 
     fn status(&self) -> v1::StationStatus {
         let tables = &self.requests.tables;
-        let (channels, subscriptions) = {
+        // One look at the tables, whose lock is dropped before the receivers'
+        // is taken (`UpdateChannel` and the like take them in that order).
+        let (channels, subscriptions, per_receiver) = {
             let t = tables.lock().unwrap_or_else(PoisonError::into_inner);
-            (t.open_channels(), t.open_subscriptions())
+            (
+                t.open_channels(),
+                t.open_subscriptions(),
+                t.open_channels_by_receiver(),
+            )
         };
-        let receivers = self.ctx.receivers.health(|id| {
-            let t = tables.lock().unwrap_or_else(PoisonError::into_inner);
-            u32::try_from(t.open_channels_on(id)).unwrap_or(u32::MAX)
-        });
+        let receivers = self
+            .ctx
+            .receivers
+            .health(|id| per_receiver.get(&id).copied().unwrap_or(0));
         status::station_status(
             receivers,
             status::host_health(),
@@ -463,10 +472,14 @@ impl Session {
     }
 }
 
-/// Answers one request, then (for an opened channel or subscription) pumps
+/// Answers one admitted request, then (for an opened channel or subscription) pumps
 /// its media into the queue until it is closed.
-async fn handle_request(ctx: RequestContext, outbound: Arc<Outbound>, req: v1::Request) {
-    let (response, media) = dispatch::dispatch(&ctx, req).await;
+async fn handle_request(
+    ctx: RequestContext,
+    outbound: Arc<Outbound>,
+    admitted: dispatch::Admitted,
+) {
+    let (response, media) = dispatch::finish(&ctx, admitted).await;
     outbound.push_body(Body::Response(response));
     match media {
         None => {}

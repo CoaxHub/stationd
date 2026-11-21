@@ -453,10 +453,12 @@ async fn a_receiver_going_takes_its_channels() {
     assert!(format!("{c:?}").contains("RequestContext"));
 }
 
-/// A backend whose `open_channel`/`subscribe_waterfall` wait for a gate.
+/// A backend whose `open_channel`/`subscribe_waterfall` wait for a gate, and
+/// whose closes wait for another (open by default).
 struct Gated {
     inner: FakeBackend,
     gate: Arc<tokio::sync::Semaphore>,
+    close_gate: Arc<tokio::sync::Semaphore>,
 }
 
 #[async_trait::async_trait]
@@ -481,6 +483,7 @@ impl Backend for Gated {
         self.inner.update_channel(req).await
     }
     async fn close_channel(&self, id: u32) -> Result<(), BackendError> {
+        let _permit = self.close_gate.acquire().await;
         self.inner.close_channel(id).await
     }
     async fn set_frontend(&self, req: v1::SetFrontend) -> Result<v1::FrontendState, BackendError> {
@@ -494,6 +497,7 @@ impl Backend for Gated {
         self.inner.subscribe_waterfall(req).await
     }
     async fn unsubscribe_waterfall(&self, id: u32) -> Result<(), BackendError> {
+        let _permit = self.close_gate.acquire().await;
         self.inner.unsubscribe_waterfall(id).await
     }
     fn health(&self) -> station_backend::Health {
@@ -504,10 +508,33 @@ impl Backend for Gated {
     }
 }
 
-#[tokio::test]
-async fn close_while_opening_closes_after_open() {
+/// A running receiver on a [`Gated`] backend.
+struct Rig {
+    c: RequestContext,
+    inner: FakeBackend,
+    /// Opens wait for its permits (none at first).
+    gate: Arc<tokio::sync::Semaphore>,
+    /// Closes wait for its permits (plenty at first).
+    close_gate: Arc<tokio::sync::Semaphore>,
+    dir: tempfile::TempDir,
+}
+
+/// One running receiver (1) on a backend whose opens wait for `gate`
+/// (a slow open): the context, the fake underneath and the gate.
+async fn gated() -> (
+    RequestContext,
+    FakeBackend,
+    Arc<tokio::sync::Semaphore>,
+    tempfile::TempDir,
+) {
+    let r = rig().await;
+    (r.c, r.inner, r.gate, r.dir)
+}
+
+async fn rig() -> Rig {
     let inner = FakeBackend::default();
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let close_gate = Arc::new(tokio::sync::Semaphore::new(1 << 20));
     let dir = tempfile::tempdir().expect("tmp");
     crate::receivers::testing::plug(&dir.path().join("usb"), "1-1", "S", "RTL2838UHIDIR");
     let receivers = crate::receivers::Receivers::new(
@@ -520,6 +547,7 @@ async fn close_while_opening_closes_after_open() {
             backends: Arc::new(SharedBackend(Arc::new(Gated {
                 inner: inner.clone(),
                 gate: Arc::clone(&gate),
+                close_gate: Arc::clone(&close_gate),
             }))),
             units: Arc::new(FakeUnits::default()),
         },
@@ -544,6 +572,18 @@ async fn close_while_opening_closes_after_open() {
         tables: Arc::default(),
         measurer: None,
     };
+    Rig {
+        c,
+        inner,
+        gate,
+        close_gate,
+        dir,
+    }
+}
+
+#[tokio::test]
+async fn close_while_opening_closes_after_open() {
+    let (c, inner, gate, _dir) = gated().await;
     let opening = tokio::spawn({
         let c = c.clone();
         async move { dispatch(&c, req(1, open(9, 1, 7_100_000))).await }
@@ -581,6 +621,499 @@ async fn close_while_opening_closes_after_open() {
     assert!(inner.channel_ids().is_empty(), "closed in the backend");
     assert!(inner.subscription_ids().is_empty());
     assert!(c.tables().channels.is_empty() && c.tables().subscriptions.is_empty());
+}
+
+fn unsub(id: u32) -> Command {
+    Command::UnsubscribeWaterfall(v1::UnsubscribeWaterfall {
+        subscription_id: id,
+    })
+}
+
+/// STN-SUBORDER: a client that frees a place and takes it at once is never
+/// refused, even when the requests finish in the opposite order.
+#[tokio::test]
+async fn unsubscribe_then_subscribe_at_the_limit_is_never_refused() {
+    let (c, inner, gate, _dir) = gated().await;
+    gate.add_permits(1000);
+    let max = limits::waterfall_subscriptions_claim(1);
+    for i in 1..=max {
+        let (r, media) = dispatch(&c, req(u64::from(i), subscribe_cmd(i, 1, 7_100_000))).await;
+        assert_eq!(code(&r), v1::ResultCode::Ok);
+        assert!(media.is_some());
+    }
+    let (r, _) = dispatch(&c, req(100, subscribe_cmd(max + 1, 1, 7_100_000))).await;
+    assert_eq!(code(&r), v1::ResultCode::ResourceExhausted, "full");
+    // The read loop: both admitted, in the hub's order, before either runs.
+    let first = admit(&c, req(101, unsub(1)));
+    let second = admit(&c, req(102, subscribe_cmd(max + 1, 1, 7_100_000)));
+    // The tasks run in the other order: the open waits for the close before
+    // it, so the backend has room.
+    let second = tokio::spawn({
+        let c = c.clone();
+        async move { finish(&c, second).await }
+    });
+    tokio::task::yield_now().await;
+    let (r1, _) = finish(&c, first).await;
+    assert_eq!(code(&r1), v1::ResultCode::Ok);
+    let (r2, media) = second.await.expect("join");
+    assert_eq!(code(&r2), v1::ResultCode::Ok, "not refused");
+    assert!(media.is_some());
+    let ids = inner.subscription_ids();
+    assert_eq!(ids.len(), usize::try_from(max).expect("small"));
+    assert!(!ids.contains(&1) && ids.contains(&(max + 1)));
+    // The ID that was closed is gone.
+    let (r, _) = dispatch(&c, req(103, unsub(1))).await;
+    assert_eq!(code(&r), v1::ResultCode::NotFound);
+}
+
+/// STN-SUBORDER: an unsubscribe that arrives while its subscribe is still
+/// opening cancels it, frees its place at once, and an open of the same ID
+/// right after it waits for its close.
+#[tokio::test]
+async fn unsubscribe_during_opening_cancels() {
+    let (c, inner, gate, _dir) = gated().await;
+    let max = limits::waterfall_subscriptions_claim(1);
+    let sub = admit(&c, req(1, subscribe_cmd(4, 1, 7_100_000)));
+    let sub_task = tokio::spawn({
+        let c = c.clone();
+        async move { finish(&c, sub).await }
+    });
+    // The open is in flight (the gate is shut); the unsubscribe takes effect
+    // in the read loop at once, answered without waiting for the open.
+    let un = admit(&c, req(2, unsub(4)));
+    assert_eq!(
+        c.tables()
+            .subscriptions
+            .values()
+            .filter(|e| e.is_live())
+            .count(),
+        0,
+        "it no longer counts toward the limit"
+    );
+    let (r, _) = finish(&c, un).await;
+    assert_eq!(code(&r), v1::ResultCode::Ok);
+    // The slot is free for `max` others while the old open still hangs.
+    let mut held = Vec::new();
+    for i in 1..=max {
+        let a = admit(
+            &c,
+            req(10 + u64::from(i), subscribe_cmd(100 + i, 1, 7_100_000)),
+        );
+        assert!(
+            !matches!(&a.0, Step::Answered(_)),
+            "subscription {i} of {max} admitted"
+        );
+        held.push(a);
+    }
+    drop(held);
+    for i in 1..=max {
+        c.tables().subscriptions.remove(&(100 + i));
+    }
+    // The same ID again, at once: reserved now, backend call after the old
+    // one's close.
+    let again = admit(&c, req(3, subscribe_cmd(4, 1, 7_100_000)));
+    assert!(!matches!(&again.0, Step::Answered(_)));
+    let again_task = tokio::spawn({
+        let c = c.clone();
+        async move { finish(&c, again).await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(inner.subscription_ids().is_empty(), "nothing opened yet");
+    gate.add_permits(2);
+    let (r, media) = sub_task.await.expect("join");
+    assert_eq!(code(&r), v1::ResultCode::Ok, "the open itself succeeded");
+    assert!(media.is_none(), "but it never went live");
+    let (r, media) = again_task.await.expect("join");
+    assert_eq!(code(&r), v1::ResultCode::Ok);
+    assert!(media.is_some(), "the later open is live");
+    assert_eq!(inner.subscription_ids(), vec![4], "and is the one left");
+    assert_eq!(c.tables().open_subscriptions(), 1);
+}
+
+fn close_cmd(id: u32) -> Command {
+    Command::CloseChannel(v1::CloseChannel { channel_id: id })
+}
+
+fn is_answered(a: &Admitted) -> Option<v1::ResultCode> {
+    match &a.0 {
+        Step::Answered(r) => Some(code(r)),
+        _ => None,
+    }
+}
+
+fn spawn_finish(
+    c: &RequestContext,
+    a: Admitted,
+) -> tokio::task::JoinHandle<(v1::Response, Option<Media>)> {
+    let c = c.clone();
+    tokio::spawn(async move { finish(&c, a).await })
+}
+
+/// An open channel `id` on the rig's receiver, through the whole of
+/// `dispatch`.
+async fn opened(c: &RequestContext, id: u32) -> Media {
+    let (r, media) = dispatch(c, req(u64::from(id), open(id, 1, 7_100_000))).await;
+    assert_eq!(code(&r), v1::ResultCode::Ok, "open {id}");
+    media.expect("media")
+}
+
+/// A status tick holds the receivers' lock and an `UpdateChannel` needs both:
+/// the update must not hold the tables' lock while it waits for the
+/// receivers' (STN-SUBORDER-F D).
+/// (The runtime has threads to spare: the receivers' own tasks block on the
+/// same lock while the status holds it.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn update_channel_never_holds_the_tables_while_taking_the_receivers() {
+    let r = rig().await;
+    r.gate.add_permits(10);
+    let c = r.c.clone();
+    let _media = opened(&c, 5).await;
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = Mutex::new(release_rx);
+    let receivers = c.receivers.clone();
+    // The status: inside `health`, with the receivers' lock held.
+    let status = tokio::task::spawn_blocking(move || {
+        receivers.health(|_| {
+            let _ = entered_tx.send(());
+            let _ = release_rx.lock().expect("lock").recv();
+            0
+        })
+    });
+    tokio::task::spawn_blocking(move || entered_rx.recv())
+        .await
+        .expect("join")
+        .expect("inside health");
+    let upd = Command::UpdateChannel(v1::UpdateChannel {
+        channel_id: 5,
+        frequency_hz: Some(7_050_000),
+        ..Default::default()
+    });
+    let update = tokio::spawn({
+        let c = c.clone();
+        async move { dispatch(&c, req(6, upd)).await }
+    });
+    // However far the update has got, the tables are free for the status's
+    // own look at them.
+    // (A blocking sleep: the runtime's own timer needs worker threads, which
+    // the receivers' tasks may be holding while they wait for the lock.)
+    tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(200)))
+        .await
+        .expect("join");
+    let free = c.tables.try_lock().is_ok();
+    // Released before any assertion, so a failure is a failure and not a hang.
+    release_tx.send(()).expect("release");
+    let (resp, _) = update.await.expect("join");
+    status.await.expect("join");
+    assert!(
+        free,
+        "the update holds the tables while it waits for the receivers"
+    );
+    assert_eq!(code(&resp), v1::ResultCode::Ok);
+}
+
+#[tokio::test]
+async fn the_status_counts_per_receiver_from_one_look() {
+    let st = Station::standard().await;
+    let c = ctx_for(&st);
+    let _a = dispatch(&c, req(1, open(1, 1, 7_100_000))).await;
+    let _b = dispatch(&c, req(2, open(2, 1, 7_100_000))).await;
+    let _d = dispatch(&c, req(3, open(3, 2, 14_200_000))).await;
+    let counts = c.tables().open_channels_by_receiver();
+    assert_eq!(counts.get(&1), Some(&2));
+    assert_eq!(counts.get(&2), Some(&1));
+    assert_eq!(counts.len(), 2);
+}
+
+/// The channel version of the at-the-limit case.
+#[tokio::test]
+async fn close_then_open_at_the_channel_limit_is_never_refused() {
+    let r = rig().await;
+    r.gate.add_permits(1000);
+    let c = &r.c;
+    let max = limits::CHANNELS_PER_RECEIVER;
+    for i in 1..=max {
+        let _ = opened(c, i).await;
+    }
+    let (full, _) = dispatch(c, req(100, open(max + 1, 1, 7_100_000))).await;
+    assert_eq!(code(&full), v1::ResultCode::ResourceExhausted);
+    let first = admit(c, req(101, close_cmd(1)));
+    let second = admit(c, req(102, open(max + 1, 1, 7_100_000)));
+    assert!(is_answered(&second).is_none(), "admitted, not refused");
+    let second = spawn_finish(c, second);
+    tokio::task::yield_now().await;
+    let (r1, _) = finish(c, first).await;
+    assert_eq!(code(&r1), v1::ResultCode::Ok);
+    let (r2, media) = second.await.expect("join");
+    assert_eq!(code(&r2), v1::ResultCode::Ok);
+    assert!(media.is_some());
+    let ids = r.inner.channel_ids();
+    assert_eq!(ids.len(), usize::try_from(max).expect("small"));
+    assert!(!ids.contains(&1) && ids.contains(&(max + 1)));
+}
+
+#[tokio::test]
+async fn a_second_close_while_the_first_is_closing_is_not_found() {
+    let r = rig().await;
+    r.gate.add_permits(10);
+    let c = &r.c;
+    let _media = opened(c, 1).await;
+    r.close_gate.forget_permits(1 << 20);
+    let first = spawn_finish(c, admit(c, req(10, close_cmd(1))));
+    tokio::task::yield_now().await;
+    let second = admit(c, req(11, close_cmd(1)));
+    assert_eq!(is_answered(&second), Some(v1::ResultCode::NotFound));
+    let (resp, _) = finish(c, second).await;
+    assert_eq!(code(&resp), v1::ResultCode::NotFound);
+    r.close_gate.add_permits(1);
+    let (resp, _) = first.await.expect("join");
+    assert_eq!(code(&resp), v1::ResultCode::Ok);
+    assert!(c.tables().channels.is_empty());
+}
+
+/// S1: an ID closing on one receiver is not taken by an open on another; on
+/// the same receiver it is.
+#[tokio::test]
+async fn an_id_still_closing_on_another_receiver_is_already_exists() {
+    let st = Station::standard().await;
+    let c = ctx_for(&st);
+    let (r, _m) = dispatch(&c, req(1, open(7, 1, 7_100_000))).await;
+    assert_eq!(code(&r), v1::ResultCode::Ok);
+    let closing = admit(&c, req(2, close_cmd(7)));
+    let elsewhere = admit(&c, req(3, open(7, 2, 14_200_000)));
+    assert_eq!(is_answered(&elsewhere), Some(v1::ResultCode::AlreadyExists));
+    let same = admit(&c, req(4, open(7, 1, 7_100_000)));
+    assert!(is_answered(&same).is_none(), "the same receiver is safe");
+    let (r, _) = finish(&c, closing).await;
+    assert_eq!(code(&r), v1::ResultCode::Ok);
+    let (r, media) = finish(&c, same).await;
+    assert_eq!(code(&r), v1::ResultCode::Ok);
+    assert!(media.is_some());
+    // Settled: another receiver may take the ID once this one is closed.
+    let (r, _) = dispatch(&c, req(5, close_cmd(7))).await;
+    assert_eq!(code(&r), v1::ResultCode::Ok);
+    let (r, _) = dispatch(&c, req(6, open(7, 2, 14_200_000))).await;
+    assert_eq!(code(&r), v1::ResultCode::Ok);
+    // The same for a subscription.
+    let (r, _m) = dispatch(&c, req(7, subscribe_cmd(8, 1, 7_100_000))).await;
+    assert_eq!(code(&r), v1::ResultCode::Ok);
+    let closing = admit(&c, req(8, unsub(8)));
+    let elsewhere = admit(&c, req(9, subscribe_cmd(8, 2, 14_200_000)));
+    assert_eq!(is_answered(&elsewhere), Some(v1::ResultCode::AlreadyExists));
+    let _ = finish(&c, closing).await;
+}
+
+/// S1: the backend's own closes and a receiver going never remove an
+/// opening or a closing entry.
+#[tokio::test]
+async fn backend_closes_leave_opening_and_closing_entries() {
+    let r = rig().await;
+    let c = &r.c;
+    r.gate.add_permits(1000);
+    let _open = opened(c, 1).await;
+    let _gone = opened(c, 2).await;
+    r.close_gate.forget_permits(1 << 20);
+    // 1 closing in its backend; 3 opening (the gate is shut).
+    let closing = spawn_finish(c, admit(c, req(10, close_cmd(1))));
+    tokio::task::yield_now().await;
+    r.gate.forget_permits(1000);
+    let opening = spawn_finish(c, admit(c, req(11, open(3, 1, 7_100_000))));
+    tokio::task::yield_now().await;
+    c.tables().channel_closed(1);
+    assert!(
+        matches!(c.tables().channels[&1].slot, Slot::Closing { .. }),
+        "a closing entry stays"
+    );
+    c.tables().channel_closed(3);
+    assert!(matches!(
+        c.tables().channels[&3].slot,
+        Slot::Opening {
+            close_requested: true,
+            ..
+        }
+    ));
+    // The receiver went: the open entry (2) goes, the others stay.
+    c.tables().receiver_gone(1);
+    assert!(!c.tables().channels.contains_key(&2));
+    assert!(matches!(c.tables().channels[&1].slot, Slot::Closing { .. }));
+    assert!(matches!(
+        c.tables().channels[&3].slot,
+        Slot::Opening {
+            close_requested: true,
+            ..
+        }
+    ));
+    // Both end through their own backend calls.
+    r.close_gate.add_permits(1 << 20);
+    r.gate.add_permits(10);
+    let (resp, _) = closing.await.expect("join");
+    assert_eq!(code(&resp), v1::ResultCode::Ok);
+    let (resp, media) = opening.await.expect("join");
+    assert_eq!(code(&resp), v1::ResultCode::Ok);
+    assert!(media.is_none(), "closed while it was opening");
+    assert!(c.tables().channels.is_empty());
+    assert!(!r.inner.channel_ids().contains(&3));
+}
+
+/// S2: the wait is bounded: another ID goes ahead, the same ID is answered
+/// `BACKEND_ERROR`.
+#[tokio::test(start_paused = true)]
+async fn the_wait_for_a_close_is_bounded() {
+    let r = rig().await;
+    r.gate.add_permits(1000);
+    let c = &r.c;
+    let _a = opened(c, 1).await;
+    r.close_gate.forget_permits(1 << 20);
+    let closing = spawn_finish(c, admit(c, req(10, close_cmd(1))));
+    tokio::task::yield_now().await;
+    // A different ID waits, then goes ahead and the backend has room.
+    let (resp, media) = dispatch(c, req(11, open(2, 1, 7_100_000))).await;
+    assert_eq!(code(&resp), v1::ResultCode::Ok);
+    assert!(media.is_some());
+    // The same ID is answered BACKEND_ERROR after the wait.
+    let again = admit(c, req(12, open(1, 1, 7_100_000)));
+    assert!(is_answered(&again).is_none());
+    let (resp, media) = finish(c, again).await;
+    assert_eq!(code(&resp), v1::ResultCode::BackendError);
+    assert!(media.is_none());
+    assert!(
+        !c.tables().channels.contains_key(&1),
+        "the entry is released"
+    );
+    r.close_gate.add_permits(1 << 20);
+    let (resp, _) = closing.await.expect("join");
+    assert_eq!(code(&resp), v1::ResultCode::Ok);
+}
+
+/// S3: open and close pairs cannot pile up: the entries winding down count
+/// up to as many again as the limit.
+#[tokio::test]
+async fn closing_entries_are_bounded() {
+    let r = rig().await;
+    let c = &r.c;
+    let max = limits::CHANNELS_PER_RECEIVER;
+    let mut held = Vec::new();
+    let mut id = 0;
+    for _ in 0..2 {
+        let mut round = Vec::new();
+        for _ in 0..max {
+            id += 1;
+            let a = admit(c, req(u64::from(id), open(id, 1, 7_100_000)));
+            assert!(is_answered(&a).is_none(), "open {id} admitted");
+            round.push(id);
+            held.push(a);
+        }
+        for i in round {
+            let a = admit(c, req(1000 + u64::from(i), close_cmd(i)));
+            assert_eq!(is_answered(&a), Some(v1::ResultCode::Ok), "close {i}");
+            held.push(a);
+        }
+    }
+    assert_eq!(
+        c.tables().channels.values().filter(|e| e.is_live()).count(),
+        0
+    );
+    let a = admit(c, req(2000, open(id + 1, 1, 7_100_000)));
+    assert_eq!(is_answered(&a), Some(v1::ResultCode::ResourceExhausted));
+    // The same for subscriptions, station-wide.
+    let subs = limits::waterfall_subscriptions_claim(1);
+    let mut sid = 0;
+    for _ in 0..2 {
+        let mut round = Vec::new();
+        for _ in 0..subs {
+            sid += 1;
+            let a = admit(
+                c,
+                req(3000 + u64::from(sid), subscribe_cmd(sid, 1, 7_100_000)),
+            );
+            assert!(is_answered(&a).is_none(), "subscription {sid} admitted");
+            round.push(sid);
+            held.push(a);
+        }
+        for i in round {
+            held.push(admit(c, req(4000 + u64::from(i), unsub(i))));
+        }
+    }
+    let a = admit(c, req(5000, subscribe_cmd(sid + 1, 1, 7_100_000)));
+    assert_eq!(is_answered(&a), Some(v1::ResultCode::ResourceExhausted));
+    drop(held);
+}
+
+/// S4: a close takes its backend when it is admitted, so it reaches the
+/// backend its channel was opened on even if the receiver goes before the
+/// close runs.
+#[tokio::test]
+async fn a_close_keeps_the_backend_it_was_admitted_with() {
+    let st = Station::standard().await;
+    let c = ctx_for(&st);
+    let (r, _m) = dispatch(&c, req(1, open(4, 1, 7_100_000))).await;
+    assert_eq!(code(&r), v1::ResultCode::Ok);
+    let backend = st.backends.get(1).expect("backend");
+    assert_eq!(backend.channel_ids(), vec![4]);
+    let closing = admit(&c, req(2, close_cmd(4)));
+    st.receivers
+        .configure(&v1::ConfigureReceivers {
+            receivers: vec![receiver(2, "CH000002", ProfileId::RtlsdrV4, 14_200_000)],
+        })
+        .await
+        .expect("set");
+    let (r, _) = finish(&c, closing).await;
+    assert_eq!(code(&r), v1::ResultCode::Ok);
+    assert!(backend.channel_ids().is_empty(), "closed in its backend");
+}
+
+/// N1: an open closed while it waited never calls its backend.
+#[tokio::test]
+async fn an_open_closed_while_it_waited_skips_the_backend() {
+    let r = rig().await;
+    r.gate.add_permits(1000);
+    let c = &r.c;
+    let _a = opened(c, 1).await;
+    r.close_gate.forget_permits(1 << 20);
+    let closing = spawn_finish(c, admit(c, req(10, close_cmd(1))));
+    tokio::task::yield_now().await;
+    let waiting = spawn_finish(c, admit(c, req(11, open(2, 1, 7_100_000))));
+    tokio::task::yield_now().await;
+    let (resp, _) = dispatch(c, req(12, close_cmd(2))).await;
+    assert_eq!(code(&resp), v1::ResultCode::Ok);
+    let permits = r.gate.available_permits();
+    r.close_gate.add_permits(1 << 20);
+    let (resp, media) = waiting.await.expect("join");
+    assert_eq!(code(&resp), v1::ResultCode::Ok);
+    assert!(
+        matches!(resp.payload, Some(Payload::ChannelOpened(ref o)) if o.channel_id == 2 && o.receiver_id == 1)
+    );
+    assert!(media.is_none());
+    assert_eq!(r.gate.available_permits(), permits, "no backend call");
+    assert!(!r.inner.channel_ids().contains(&2));
+    let _ = closing.await.expect("join");
+    assert!(c.tables().channels.is_empty());
+}
+
+/// The session ends with an open waiting and an entry closing: the tasks are
+/// aborted and both are closed in their backends.
+#[tokio::test]
+async fn the_session_ending_closes_a_waiting_open_and_a_closing_entry() {
+    let r = rig().await;
+    r.gate.add_permits(1000);
+    let c = &r.c;
+    let _a = opened(c, 1).await;
+    r.close_gate.forget_permits(1 << 20);
+    let closing = spawn_finish(c, admit(c, req(10, close_cmd(1))));
+    tokio::task::yield_now().await;
+    let waiting = spawn_finish(c, admit(c, req(11, open(2, 1, 7_100_000))));
+    tokio::task::yield_now().await;
+    closing.abort();
+    waiting.abort();
+    let _ = closing.await;
+    let _ = waiting.await;
+    r.close_gate.add_permits(1 << 20);
+    let (channels, subs) = c.tables().take_all();
+    assert_eq!(channels, vec![(1, 1), (1, 2)]);
+    assert!(subs.is_empty());
+    close_in_backends(&c.receivers, channels, subs).await;
+    assert!(r.inner.channel_ids().is_empty());
+    assert!(c.tables().channels.is_empty());
 }
 
 #[test]

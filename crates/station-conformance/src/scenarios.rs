@@ -229,6 +229,10 @@ pub const ALL: &[Scenario] = &[
         "SubscribeWaterfall on a receiver → valid rows; UnsubscribeWaterfall stops them (§4, §6.2)"
     ),
     scenario!(
+        takes_a_freed_place_at_once,
+        "at the channel limit, CloseChannel then OpenChannel sent back to back: both OK, the close's place is free for the open without waiting for its answer (§4 Order)"
+    ),
+    scenario!(
         drops_channels_on_disconnect,
         "channels do not survive a reconnect (§2.3)"
     ),
@@ -1444,6 +1448,34 @@ pub async fn channel_limit_per_receiver(
         )?;
         let other = open_command(&caps, 2, max + 2).ok_or_else(|| missing_receiver(2))?;
         open(&mut conn, other, cfg).await?;
+        Ok(After::Stop(Some(Box::new(conn))))
+    })
+    .await
+}
+
+/// The hub sends a close and an open of a new ID back to back at the
+/// receiver's limit, without waiting for the close's answer: the station
+/// frees the place in the order it received the requests (§4 Order).
+pub async fn takes_a_freed_place_at_once(
+    sut: &mut dyn StationUnderTest,
+    cfg: &ScenarioConfig,
+) -> Result<()> {
+    let harness = Harness::new().await;
+    run_scenario(sut, cfg, harness, async |h, _sut| {
+        let (mut conn, caps) = h.ready(cfg).await?;
+        let max = receiver_caps(&caps, 1).map_or(0, |r| r.max_channels);
+        for channel_id in 1..=max {
+            let command = open_command(&caps, 1, channel_id).ok_or_else(|| missing_receiver(1))?;
+            open(&mut conn, command, cfg).await?;
+        }
+        let one_more = open_command(&caps, 1, max + 1).ok_or_else(|| missing_receiver(1))?;
+        let close = Command::CloseChannel(v1::CloseChannel { channel_id: 1 });
+        let close_id = conn.request(close).await?;
+        let open_id = conn.request(one_more).await?;
+        let r = conn.expect_response(open_id, cfg.response_within).await?;
+        expect_code(&r, v1::ResultCode::Ok, "OpenChannel right after a close")?;
+        let r = conn.expect_response(close_id, cfg.response_within).await?;
+        expect_code(&r, v1::ResultCode::Ok, "CloseChannel")?;
         Ok(After::Stop(Some(Box::new(conn))))
     })
     .await

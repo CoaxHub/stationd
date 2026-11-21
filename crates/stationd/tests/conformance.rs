@@ -57,6 +57,7 @@ conformance!(
     opens_channel_and_streams_audio,
     channel_limit_per_receiver,
     subscribes_waterfall_and_streams_rows,
+    takes_a_freed_place_at_once,
     drops_channels_on_disconnect,
     reports_hardware,
     applies_receiver_set,
